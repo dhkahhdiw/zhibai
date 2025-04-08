@@ -1,164 +1,178 @@
 #!/usr/bin/env python3
-import asyncio
-import uvloop  # 高性能事件循环
+import uvloop
+
 uvloop.install()
 
-import logging
-import hmac
-import hashlib
-import urllib.parse
-import time
-import math
+import asyncio
 import numpy as np
 import pandas as pd
 from aiohttp import ClientTimeout, TCPConnector
 from aiohttp_retry import RetryClient, ExponentialRetry
-from config import API_KEY, SECRET_KEY
-from scipy.stats import norm  # 如需 PSR
+from dotenv import load_dotenv
+import os
+import hmac
+import hashlib
+import urllib.parse
+import logging
+from typing import Optional
 
-# ========== 系统配置 ==========
+# 环境变量加载
+load_dotenv()
+API_KEY = os.getenv('API_KEY')
+SECRET_KEY = os.getenv('SECRET_KEY')
+
+# ========== 全局配置 ==========
 SYMBOL = 'ETHUSDC'
 LEVERAGE = 10
-QUANTITY = 0.06
 REST_BASE_URL = 'https://fapi.binance.com'
-PROXY = None  # Linux 上通常不走本地代理，若需要可填写 http://127.0.0.1:7897
-
-SL_PERCENT = 0.02
-TP_PERCENT = 0.02
-
-KLINE_INTERVAL = '1h'
-MAX_KLINES = 100
+PROXY = None  # 生产环境建议关闭代理
 
 # ========== 日志配置 ==========
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
         logging.FileHandler("bot.log", encoding="utf-8")
     ]
 )
-logger = logging.getLogger('RestAPI-Bot')
+logger = logging.getLogger('HFT-Bot')
 
 
-class BinanceRESTAPI:
+class BinanceHFTClient:
     def __init__(self):
-        connector = TCPConnector(limit=100, ssl=True)  # 启用 SSL 验证
+        self.connector = TCPConnector(limit=100, ssl=False, force_close=True)
         self.session = RetryClient(
-            raise_for_status=False,
+            connector=self.connector,
             retry_options=ExponentialRetry(attempts=3),
-            connector=connector,
-            timeout=ClientTimeout(total=30)
+            timeout=ClientTimeout(total=2)  # 高频交易需要更短超时
         )
+        self.recv_window = 5000
 
     def _sign(self, params: dict) -> str:
         query = urllib.parse.urlencode(params)
-        return hmac.new(SECRET_KEY.encode(), query.encode(), hashlib.sha256).hexdigest()
+        return hmac.new(
+            SECRET_KEY.encode('utf-8'),
+            query.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
 
-    async def get_kline_data(self):
+    async def fetch_klines(self) -> Optional[pd.DataFrame]:
+        """获取优化后的K线数据"""
         url = f"{REST_BASE_URL}/fapi/v1/klines"
-        params = {'symbol': SYMBOL, 'interval': KLINE_INTERVAL, 'limit': MAX_KLINES}
+        params = {'symbol': SYMBOL, 'interval': '1m', 'limit': 100}
+
         try:
             async with self.session.get(url, params=params, proxy=PROXY) as resp:
-                data = await resp.json()
-                if not isinstance(data, list) or len(data) < 2:
-                    logger.warning(f"{KLINE_INTERVAL} Kline 数据异常: {data}")
-                    return []
-                return data
-        except Exception as e:
-            logger.error(f"获取 Kline 数据失败: {e}")
-            return []
+                if resp.status != 200:
+                    logger.error(f"K线接口异常: HTTP {resp.status}")
+                    return None
 
-    async def place_order(self, params: dict):
-        url = f"{REST_BASE_URL}/fapi/v1/order"
+                data = await resp.json()
+                if len(data) < 10:
+                    logger.warning("K线数据不足")
+                    return None
+
+                # 使用NumPy加速处理
+                arr = np.array(data)[:, 1:6].astype(float)  # O,H,L,C,V
+                return pd.DataFrame(arr, columns=['open', 'high', 'low', 'close', 'vol'])
+
+        except Exception as e:
+            logger.error(f"获取K线失败: {str(e)}")
+            return None
+
+    async def place_order(self, side: str, quantity: float, stop_price: float) -> dict:
+        """下单接口优化版"""
+        params = {
+            'symbol': SYMBOL,
+            'side': side.upper(),
+            'type': 'STOP_MARKET',
+            'quantity': round(quantity, 3),
+            'stopPrice': round(stop_price, 2),
+            'timestamp': int(time.time() * 1000),
+            'recvWindow': self.recv_window
+        }
         params['signature'] = self._sign(params)
+
         headers = {"X-MBX-APIKEY": API_KEY}
+        url = f"{REST_BASE_URL}/fapi/v1/order"
+
         try:
-            async with self.session.post(url, headers=headers, data=params, proxy=PROXY) as resp:
+            async with self.session.post(url, headers=headers, data=params) as resp:
                 result = await resp.json()
-                logger.info(f"订单响应: {result}")
+                if result.get('status') == 'FILLED':
+                    logger.info(f"订单成交: {side} {quantity} @ {result['avgPrice']}")
                 return result
         except Exception as e:
-            logger.error(f"下单异常: {e}")
+            logger.error(f"下单失败: {str(e)}")
             return {}
 
-    async def close(self):
-        await self.session.close()
 
+class VolatilityStrategy:
+    def __init__(self, client: BinanceHFTClient):
+        self.client = client
+        self.position = 0.0
+        self.atr_window = 14
 
-def calculate_rsi(df: pd.DataFrame, period=14) -> pd.Series:
-    delta = df['close'].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(window=period).mean()
-    avg_loss = loss.rolling(window=period).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return (100 - (100 / (1 + rs))).fillna(50)
+    def calculate_features(self, df: pd.DataFrame) -> dict:
+        """使用向量化计算优化指标"""
+        high, low, close = df['high'], df['low'], df['close']
 
+        # 计算ATR
+        tr = pd.concat([high - low,
+                        (high - close.shift(1)).abs(),
+                        (low - close.shift(1)).abs()], axis=1).max(axis=1)
+        atr = tr.rolling(self.atr_window).mean().iloc[-1]
 
-def calculate_atr(df: pd.DataFrame, period=14) -> pd.Series:
-    high, low, close = df['high'], df['low'], df['close']
-    prev = close.shift(1)
-    tr = pd.concat([high - low, (high - prev).abs(), (low - prev).abs()], axis=1).max(axis=1)
-    return tr.rolling(window=period).mean().fillna(0)
+        # 计算EMA交叉
+        ema_fast = close.ewm(span=9).mean().iloc[-1]
+        ema_slow = close.ewm(span=21).mean().iloc[-1]
 
-
-class TradingStrategy:
-    def __init__(self, api: BinanceRESTAPI):
-        self.api = api
+        return {
+            'atr': atr,
+            'ema_fast': ema_fast,
+            'ema_slow': ema_slow,
+            'spread': (high - low).iloc[-1]
+        }
 
     async def run(self):
+        """策略主循环"""
         while True:
-            data = await self.api.get_kline_data()
-            if not data:
-                await asyncio.sleep(5)
-                continue
+            try:
+                df = await self.client.fetch_klines()
+                if df is None:
+                    await asyncio.sleep(1)
+                    continue
 
-            df = pd.DataFrame(data, columns=[
-                'ts', 'open', 'high', 'low', 'close', 'vol',
-                'cts', 'qav', 'nt', 'tbbav', 'tbqav', 'ignore'
-            ]).astype(float)
-            df['rsi'] = calculate_rsi(df)
-            df['atr'] = calculate_atr(df)
+                features = self.calculate_features(df)
+                current_price = df['close'].iloc[-1]
 
-            price = df['close'].iloc[-1]
-            atr = df['atr'].iloc[-1]
-            rsi = df['rsi'].iloc[-1]
+                # 生成信号
+                if features['ema_fast'] > features['ema_slow'] * 1.001:
+                    stop_loss = current_price - features['atr'] * 1.5
+                    await self.client.place_order('BUY', QUANTITY, stop_loss)
+                elif features['ema_fast'] < features['ema_slow'] * 0.999:
+                    stop_loss = current_price + features['atr'] * 1.5
+                    await self.client.place_order('SELL', QUANTITY, stop_loss)
 
-            # 示例信号：RSI<30买入，>70卖出
-            if rsi < 30:
-                sl = round(price - atr * 1.5, 2)
-                tp = round(price + atr * 1.5, 2)
-                params = {
-                    'symbol': SYMBOL, 'side': 'BUY', 'type': 'MARKET',
-                    'quantity': QUANTITY, 'stopPrice': sl, 'timeInForce': 'GTC',
-                    'timestamp': int(time.time()*1000)
-                }
-                await self.api.place_order(params)
-                logger.info(f"BUY 市价单, SL={sl}, TP={tp}")
-            elif rsi > 70:
-                sl = round(price + atr * 1.5, 2)
-                tp = round(price - atr * 1.5, 2)
-                params = {
-                    'symbol': SYMBOL, 'side': 'SELL', 'type': 'MARKET',
-                    'quantity': QUANTITY, 'stopPrice': sl, 'timeInForce': 'GTC',
-                    'timestamp': int(time.time()*1000)
-                }
-                await self.api.place_order(params)
-                logger.info(f"SELL 市价单, SL={sl}, TP={tp}")
+                await asyncio.sleep(5)  # 1分钟周期
 
-            await asyncio.sleep(60)
+            except Exception as e:
+                logger.error(f"策略运行异常: {str(e)}")
+                await asyncio.sleep(10)
 
 
 async def main():
-    api = BinanceRESTAPI()
-    strat = TradingStrategy(api)
+    client = BinanceHFTClient()
+    strategy = VolatilityStrategy(client)
+
     try:
-        await strat.run()
+        await strategy.run()
     except KeyboardInterrupt:
-        logger.info("退出")
+        logger.info("用户终止操作")
     finally:
-        await api.close()
+        await client.session.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
