@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# 高频交易引擎 v3.61 (Vultr VHF-1C-1GB 终极优化版)
+# 高频交易引擎 v3.6 (Vultr VHF-1C-1GB 终极优化版)
 
 import uvloop
 
@@ -32,6 +32,10 @@ SYMBOL = os.getenv('TRADING_PAIR', 'ETHUSDT')
 LEVERAGE = int(os.getenv('LEVERAGE', 10))
 QUANTITY = float(os.getenv('QUANTITY', 0.01))
 REST_URL = 'https://fapi.binance.com'
+
+# 必须检查 API_KEY 和 SECRET_KEY 是否加载成功
+if API_KEY is None or SECRET_KEY is None:
+    raise Exception("请在 .env 中正确配置 BINANCE_API_KEY 与 BINANCE_SECRET_KEY")
 
 # ========== 高频参数 ==========
 # 各接口的 (请求上限, 时间周期[s])
@@ -82,7 +86,7 @@ class BinanceHFTClient:
     """高频交易客户端（Vultr终极优化版）"""
 
     def __init__(self):
-        # 先初始化配置，确保后续使用 self._config 时不会出错
+        # 先初始化配置，确保后续使用时 self._config 存在
         self._config = TradingConfig()
 
         self.connector = TCPConnector(
@@ -116,6 +120,17 @@ class BinanceHFTClient:
             timeout=ClientTimeout(total=self._config.order_timeout)
         )
 
+    def _hmac_sign(self, params: Dict) -> str:
+        """生成 HMAC 签名"""
+        if SECRET_KEY is None:
+            raise Exception("SECRET_KEY 未设置")
+        query = urllib.parse.urlencode(sorted(params.items()))
+        return hmac.new(
+            SECRET_KEY.encode(),
+            query.encode(),
+            hashlib.sha256
+        ).hexdigest()
+
     async def _rate_limit_check(self, endpoint: str):
         """动态速率限制（带自适应调整）"""
         limit, period = RATE_LIMITS.get(endpoint, (60, 1))
@@ -123,12 +138,10 @@ class BinanceHFTClient:
         now = time.time()
         while dq and dq[0] < now - period:
             dq.popleft()
-
         if len(dq) >= limit:
             wait_time = dq[0] + period - now + np.random.uniform(0, 0.05)
             logger.warning(f"Rate limit hit: {endpoint} - Waiting {wait_time:.3f}s")
             await asyncio.sleep(wait_time)
-
         dq.append(now)
         METRICS['throughput'].inc()
 
@@ -147,7 +160,7 @@ class BinanceHFTClient:
             ).hexdigest()
         except Exception as e:
             logger.error(f"签名生成失败: {str(e)}")
-            await self.sync_server_time()
+            await self.sync_server_time()  # 使用新同步方法
             raise
 
         headers = {"X-MBX-APIKEY": API_KEY}
@@ -155,9 +168,7 @@ class BinanceHFTClient:
             try:
                 endpoint = path.split('/')[-1]
                 await self._rate_limit_check(endpoint)
-
                 post_data = {**params, 'signature': signature}
-
                 async with self.session.request(
                         method,
                         REST_URL + path,
@@ -175,18 +186,21 @@ class BinanceHFTClient:
         raise Exception("超过最大重试次数")
 
     async def sync_server_time(self):
-        """增强时间同步（带误差补偿）"""
+        """增强时间同步（不使用签名请求）"""
+        url = REST_URL + '/fapi/v1/time'
         time_diffs = []
         for _ in range(7):
             try:
-                data = await self._signed_request('GET', '/fapi/v1/time', {})
-                server_time = data['serverTime']
-                local_time = int(time.time() * 1000)
-                time_diffs.append(server_time - local_time)
+                async with self.session.get(url) as resp:
+                    data = await resp.json()
+                    server_time = data.get('serverTime')
+                    if server_time is None:
+                        raise Exception("serverTime 未返回")
+                    local_time = int(time.time() * 1000)
+                    time_diffs.append(server_time - local_time)
                 await asyncio.sleep(0.05)
             except Exception as e:
                 logger.error(f"时间同步失败: {str(e)}")
-
         if time_diffs:
             self._time_diff = int(np.mean(time_diffs[-3:]))  # 使用最后三次平均值
             if abs(self._time_diff) > 500:
@@ -226,16 +240,16 @@ class VolatilityStrategy:
 
     def __init__(self, client: BinanceHFTClient):
         self.client = client
-        self.config = TradingConfig()  # 使用独立配置或共享客户端配置
+        self.config = TradingConfig()  # 独立配置
         self._init_indicators()
 
     def _init_indicators(self):
-        """预编译加速（通过lambda调用pandas内置函数）"""
+        """预编译加速（通过 lambda 调用 pandas 内置函数）"""
         self.ema_fast = lambda x: x.ewm(span=self.config.ema_fast, adjust=False).mean().values
         self.ema_slow = lambda x: x.ewm(span=self.config.ema_slow, adjust=False).mean().values
 
     def calculate_atr(self, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> float:
-        """SIMD加速ATR计算"""
+        """SIMD加速 ATR 计算"""
         prev_close = close[:-1]
         tr = np.maximum(
             high[1:] - low[1:],
@@ -253,7 +267,6 @@ class VolatilityStrategy:
             try:
                 # 实时监控内存使用
                 METRICS['memory'].set(psutil.Process().memory_info().rss // 1024 // 1024)
-
                 df = await self.client.fetch_klines()
                 if df is None:
                     await asyncio.sleep(0.25)
@@ -273,7 +286,7 @@ class VolatilityStrategy:
                     stop_price = round(stop_price, self.config.price_precision)
                     await self._execute_order('BUY', stop_price)
 
-                await asyncio.sleep(0.25)  # 250ms循环周期
+                await asyncio.sleep(0.25)  # 250ms 循环周期
 
             except Exception as e:
                 logger.error(f"策略异常: {str(e)}")
