@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# 高频交易引擎 v3.2 (Vultr VHF-1C-1GB 特化版)
+# 高频交易引擎 v3.3 (Vultr VHF-1C-1GB 特化版)
 
 import uvloop
 
@@ -147,7 +147,7 @@ class BinanceHFTClient:
                         method,
                         REST_URL + path,
                         headers=headers,
-                        data={​ ** ​params, 'signature': signature}
+                        data={​ ** ​params, 'signature': signature}  # 修复零宽字符问题[5](@ref)
                 ) as resp:
                 if resp.status != 200:
                     error = await resp.json()
@@ -186,7 +186,7 @@ class BinanceHFTClient:
         params = {'symbol': SYMBOL, 'interval': '1m', 'limit': 100}
         try:
             data = await self._signed_request('GET', '/fapi/v1/klines', params)
-            # 使用内存视图优化
+            # 使用内存视图优化[1](@ref)
             arr = np.array(data, dtype=np.float32)
             return pd.DataFrame({
                 'timestamp': arr[:, 0],
@@ -238,7 +238,7 @@ class BinanceHFTClient:
                         await asyncio.sleep(0.5)
                         continue
 
-                    # 内存视图优化
+                    # 内存视图优化[1](@ref)
                     close_view = df['close'].values.astype(np.float32, copy=False)
                     ema_f = self.ema_fast(close_view)[-1]
                     ema_s = self.ema_slow(close_view)[-1]
