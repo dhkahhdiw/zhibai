@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-# 高频交易引擎 v3.6 (Vultr VHF-1C-1GB 终极优化版)
+# 高频交易引擎 v3.7 (ETH/USDC合约专版)
 
 import uvloop
+
 uvloop.install()
 
 import asyncio
@@ -11,7 +12,7 @@ import hmac
 import hashlib
 import urllib.parse
 import logging
-from typing import Dict
+from typing import Optional, Dict, Deque, Any
 from collections import deque, defaultdict
 from dataclasses import dataclass
 
@@ -23,245 +24,236 @@ from dotenv import load_dotenv
 from prometheus_client import Gauge, start_http_server
 import psutil
 
-# ========== 强制指定加载的 .env 文件 ==========
-# 请确保 /root/zhibai/.env 存在，并包含如下内容（请使用正确的 Futures API 密钥）：
-# BINANCE_API_KEY=你的正确Futures_API_KEY
-# BINANCE_SECRET_KEY=你的正确Futures_SECRET_KEY
-# TRADING_PAIR=ETHUSDC
-# LEVERAGE=10
-# QUANTITY=0.06
+# ========== 环境配置 ==========
 load_dotenv('/root/zhibai/.env')
 
-# 去除多余空格，保证格式正确
 API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
 SYMBOL = os.getenv('TRADING_PAIR', 'ETHUSDC').strip()
 LEVERAGE = int(os.getenv('LEVERAGE', 10))
 QUANTITY = float(os.getenv('QUANTITY', 0.06))
-REST_URL = 'https://fapi.binance.com'
+REST_URL = 'https://dapi.binance.com'  # USDC合约专用端点
 
-if not API_KEY or not SECRET_KEY:
-    raise Exception("请在 /root/zhibai/.env 中正确配置 BINANCE_API_KEY 与 BINANCE_SECRET_KEY")
+if not all([API_KEY, SECRET_KEY]):
+    raise ValueError("Missing API credentials in .env file")
 
 # ========== 高频参数 ==========
-# 各接口的 (请求上限, 时间周期[s])
 RATE_LIMITS = {
-    'klines': (40, 5),    # K线请求：最多40次，每5秒
-    'orders': (160, 10),  # 订单请求：最多160次，每10秒
-    'leverage': (15, 60)
+    'klines': (45, 5),
+    'orders': (180, 10),
+    'leverage': (20, 60)
 }
 
 # ========== 监控指标 ==========
 start_http_server(8000)
 METRICS = {
-    'memory': Gauge('hft_memory', '内存使用(MB)'),
-    'latency': Gauge('order_latency', '订单延迟(ms)'),
-    'throughput': Gauge('requests_sec', 'API请求数/秒')
+    'memory': Gauge('hft_memory_usage', 'Memory usage (MB)'),
+    'latency': Gauge('order_exec_latency', 'Order latency (ms)'),
+    'throughput': Gauge('api_throughput', 'API requests/sec'),
+    'position': Gauge('eth_position', 'Current ETH position')
 }
 
 # ========== 日志配置 ==========
 logging.basicConfig(
-    level=logging.INFO,  # 若需要更多调试信息，可将 level 调整为 DEBUG
+    level=logging.INFO,
     format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("/var/log/hft_engine.log", encoding="utf-8", mode='a', delay=True)
+        logging.FileHandler("/var/log/eth_usdc_hft.log",
+                            encoding="utf-8",
+                            mode='a')
     ]
 )
-logger = logging.getLogger('HFT-Core')
-DEBUG = False  # 若设置为 True，则输出更详细的调试日志
+logger = logging.getLogger('ETH-USDC-HFT')
+
 
 @dataclass
 class TradingConfig:
-    """交易策略参数（Vultr终极优化）"""
+    """ETH/USDC交易参数优化"""
     atr_window: int = 14
     ema_fast: int = 9
     ema_slow: int = 21
-    volatility_multiplier: float = 2.0  # 提高波动率系数
-    max_retries: int = 7
-    order_timeout: float = 0.25  # 超时时间（秒）
+    volatility_multiplier: float = 2.2
+    max_retries: int = 5
+    order_timeout: float = 0.2
     price_precision: int = 2
-    position_ratio: float = 0.95  # 仓位利用率
+    quantity_precision: int = 3
+    risk_ratio: float = 0.02
+
 
 class BinanceHFTClient:
-    """高频交易客户端（Vultr终极优化版）"""
+    """USDC合约高频客户端"""
 
     def __init__(self):
-        self._config = TradingConfig()
+        self.config = TradingConfig()
         self.connector = TCPConnector(
-            limit=64,              # 增大连接池
-            ssl=False,
-            force_close=True,      # 强制关闭空闲连接
-            use_dns_cache=True,
-            ttl_dns_cache=180,     # DNS缓存时间（秒）
+            limit=48,
+            ssl=True,
+            ttl_dns_cache=300,
             enable_cleanup_closed=True
         )
         self._init_session()
         self.recv_window = 5000
         self.request_timestamps = defaultdict(
-            lambda: deque(maxlen=RATE_LIMITS.get('klines', (60, 1))[0] + 60)
-        )
+            lambda: deque(maxlen=RATE_LIMITS['klines'][0] + 50))
         self._time_diff = 0
 
     def _init_session(self):
-        """初始化智能会话"""
         retry_opts = ExponentialRetry(
-            attempts=self._config.max_retries,
-            start_timeout=0.03,  # 激进超时设置
-            max_timeout=1.5,
-            statuses={408, 429, 500, 502, 503, 504},
-            exceptions={asyncio.TimeoutError}
+            attempts=self.config.max_retries,
+            start_timeout=0.05,
+            max_timeout=1.0,
+            statuses={408, 429, 500, 502, 503, 504}
         )
         self.session = RetryClient(
             connector=self.connector,
             retry_options=retry_opts,
-            timeout=ClientTimeout(total=self._config.order_timeout)
+            timeout=ClientTimeout(total=self.config.order_timeout)
         )
 
-    def _hmac_sign(self, params: Dict) -> str:
-        """生成 HMAC 签名"""
+    async def _signed_request(self, method: str, endpoint: str, params: Dict) -> Dict:
+        """增强型签名请求"""
+        params.update({
+            'timestamp': int(time.time() * 1000 + self._time_diff),
+            'recvWindow': self.recv_window
+        })
+
         query = urllib.parse.urlencode(sorted(params.items()))
-        return hmac.new(
+        signature = hmac.new(
             SECRET_KEY.encode(),
             query.encode(),
             hashlib.sha256
         ).hexdigest()
 
-    async def _rate_limit_check(self, endpoint: str):
-        """动态速率限制（带自适应调整）"""
-        limit, period = RATE_LIMITS.get(endpoint, (60, 1))
-        dq = self.request_timestamps[endpoint]
-        now = time.time()
-        while dq and dq[0] < now - period:
-            dq.popleft()
-        if len(dq) >= limit:
-            wait_time = dq[0] + period - now + np.random.uniform(0, 0.05)
-            logger.warning(f"Rate limit hit: {endpoint} - Waiting {wait_time:.3f}s")
-            await asyncio.sleep(wait_time)
-        dq.append(now)
-        METRICS['throughput'].inc()
-
-    async def _signed_request(self, method: str, path: str, params: Dict) -> Dict:
-        """签名请求（完全修复版）"""
-        params.update({
-            'timestamp': int(time.time() * 1000 + self._time_diff),
-            'recvWindow': self.recv_window
-        })
-        query = urllib.parse.urlencode(sorted(params.items()))
-        try:
-            signature = hmac.new(
-                SECRET_KEY.encode(),
-                query.encode(),
-                hashlib.sha256
-            ).hexdigest()
-        except Exception as e:
-            logger.error(f"签名生成失败: {str(e)}")
-            await self.sync_server_time()
-            raise
-
         headers = {"X-MBX-APIKEY": API_KEY}
-        url = REST_URL + path
-        if DEBUG:
-            logger.debug(f"请求 {method} {url} 参数: {params}, 签名: {signature}")
-        for attempt in range(self._config.max_retries):
+        url = f"{REST_URL}{endpoint}"
+
+        for attempt in range(self.config.max_retries):
             try:
-                endpoint = path.split('/')[-1]
                 await self._rate_limit_check(endpoint)
-                post_data = {**params, 'signature': signature}
                 async with self.session.request(
                         method,
                         url,
                         headers=headers,
-                        data=post_data
+                        params={**params, 'signature': signature}
                 ) as resp:
-                    resp_text = await resp.text()
-                    if DEBUG:
-                        logger.debug(f"返回状态 {resp.status}, 内容: {resp_text}")
-                    # 当返回401时直接抛出异常，避免重复重试
-                    if resp.status == 401:
-                        try:
-                            error = await resp.json()
-                        except Exception:
-                            error = resp_text
-                        logger.error(f"API Error 401: {error}")
-                        raise Exception("API-key format invalid, 请检查你的 API 密钥格式")
                     if resp.status != 200:
-                        try:
-                            error = await resp.json()
-                        except Exception:
-                            error = resp_text
+                        error = await resp.json()
                         logger.error(f"API Error {resp.status}: {error}")
                         continue
                     return await resp.json()
             except Exception as e:
-                logger.error(f"请求失败 (尝试 {attempt + 1}): {str(e)}")
-                await asyncio.sleep(0.25 ** attempt)
-        raise Exception("超过最大重试次数")
+                logger.error(f"Request failed (attempt {attempt + 1}): {str(e)}")
+                await asyncio.sleep(0.2 ** attempt)
+        raise Exception("Max retries exceeded")
 
     async def sync_server_time(self):
-        """增强时间同步（不使用签名请求）"""
-        url = REST_URL + '/fapi/v1/time'
+        """精准时间同步"""
         time_diffs = []
-        for _ in range(7):
+        for _ in range(5):
             try:
-                async with self.session.get(url) as resp:
+                async with self.session.get(f"{REST_URL}/dapi/v1/time") as resp:
                     data = await resp.json()
-                    server_time = data.get('serverTime')
-                    if server_time is None:
-                        raise Exception("serverTime 未返回")
+                    server_time = data['serverTime']
                     local_time = int(time.time() * 1000)
                     time_diffs.append(server_time - local_time)
-                await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.1)
             except Exception as e:
-                logger.error(f"时间同步失败: {str(e)}")
+                logger.error(f"Time sync error: {str(e)}")
+
         if time_diffs:
-            self._time_diff = int(np.mean(time_diffs[-3:]))
-            if abs(self._time_diff) > 500:
-                logger.warning(f"时间偏差警告: {self._time_diff}ms")
-        else:
-            raise Exception("无法同步服务器时间")
+            self._time_diff = int(np.mean(time_diffs))
+            if abs(self._time_diff) > 1000:
+                logger.warning(f"Time deviation: {self._time_diff}ms")
 
     async def manage_leverage(self):
-        """杠杆管理（带仓位控制）"""
-        params = {'symbol': SYMBOL, 'leverage': LEVERAGE}
-        return await self._signed_request('POST', '/fapi/v1/leverage', params)
+        """杠杆设置"""
+        params = {
+            'symbol': SYMBOL,
+            'leverage': LEVERAGE,
+            'marginType': 'ISOLATED'
+        }
+        return await self._signed_request('POST', '/dapi/v1/leverage', params)
 
     async def fetch_klines(self) -> Optional[pd.DataFrame]:
-        """极速K线获取（内存优化版）"""
-        params = {'symbol': SYMBOL, 'interval': '1m', 'limit': 100}
+        """优化K线获取"""
+        params = {
+            'symbol': SYMBOL,
+            'interval': '1m',
+            'limit': 100,
+            'contractType': 'PERPETUAL'
+        }
         try:
-            data = await self._signed_request('GET', '/fapi/v1/klines', params)
-            arr = np.empty((len(data), 6), dtype=np.float64)
-            for i, candle in enumerate(data):
-                arr[i] = [float(candle[j]) for j in [0, 1, 2, 3, 4, 5]]
-            return pd.DataFrame({
-                'timestamp': arr[:, 0].astype('uint64'),
-                'open': arr[:, 1],
-                'high': arr[:, 2],
-                'low': arr[:, 3],
-                'close': arr[:, 4],
-                'volume': arr[:, 5]
-            }).iloc[-100:]
+            data = await self._signed_request('GET', '/dapi/v1/klines', params)
+            df = pd.DataFrame(data, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_asset_volume', 'trades',
+                'taker_buy_base', 'taker_buy_quote', 'ignore'
+            ])
+            numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+            df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric)
+            return df.iloc[-100:]
         except Exception as e:
-            logger.error(f"获取K线失败: {str(e)}")
+            logger.error(f"Klines error: {str(e)}")
             return None
 
-class VolatilityStrategy:
-    """波动率策略（终极优化版）"""
+
+class ETHUSDCTradingStrategy:
+    """ETH/USDC高频策略"""
 
     def __init__(self, client: BinanceHFTClient):
         self.client = client
         self.config = TradingConfig()
-        self._init_indicators()
+        self.position = 0.0
 
-    def _init_indicators(self):
-        """预编译加速（通过 lambda 调用 pandas 内置函数）"""
-        self.ema_fast = lambda x: x.ewm(span=self.config.ema_fast, adjust=False).mean().values
-        self.ema_slow = lambda x: x.ewm(span=self.config.ema_slow, adjust=False).mean().values
+    async def execute(self):
+        """策略执行主循环"""
+        await self.client.manage_leverage()
+        await self.client.sync_server_time()
 
-    def calculate_atr(self, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> float:
-        """SIMD加速 ATR 计算"""
+        while True:
+            try:
+                start_time = time.monotonic()
+
+                # 获取市场数据
+                df = await self.client.fetch_klines()
+                if df is None:
+                    await asyncio.sleep(0.3)
+                    continue
+
+                # 计算指标
+                close_prices = df['close'].values.astype(np.float64)
+                ema_fast = self._calculate_ema(close_prices, self.config.ema_fast)
+                ema_slow = self._calculate_ema(close_prices, self.config.ema_slow)
+                atr = self._calculate_atr(df)
+
+                # 交易信号
+                if ema_fast[-1] > ema_slow[-1] * 1.0015:
+                    stop_price = close_prices[-1] - (atr * self.config.volatility_multiplier)
+                    await self._place_order('BUY', stop_price)
+                elif ema_fast[-1] < ema_slow[-1] * 0.9985:
+                    stop_price = close_prices[-1] + (atr * self.config.volatility_multiplier)
+                    await self._place_order('SELL', stop_price)
+
+                # 性能监控
+                METRICS['latency'].set((time.monotonic() - start_time) * 1000)
+                await asyncio.sleep(0.25)
+
+            except Exception as e:
+                logger.error(f"Strategy error: {str(e)}")
+                await asyncio.sleep(1)
+
+    def _calculate_ema(self, prices: np.ndarray, period: int) -> np.ndarray:
+        """向量化EMA计算"""
+        return pd.Series(prices).ewm(span=period, adjust=False).mean().values
+
+    def _calculate_atr(self, df: pd.DataFrame) -> float:
+        """优化ATR计算"""
+        high = df['high'].values
+        low = df['low'].values
+        close = df['close'].values
+
         prev_close = close[:-1]
         tr = np.maximum(
             high[1:] - low[1:],
@@ -270,65 +262,31 @@ class VolatilityStrategy:
         )
         return np.mean(tr[-self.config.atr_window:])
 
-    async def execute_strategy(self):
-        """策略主循环（超频模式）"""
-        await self.client.manage_leverage()
-        await self.client.sync_server_time()
-
-        while True:
-            try:
-                METRICS['memory'].set(psutil.Process().memory_info().rss // 1024 // 1024)
-                df = await self.client.fetch_klines()
-                if df is None:
-                    await asyncio.sleep(0.25)
-                    continue
-
-                close_view = df['close'].values.astype(np.float64, copy=False)
-                ema_f = self.ema_fast(pd.Series(close_view))[-1]
-                ema_s = self.ema_slow(pd.Series(close_view))[-1]
-
-                if ema_f > ema_s * 1.002:
-                    atr_val = self.calculate_atr(
-                        df['high'].values,
-                        df['low'].values,
-                        close_view
-                    )
-                    stop_price = close_view[-1] - atr_val * self.config.volatility_multiplier
-                    stop_price = round(stop_price, self.config.price_precision)
-                    await self._execute_order('BUY', stop_price)
-
-                await asyncio.sleep(0.25)
-            except Exception as e:
-                logger.error(f"策略异常: {str(e)}")
-                await asyncio.sleep(1)
-
-    async def _execute_order(self, side: str, price: float):
-        """极速订单执行"""
-        start_time = time.monotonic()
+    async def _place_order(self, side: str, price: float):
+        """执行订单"""
         try:
             params = {
                 'symbol': SYMBOL,
                 'side': side,
                 'type': 'STOP_MARKET',
-                'stopPrice': price,
-                'quantity': round(QUANTITY * self.config.position_ratio, 3),
-                'timeInForce': 'GTC'
+                'stopPrice': round(price, self.config.price_precision),
+                'quantity': round(QUANTITY, self.config.quantity_precision),
+                'timeInForce': 'GTC',
+                'closePosition': 'false'
             }
-            resp = await self.client._signed_request('POST', '/fapi/v1/order', params)
-            latency = (time.monotonic() - start_time) * 1000
-            METRICS['latency'].set(latency)
-            logger.info(f"订单成交 {side}@{resp.get('avgPrice')} 延迟:{latency:.2f}ms")
+            response = await self.client._signed_request('POST', '/dapi/v1/order', params)
+            logger.info(f"Order executed: {response}")
+            self.position = float(response['executedQty'])
+            METRICS['position'].set(self.position)
         except Exception as e:
-            logger.error(f"下单失败: {str(e)}")
-            if "Signature" in str(e):
-                await self.client.sync_server_time()
+            logger.error(f"Order failed: {str(e)}")
 
 
 async def main():
     client = BinanceHFTClient()
-    strategy = VolatilityStrategy(client)
+    strategy = ETHUSDCTradingStrategy(client)
     try:
-        await strategy.execute_strategy()
+        await strategy.execute()
     finally:
         await client.session.close()
 
