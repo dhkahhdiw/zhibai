@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# 高频交易引擎 v3.3 (Vultr VHF-1C-1GB 特化版)
+# 高频交易引擎 v3.4 (Vultr VHF-1C-1GB 特化版)
 
 import uvloop
 
@@ -35,9 +35,9 @@ REST_URL = 'https://fapi.binance.com'
 
 # ========== 高频参数 ==========
 RATE_LIMITS = {
-    'klines': (30, 5),  # 30次/5秒
-    'orders': (120, 10),  # 120次/10秒
-    'leverage': (10, 60)  # 10次/分钟
+    'klines': (30, 5),
+    'orders': (120, 10),
+    'leverage': (10, 60)
 }
 
 # ========== 监控指标 ==========
@@ -71,8 +71,8 @@ class TradingConfig:
     ema_fast: int = 9
     ema_slow: int = 21
     volatility_multiplier: float = 1.5
-    max_retries: int = 3
-    order_timeout: float = 1.2  # 秒
+    max_retries: int = 5
+    order_timeout: float = 0.5  # 缩短超时时间
 
 
 class BinanceHFTClient:
@@ -80,17 +80,17 @@ class BinanceHFTClient:
 
     def __init__(self):
         self.connector = TCPConnector(
-            limit=12,
+            limit=16,
             ssl=False,
-            force_close=True,
+            force_close=False,
             use_dns_cache=True,
-            ttl_dns_cache=300,
+            ttl_dns_cache=600,
             enable_cleanup_closed=True
         )
         self._init_session()
         self.recv_window = 5000
         self.request_timestamps = defaultdict(
-            lambda: deque(maxlen=RATE_LIMITS['klines'][0] + 10)
+            lambda: deque(maxlen=RATE_LIMITS['klines'][0] + 20)
         )
         self._time_diff = 0
         self._config = TradingConfig()
@@ -98,10 +98,10 @@ class BinanceHFTClient:
     def _init_session(self):
         """初始化带重试的会话"""
         retry_opts = ExponentialRetry(
-            attempts=3,
-            start_timeout=0.3,
-            max_timeout=1.5,
-            statuses={408, 500, 502, 503, 504}
+            attempts=5,
+            start_timeout=0.1,
+            max_timeout=3.0,
+            statuses={408, 429, 500, 502, 503, 504}
         )
         self.session = RetryClient(
             connector=self.connector,
@@ -133,11 +133,16 @@ class BinanceHFTClient:
             'recvWindow': self.recv_window
         })
         query = urllib.parse.urlencode(sorted(params.items()))
-        signature = hmac.new(
-            SECRET_KEY.encode(),
-            query.encode(),
-            hashlib.sha256
-        ).hexdigest()
+        try:
+            signature = hmac.new(
+                SECRET_KEY.encode(),
+                query.encode(),
+                hashlib.sha256
+            ).hexdigest()
+        except Exception as e:
+            logger.error(f"签名生成失败: {str(e)}")
+            await self.sync_server_time()
+            raise
 
         headers = {"X-MBX-APIKEY": API_KEY}
         for attempt in range(self._config.max_retries):
@@ -147,7 +152,7 @@ class BinanceHFTClient:
                         method,
                         REST_URL + path,
                         headers=headers,
-                        data={​ ** ​params, 'signature': signature}  # 修复零宽字符问题[5](@ref)
+                        data={​ ** ​params, 'signature': signature}
                 ) as resp:
                 if resp.status != 200:
                     error = await resp.json()
@@ -186,10 +191,9 @@ class BinanceHFTClient:
         params = {'symbol': SYMBOL, 'interval': '1m', 'limit': 100}
         try:
             data = await self._signed_request('GET', '/fapi/v1/klines', params)
-            # 使用内存视图优化[1](@ref)
             arr = np.array(data, dtype=np.float32)
             return pd.DataFrame({
-                'timestamp': arr[:, 0],
+                'timestamp': arr[:, 0].astype('uint64'),
                 'open': arr[:, 1].astype('float32'),
                 'high': arr[:, 2].astype('float32'),
                 'low': arr[:, 3].astype('float32'),
@@ -238,7 +242,6 @@ class BinanceHFTClient:
                         await asyncio.sleep(0.5)
                         continue
 
-                    # 内存视图优化[1](@ref)
                     close_view = df['close'].values.astype(np.float32, copy=False)
                     ema_f = self.ema_fast(close_view)[-1]
                     ema_s = self.ema_slow(close_view)[-1]
