@@ -14,13 +14,17 @@ import logging
 from typing import Dict, Optional
 from collections import deque, defaultdict
 from dataclasses import dataclass
-from socket import AF_INET  # 强制使用IPv4
+from socket import AF_INET
 
 import numpy as np
 import pandas as pd
 from aiohttp import ClientTimeout, TCPConnector
 from aiohttp_retry import RetryClient, ExponentialRetry
-from aiohttp.resolver import AsyncResolver
+try:
+    from aiohttp.resolver import AsyncResolver
+    resolver = AsyncResolver(nameservers=["8.8.8.8", "1.1.1.1"])
+except ImportError:
+    resolver = None
 from dotenv import load_dotenv
 from prometheus_client import Gauge, start_http_server
 import psutil
@@ -34,10 +38,10 @@ load_dotenv(_env_path)
 # 去除多余空格，确保格式正确
 API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
-SYMBOL = os.getenv('TRADING_PAIR', 'ETHUSDC').strip()  # 交易对名称，USDC合约通常用 "ETHUSDC"
+SYMBOL = os.getenv('TRADING_PAIR', 'ETHUSDC').strip()   # 交易对名称，此处为 "ETHUSDC"
 LEVERAGE = int(os.getenv('LEVERAGE', 10))
 QUANTITY = float(os.getenv('QUANTITY', 0.06))
-# 对于 USDC-M Futures，接口基础 URL 使用 Binance 官方域名
+# USDC-M Futures使用正式基础 URL
 REST_URL = 'https://api.binance.com'
 
 if not API_KEY or not SECRET_KEY:
@@ -64,7 +68,7 @@ METRICS = {
 
 # ========== 日志配置 ==========
 logging.basicConfig(
-    level=logging.INFO,  # 若需要更详细调试信息，可设置为 DEBUG
+    level=logging.INFO,  # 如需调试，可将 level 改为 DEBUG
     format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
@@ -73,7 +77,7 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger('ETH-USDC-HFT')
-DEBUG = False
+DEBUG = False  # 调试开关
 
 @dataclass
 class TradingConfig:
@@ -93,21 +97,20 @@ class BinanceHFTClient:
     """高频交易客户端（终极修复版）"""
     def __init__(self):
         self.config = TradingConfig()
-        # 配置解析器为 IPv4（使用公共DNS提高解析稳定性）
-        resolver = AsyncResolver(nameservers=["8.8.8.8", "1.1.1.1"])
-        self.connector = TCPConnector(
-            limit=128,
-            ssl=True,
-            ttl_dns_cache=60,
-            force_close=True,
-            family=AF_INET,
-            resolver=resolver
-        )
+        # 创建TCPConnector，若resolver可用则添加
+        connector_args = {
+            "limit": 128,
+            "ssl": True,
+            "ttl_dns_cache": 60,
+            "force_close": True,
+            "family": AF_INET
+        }
+        if resolver is not None:
+            connector_args["resolver"] = resolver
+        self.connector = TCPConnector(**connector_args)
         self._init_session()
         self.recv_window = 5000
-        self.request_timestamps = defaultdict(
-            lambda: deque(maxlen=RATE_LIMITS['klines'][0] + 150)
-        )
+        self.request_timestamps = defaultdict(lambda: deque(maxlen=RATE_LIMITS['klines'][0] + 150))
         self._time_diff = 0
         self.position = 0.0
 
@@ -121,10 +124,7 @@ class BinanceHFTClient:
         self.session = RetryClient(
             connector=self.connector,
             retry_options=retry_opts,
-            timeout=ClientTimeout(
-                total=self.config.network_timeout,
-                sock_connect=self.config.order_timeout
-            )
+            timeout=ClientTimeout(total=self.config.network_timeout, sock_connect=self.config.order_timeout)
         )
 
     async def _rate_limit_check(self, endpoint: str):
@@ -141,7 +141,6 @@ class BinanceHFTClient:
         METRICS['throughput'].inc()
 
     async def _signed_request(self, method: str, path: str, params: Dict) -> Dict:
-        # 添加公共参数
         params.update({
             'timestamp': int(time.time() * 1000 + self._time_diff),
             'recvWindow': self.recv_window
@@ -149,18 +148,13 @@ class BinanceHFTClient:
         sorted_params = sorted(params.items())
         query = urllib.parse.urlencode(sorted_params)
         try:
-            signature = hmac.new(
-                SECRET_KEY.encode(),
-                query.encode(),
-                hashlib.sha256
-            ).hexdigest()
+            signature = hmac.new(SECRET_KEY.encode(), query.encode(), hashlib.sha256).hexdigest()
         except Exception as e:
             logger.error(f"签名生成失败: {str(e)}")
             await self.sync_server_time()
             raise
-
         full_query = f"{query}&signature={signature}"
-        # 使用 USDC-M Futures 专用路径前缀 "/sapi/v1/futures/usdc"
+        # USDC-M Futures接口路径前缀
         url = f"{REST_URL}/sapi/v1/futures/usdc{path}?{full_query}"
         headers = {"X-MBX-APIKEY": API_KEY}
         if DEBUG:
@@ -221,7 +215,7 @@ class BinanceHFTClient:
             data = await self._signed_request('GET', '/klines', params)
             arr = np.empty((len(data), 6), dtype=np.float64)
             for i, candle in enumerate(data):
-                # 根据 Binance USDC-M Futures 文档，字段下标请确认，此处示例取 [1,2,3,4,5,7]
+                # 根据 Binance USDC-M Futures 文档，请调整字段下标，示例中取 [1,2,3,4,5,7]
                 arr[i] = [float(candle[j]) for j in [1, 2, 3, 4, 5, 7]]
             return pd.DataFrame({
                 'open': arr[:, 0],
@@ -252,7 +246,6 @@ class ETHUSDCStrategy:
                 if df is None or df.empty:
                     await asyncio.sleep(0.15)
                     continue
-
                 close_prices = df['close'].values.astype(np.float64)
                 ema_fast = pd.Series(close_prices).ewm(span=self.config.ema_fast, adjust=False).mean().values
                 ema_slow = pd.Series(close_prices).ewm(span=self.config.ema_slow, adjust=False).mean().values
@@ -295,7 +288,7 @@ class ETHUSDCStrategy:
             params = {
                 'symbol': SYMBOL,
                 'side': side,
-                'type': 'STOP',  # 如官方建议使用 STOP_MARKET，请根据实际文档修改此处
+                'type': 'STOP',  # 根据最新官方文档，若要求 STOP_MARKET 请相应调整
                 'stopPrice': float(f"{price:.{self.config.price_precision}f}"),
                 'quantity': formatted_qty,
                 'timeInForce': 'GTC',
