@@ -59,6 +59,7 @@ class BinanceHFTClient:
 
     def __init__(self):
         # 网络层优化配置
+        # 注意：如果使用的 aiohttp 版本不支持 tcp_fast_open 参数，请删除下面这一行中的 tcp_fast_open=TCP_FAST_OPEN,
         self.connector = TCPConnector(
             limit=8,  # 针对 1GB 内存的优化
             ssl=False,
