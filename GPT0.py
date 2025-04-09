@@ -33,11 +33,10 @@ load_dotenv(_env_path)
 # 去除多余空格，确保格式正确
 API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
-# 修改默认交易对为 "ETHUSD_PERP"（合约交割合约的常用符号），请根据需要在 .env 中覆盖
-SYMBOL = os.getenv('TRADING_PAIR', 'ETHUSD_PERP').strip()
+SYMBOL = os.getenv('TRADING_PAIR', 'ETHUSDC').strip()  # 如需其它交易对，请在 .env 中设置
 LEVERAGE = int(os.getenv('LEVERAGE', 10))
 QUANTITY = float(os.getenv('QUANTITY', 0.06))
-# 使用 dapi 接口（适用于币本位交割合约），如果是USDC合约请检查文档和接口
+# USDC合约接口使用 dapi
 REST_URL = 'https://dapi.binance.com'
 
 if not API_KEY or not SECRET_KEY:
@@ -62,7 +61,7 @@ METRICS = {
 
 # ========== 日志配置 ==========
 logging.basicConfig(
-    level=logging.INFO,  # 若需要更详细调试可修改为 DEBUG
+    level=logging.INFO,  # 如需调试请将 level 改为 DEBUG
     format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
@@ -71,25 +70,24 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger('ETH-USDC-HFT')
-DEBUG = False  # 调试开关
+DEBUG = False
 
+# ========== 交易参数配置 ==========
 @dataclass
 class TradingConfig:
-    """交易参数配置"""
     atr_window: int = 14
     ema_fast: int = 9
     ema_slow: int = 21
     volatility_multiplier: float = 2.5
     max_retries: int = 3
     order_timeout: float = 0.15  # 150ms超时
-    price_precision: int = 2
-    quantity_precision: int = 3
+    # 从环境变量中读取精度，默认 2 和 3
+    price_precision: int = int(os.getenv('PRICE_PRECISION', '2'))
+    quantity_precision: int = int(os.getenv('QUANTITY_PRECISION', '3'))
     max_position: float = 10.0
-    network_timeout: float = 1.0  # 网络超时
+    network_timeout: float = 1.0
 
 class BinanceHFTClient:
-    """高频交易客户端（终极修复版）"""
-
     def __init__(self):
         self.config = TradingConfig()
         self.connector = TCPConnector(
@@ -136,7 +134,7 @@ class BinanceHFTClient:
         METRICS['throughput'].inc()
 
     async def _signed_request(self, method: str, path: str, params: Dict) -> Dict:
-        """增强型签名请求：构造完整 URL 后发送请求"""
+        # 添加公共参数
         params.update({
             'timestamp': int(time.time() * 1000 + self._time_diff),
             'recvWindow': self.recv_window
@@ -154,6 +152,7 @@ class BinanceHFTClient:
             await self.sync_server_time()
             raise
 
+        # 使用格式化字符串确保数值精度符合要求
         full_query = f"{query}&signature={signature}"
         url = f"{REST_URL}{path}?{full_query}"
         headers = {"X-MBX-APIKEY": API_KEY}
@@ -184,7 +183,6 @@ class BinanceHFTClient:
         raise Exception("超过最大重试次数")
 
     async def sync_server_time(self):
-        """高精度时间同步（不使用签名请求）"""
         url = f"{REST_URL}/dapi/v1/time"
         time_diffs = []
         for _ in range(7):
@@ -207,18 +205,16 @@ class BinanceHFTClient:
             raise Exception("无法同步服务器时间")
 
     async def manage_leverage(self):
-        """设置杠杆（USDC合约专用）"""
         params = {'symbol': SYMBOL, 'leverage': LEVERAGE, 'dualSidePosition': 'true'}
         return await self._signed_request('POST', '/dapi/v1/leverage', params)
 
     async def fetch_klines(self) -> Optional[pd.DataFrame]:
-        """获取K线数据（内存优化）"""
         params = {'symbol': SYMBOL, 'interval': '1m', 'limit': 100, 'contractType': 'PERPETUAL'}
         try:
             data = await self._signed_request('GET', '/dapi/v1/klines', params)
             arr = np.empty((len(data), 6), dtype=np.float64)
             for i, candle in enumerate(data):
-                # 根据 Binance USDC 合约 API 文档，请确保字段下标正确（此处示例取 [1, 2, 3, 4, 5, 7]）
+                # 根据 USDC 合约文档调整字段下标，此处使用 [1,2,3,4,5,7]
                 arr[i] = [float(candle[j]) for j in [1, 2, 3, 4, 5, 7]]
             return pd.DataFrame({
                 'open': arr[:, 0],
@@ -233,8 +229,6 @@ class BinanceHFTClient:
             return None
 
 class ETHUSDCStrategy:
-    """策略交易实现（全问题修复版）"""
-
     def __init__(self, client: BinanceHFTClient):
         self.client = client
         self.config = TradingConfig()
@@ -259,10 +253,13 @@ class ETHUSDCStrategy:
 
                 if ema_fast[-1] > ema_slow[-1] * 1.003:
                     stop_price = close_prices[-1] - (atr * self.config.volatility_multiplier)
-                    await self._execute_order('BUY', stop_price)
+                    # 格式化stopPrice，确保小数位不超过配置
+                    formatted_stop = float(f"{stop_price:.{self.config.price_precision}f}")
+                    await self._execute_order('BUY', formatted_stop)
                 elif ema_fast[-1] < ema_slow[-1] * 0.997:
                     stop_price = close_prices[-1] + (atr * self.config.volatility_multiplier)
-                    await self._execute_order('SELL', stop_price)
+                    formatted_stop = float(f"{stop_price:.{self.config.price_precision}f}")
+                    await self._execute_order('SELL', formatted_stop)
 
                 cycle_time = (time.monotonic() - cycle_start) * 1000
                 METRICS['latency'].set(cycle_time)
@@ -290,13 +287,15 @@ class ETHUSDCStrategy:
             if qty <= 0:
                 logger.warning("已达最大持仓限制")
                 return
+            # 格式化数量
+            formatted_qty = float(f"{qty:.{self.config.quantity_precision}f}")
 
             params = {
                 'symbol': SYMBOL,
                 'side': side,
                 'type': 'STOP',
-                'stopPrice': round(price, self.config.price_precision),
-                'quantity': round(qty, self.config.quantity_precision),
+                'stopPrice': float(f"{price:.{self.config.price_precision}f}"),
+                'quantity': formatted_qty,
                 'timeInForce': 'GTC',
                 'workingType': 'MARK_PRICE',
                 'priceProtect': 'true'
