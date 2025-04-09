@@ -2,7 +2,6 @@
 # 高频交易引擎 v3.6 (Vultr VHF-1C-1GB 终极优化版)
 
 import uvloop
-
 uvloop.install()
 
 import asyncio
@@ -26,21 +25,22 @@ import psutil
 
 # ========== 环境配置 ==========
 load_dotenv()
-API_KEY = os.getenv('BINANCE_API_KEY')
-SECRET_KEY = os.getenv('BINANCE_SECRET_KEY')
-SYMBOL = os.getenv('TRADING_PAIR', 'ETHUSDT')
+# 加上 strip() 去掉可能存在的多余空格
+API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
+SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
+SYMBOL = os.getenv('TRADING_PAIR', 'ETHUSDC').strip()  # 此处建议使用 'ETHUSDC' 合约标的（根据实际情况调整）
 LEVERAGE = int(os.getenv('LEVERAGE', 10))
 QUANTITY = float(os.getenv('QUANTITY', 0.01))
 REST_URL = 'https://fapi.binance.com'
 
-# 必须检查 API_KEY 和 SECRET_KEY 是否加载成功
-if API_KEY is None or SECRET_KEY is None:
+# 检查 API_KEY 与 SECRET_KEY 是否有效
+if not API_KEY or not SECRET_KEY:
     raise Exception("请在 .env 中正确配置 BINANCE_API_KEY 与 BINANCE_SECRET_KEY")
 
 # ========== 高频参数 ==========
 # 各接口的 (请求上限, 时间周期[s])
 RATE_LIMITS = {
-    'klines': (40, 5),  # K线请求：最多40次，每5秒
+    'klines': (40, 5),    # K线请求：最多40次，每5秒
     'orders': (160, 10),  # 订单请求：最多160次，每10秒
     'leverage': (15, 60)
 }
@@ -90,11 +90,11 @@ class BinanceHFTClient:
         self._config = TradingConfig()
 
         self.connector = TCPConnector(
-            limit=64,  # 增大连接池
+            limit=64,              # 增大连接池
             ssl=False,
-            force_close=True,  # 强制关闭空闲连接
+            force_close=True,      # 强制关闭空闲连接
             use_dns_cache=True,
-            ttl_dns_cache=180,  # DNS缓存时间（秒）
+            ttl_dns_cache=180,     # DNS缓存时间（秒）
             enable_cleanup_closed=True
         )
         # 初始化 session 依赖 _config.order_timeout
@@ -109,7 +109,7 @@ class BinanceHFTClient:
         """初始化智能会话"""
         retry_opts = ExponentialRetry(
             attempts=self._config.max_retries,
-            start_timeout=0.03,  # 更激进超时设置
+            start_timeout=0.03,  # 激进超时设置
             max_timeout=1.5,
             statuses={408, 429, 500, 502, 503, 504},
             exceptions={asyncio.TimeoutError}
@@ -122,8 +122,6 @@ class BinanceHFTClient:
 
     def _hmac_sign(self, params: Dict) -> str:
         """生成 HMAC 签名"""
-        if SECRET_KEY is None:
-            raise Exception("SECRET_KEY 未设置")
         query = urllib.parse.urlencode(sorted(params.items()))
         return hmac.new(
             SECRET_KEY.encode(),
@@ -160,7 +158,7 @@ class BinanceHFTClient:
             ).hexdigest()
         except Exception as e:
             logger.error(f"签名生成失败: {str(e)}")
-            await self.sync_server_time()  # 使用新同步方法
+            await self.sync_server_time()  # 调用同步时间（不再使用签名请求）
             raise
 
         headers = {"X-MBX-APIKEY": API_KEY}
