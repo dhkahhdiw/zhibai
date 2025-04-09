@@ -34,7 +34,7 @@ PROXY = None  # 生产环境关闭代理
 
 # ========== 高频交易优化参数 ==========
 RATE_LIMIT = {'klines': 30, 'orders': 120}  # 基于1GB内存的保守限制
-TCP_FAST_OPEN = True  # 需内核支持 net.ipv4.tcp_fastopen=3
+# TCP_FAST_OPEN 已废弃，不再传递
 
 # ========== 监控指标初始化 ==========
 MEM_USAGE = Gauge('memory_usage', 'Process memory usage (MB)')
@@ -58,13 +58,11 @@ class BinanceHFTClient:
     """高频交易客户端（含VPS优化适配）"""
 
     def __init__(self):
-        # 网络层优化配置
-        # 注意：如果使用的 aiohttp 版本不支持 tcp_fast_open 参数，请删除下面这一行中的 tcp_fast_open=TCP_FAST_OPEN,
+        # 网络层优化配置：移除 tcp_fast_open 参数
         self.connector = TCPConnector(
-            limit=8,  # 针对 1GB 内存的优化
+            limit=8,               # 针对 1GB 内存的优化
             ssl=False,
             force_close=True,
-            tcp_fast_open=TCP_FAST_OPEN,
             keepalive_timeout=10
         )
         retry_opts = ExponentialRetry(attempts=3, start_timeout=0.5, max_timeout=2)
@@ -89,6 +87,21 @@ class BinanceHFTClient:
             hashlib.sha256
         ).hexdigest()
 
+    async def _rate_limit_check(self, endpoint: str):
+        """异步速率限制控制（基于60秒窗口）"""
+        now = time.time()
+        window = 60  # 60秒窗口
+
+        # 清理过期时间戳
+        while self.request_timestamps[endpoint] and self.request_timestamps[endpoint][0] < now - window:
+            self.request_timestamps[endpoint].popleft()
+
+        if len(self.request_timestamps[endpoint]) >= RATE_LIMIT[endpoint]:
+            sleep_time = (self.request_timestamps[endpoint][0] + window) - now
+            logger.warning(f"速率限制触发: {endpoint} 休眠 {sleep_time:.2f}s")
+            await asyncio.sleep(max(sleep_time, 0))
+        self.request_timestamps[endpoint].append(time.time())
+
     async def _post(self, path: str, params: Dict) -> Dict:
         """带时间校准的 POST 请求"""
         params.update({
@@ -98,7 +111,7 @@ class BinanceHFTClient:
         })
 
         endpoint = path.split('/')[-1]
-        self._rate_limit_check(endpoint)
+        await self._rate_limit_check(endpoint)
 
         headers = {"X-MBX-APIKEY": API_KEY}
         async with self.session.post(REST_URL + path, headers=headers, data=params) as resp:
@@ -110,7 +123,7 @@ class BinanceHFTClient:
 
     async def _get(self, path: str, params: Dict) -> Dict:
         """GET 请求封装（适配 Binance 官方要求）"""
-        self._rate_limit_check('klines')
+        await self._rate_limit_check('klines')
         async with self.session.get(REST_URL + path, params=params) as resp:
             data = await resp.json()
             if resp.status != 200:
@@ -141,21 +154,6 @@ class BinanceHFTClient:
             server_time = data['serverTime']
             self._time_diff = server_time - int(time.time() * 1000)
             logger.info(f"时间校准完成, 偏差: {self._time_diff}ms")
-
-    def _rate_limit_check(self, endpoint: str):
-        """简单速率限制控制（基于60秒窗口）"""
-        now = time.time()
-        window = 60  # 60秒窗口
-
-        # 清理过期时间戳
-        while self.request_timestamps[endpoint] and self.request_timestamps[endpoint][0] < now - window:
-            self.request_timestamps[endpoint].popleft()
-
-        if len(self.request_timestamps[endpoint]) >= RATE_LIMIT[endpoint]:
-            sleep_time = (self.request_timestamps[endpoint][0] + window) - now
-            logger.warning(f"速率限制触发: {endpoint} 休眠 {sleep_time:.2f}s")
-            time.sleep(max(sleep_time, 0))
-        self.request_timestamps[endpoint].append(now)
 
     async def fetch_klines(self) -> Optional[pd.DataFrame]:
         """获取 K 线数据（内存敏感型优化）"""
