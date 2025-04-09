@@ -35,7 +35,7 @@ REST_URL = 'https://fapi.binance.com'
 
 # ========== 高频参数 ==========
 RATE_LIMITS = {
-    'klines': (40, 5),  # 提升K线请求限制
+    'klines': (40, 5),  # (limit, period) 提升K线请求限制
     'orders': (160, 10),  # 订单速率优化
     'leverage': (15, 60)
 }
@@ -72,7 +72,7 @@ class TradingConfig:
     ema_slow: int = 21
     volatility_multiplier: float = 2.0  # 提高波动率系数
     max_retries: int = 7
-    order_timeout: float = 0.25  # 超时时间优化
+    order_timeout: float = 0.25  # 超时时间优化（秒）
     price_precision: int = 2
     position_ratio: float = 0.95  # 仓位利用率
 
@@ -81,6 +81,9 @@ class BinanceHFTClient:
     """高频交易客户端（Vultr终极优化版）"""
 
     def __init__(self):
+        # 先加载配置
+        self._config = TradingConfig()
+
         self.connector = TCPConnector(
             limit=64,  # 增大连接池
             ssl=False,
@@ -89,14 +92,13 @@ class BinanceHFTClient:
             ttl_dns_cache=180,  # 更短DNS缓存
             enable_cleanup_closed=True
         )
+        # 初始化 session 时使用 _config
         self._init_session()
         self.recv_window = 5000
-        # 修复括号未闭合问题
         self.request_timestamps = defaultdict(
-            lambda: deque(maxlen=RATE_LIMITS['klines'][0] + 60)
+            lambda: deque(maxlen=RATE_LIMITS.get('klines', (60, 1))[0] + 60)
         )
         self._time_diff = 0
-        self._config = TradingConfig()
 
     def _init_session(self):
         """初始化智能会话"""
@@ -202,7 +204,7 @@ class BinanceHFTClient:
         params = {'symbol': SYMBOL, 'interval': '1m', 'limit': 100}
         try:
             data = await self._signed_request('GET', '/fapi/v1/klines', params)
-            # 预分配内存+向量化处理
+            # 预分配内存 + 向量化处理
             arr = np.empty((len(data), 6), dtype=np.float64)
             for i, candle in enumerate(data):
                 arr[i] = [float(candle[j]) for j in [0, 1, 2, 3, 4, 5]]
@@ -224,11 +226,11 @@ class VolatilityStrategy:
 
     def __init__(self, client: BinanceHFTClient):
         self.client = client
-        self.config = TradingConfig()
+        self.config = TradingConfig()  # 可独立配置或使用客户端配置
         self._init_indicators()
 
     def _init_indicators(self):
-        """预编译JIT加速"""
+        """预编译JIT加速（通过 lambda 方式调用 pandas 内置函数）"""
         self.ema_fast = lambda x: x.ewm(span=self.config.ema_fast, adjust=False).mean().values
         self.ema_slow = lambda x: x.ewm(span=self.config.ema_slow, adjust=False).mean().values
 
@@ -250,9 +252,7 @@ class VolatilityStrategy:
         while True:
             try:
                 # 实时资源监控
-                METRICS['memory'].set(
-                    psutil.Process().memory_info().rss // 1024 // 1024
-                )
+                METRICS['memory'].set(psutil.Process().memory_info().rss // 1024 // 1024)
 
                 df = await self.client.fetch_klines()
                 if df is None:
@@ -260,8 +260,8 @@ class VolatilityStrategy:
                     continue
 
                 close_view = df['close'].values.astype(np.float64, copy=False)
-                ema_f = self.ema_fast(close_view)[-1]
-                ema_s = self.ema_slow(close_view)[-1]
+                ema_f = self.ema_fast(pd.Series(close_view))[-1]
+                ema_s = self.ema_slow(pd.Series(close_view))[-1]
 
                 if ema_f > ema_s * 1.002:  # 提高触发阈值
                     atr_val = self.calculate_atr(
@@ -304,7 +304,6 @@ class VolatilityStrategy:
 async def main():
     client = BinanceHFTClient()
     strategy = VolatilityStrategy(client)
-
     try:
         await strategy.execute_strategy()
     finally:
