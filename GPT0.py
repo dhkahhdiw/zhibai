@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# 高频交易引擎 v3.1 (Vultr 1GB内存特化版)
+# 高频交易引擎 v3.2 (Vultr VHF-1C-1GB 特化版)
 
 import uvloop
 
@@ -37,7 +37,7 @@ REST_URL = 'https://fapi.binance.com'
 RATE_LIMITS = {
     'klines': (30, 5),  # 30次/5秒
     'orders': (120, 10),  # 120次/10秒
-    'leverage': (10, 60)  # 10次/分钟[6,8](@ref)
+    'leverage': (10, 60)  # 10次/分钟
 }
 
 # ========== 监控指标 ==========
@@ -72,7 +72,7 @@ class TradingConfig:
     ema_slow: int = 21
     volatility_multiplier: float = 1.5
     max_retries: int = 3
-    order_timeout: float = 1.2  # 秒[3,6](@ref)
+    order_timeout: float = 1.2  # 秒
 
 
 class BinanceHFTClient:
@@ -96,7 +96,7 @@ class BinanceHFTClient:
         self._config = TradingConfig()
 
     def _init_session(self):
-        """初始化带重试的会话[6](@ref)"""
+        """初始化带重试的会话"""
         retry_opts = ExponentialRetry(
             attempts=3,
             start_timeout=0.3,
@@ -110,7 +110,7 @@ class BinanceHFTClient:
         )
 
     async def _rate_limit_check(self, endpoint: str):
-        """动态速率限制检查[6,8](@ref)"""
+        """动态速率限制检查"""
         limit, period = RATE_LIMITS.get(endpoint, (60, 1))
         dq = self.request_timestamps[endpoint]
 
@@ -161,7 +161,7 @@ class BinanceHFTClient:
         raise Exception("Max retries exceeded")
 
     async def sync_server_time(self):
-        """增强型时间同步[3](@ref)"""
+        """增强型时间同步"""
         for _ in range(3):
             try:
                 data = await self._signed_request('GET', '/fapi/v1/time', {})
@@ -182,19 +182,19 @@ class BinanceHFTClient:
         return await self._signed_request('POST', '/fapi/v1/leverage', params)
 
     async def fetch_klines(self) -> Optional[pd.DataFrame]:
-        """内存优化版K线获取[2,9](@ref)"""
+        """内存优化版K线获取"""
         params = {'symbol': SYMBOL, 'interval': '1m', 'limit': 100}
         try:
             data = await self._signed_request('GET', '/fapi/v1/klines', params)
-            # 使用内存视图优化[2](@ref)
+            # 使用内存视图优化
             arr = np.array(data, dtype=np.float32)
             return pd.DataFrame({
                 'timestamp': arr[:, 0],
-                'open': arr[:, 1],
-                'high': arr[:, 2],
-                'low': arr[:, 3],
-                'close': arr[:, 4],
-                'volume': arr[:, 5]
+                'open': arr[:, 1].astype('float32'),
+                'high': arr[:, 2].astype('float32'),
+                'low': arr[:, 3].astype('float32'),
+                'close': arr[:, 4].astype('float32'),
+                'volume': arr[:, 5].astype('float32')
             }).iloc[-100:]
         except Exception as e:
             logger.error(f"获取K线失败: {str(e)}")
@@ -209,12 +209,12 @@ class BinanceHFTClient:
             self._init_indicators()
 
         def _init_indicators(self):
-            """向量化指标计算[2,4](@ref)"""
+            """向量化指标计算"""
             self.ema_fast = lambda x: x.ewm(span=self.config.ema_fast).mean().values
             self.ema_slow = lambda x: x.ewm(span=self.config.ema_slow).mean().values
 
         def calculate_atr(self, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> float:
-            """向量化ATR计算[4](@ref)"""
+            """向量化ATR计算"""
             tr = np.maximum(
                 high[1:] - low[1:],
                 np.abs(high[1:] - close[:-1]),
@@ -223,7 +223,7 @@ class BinanceHFTClient:
             return np.mean(tr[-self.config.atr_window:])
 
         async def execute_strategy(self):
-            """策略执行引擎[1,5](@ref)"""
+            """策略执行引擎"""
             await self.client.manage_leverage()
             await self.client.sync_server_time()
 
@@ -238,7 +238,7 @@ class BinanceHFTClient:
                         await asyncio.sleep(0.5)
                         continue
 
-                    # 内存视图优化[9](@ref)
+                    # 内存视图优化
                     close_view = df['close'].values.astype(np.float32, copy=False)
                     ema_f = self.ema_fast(close_view)[-1]
                     ema_s = self.ema_slow(close_view)[-1]
@@ -259,7 +259,7 @@ class BinanceHFTClient:
                     await asyncio.sleep(5)
 
         async def _execute_order(self, side: str, price: float):
-            """订单执行（带延迟监控）[3,6](@ref)"""
+            """订单执行（带延迟监控）"""
             start_time = time.monotonic()
             try:
                 params = {
