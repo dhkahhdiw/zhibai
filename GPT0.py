@@ -14,11 +14,13 @@ import logging
 from typing import Dict, Optional
 from collections import deque, defaultdict
 from dataclasses import dataclass
+from socket import AF_INET  # 强制使用IPv4
 
 import numpy as np
 import pandas as pd
 from aiohttp import ClientTimeout, TCPConnector
 from aiohttp_retry import RetryClient, ExponentialRetry
+from aiohttp.resolver import AsyncResolver
 from dotenv import load_dotenv
 from prometheus_client import Gauge, start_http_server
 import psutil
@@ -32,10 +34,10 @@ load_dotenv(_env_path)
 # 去除多余空格，确保格式正确
 API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
-SYMBOL = os.getenv('TRADING_PAIR', 'ETHUSDC').strip()  # 对于 USDC-M Futures，交易对应填写 "ETHUSDC"
+SYMBOL = os.getenv('TRADING_PAIR', 'ETHUSDC').strip()  # 交易对名称，USDC合约通常用 "ETHUSDC"
 LEVERAGE = int(os.getenv('LEVERAGE', 10))
 QUANTITY = float(os.getenv('QUANTITY', 0.06))
-# 对于 USDC-M Futures，采用基础 URL 为 api.binance.com，接口路径将带有产品前缀
+# 对于 USDC-M Futures，接口基础 URL 使用 Binance 官方域名
 REST_URL = 'https://api.binance.com'
 
 if not API_KEY or not SECRET_KEY:
@@ -62,7 +64,7 @@ METRICS = {
 
 # ========== 日志配置 ==========
 logging.basicConfig(
-    level=logging.INFO,  # 如需调试，可修改为 DEBUG
+    level=logging.INFO,  # 若需要更详细调试信息，可设置为 DEBUG
     format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
@@ -71,7 +73,7 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger('ETH-USDC-HFT')
-DEBUG = False  # 调试开关
+DEBUG = False
 
 @dataclass
 class TradingConfig:
@@ -81,22 +83,25 @@ class TradingConfig:
     ema_slow: int = 21
     volatility_multiplier: float = 2.5
     max_retries: int = 3
-    order_timeout: float = 0.15  # 150ms超时
+    order_timeout: float = 0.5  # 500ms连接超时
+    network_timeout: float = 2.0  # 2秒总超时
     price_precision: int = int(os.getenv('PRICE_PRECISION', '2'))
     quantity_precision: int = int(os.getenv('QUANTITY_PRECISION', '3'))
     max_position: float = 10.0
-    network_timeout: float = 1.0
 
 class BinanceHFTClient:
     """高频交易客户端（终极修复版）"""
-
     def __init__(self):
         self.config = TradingConfig()
+        # 配置解析器为 IPv4（使用公共DNS提高解析稳定性）
+        resolver = AsyncResolver(nameservers=["8.8.8.8", "1.1.1.1"])
         self.connector = TCPConnector(
             limit=128,
             ssl=True,
             ttl_dns_cache=60,
-            force_close=True
+            force_close=True,
+            family=AF_INET,
+            resolver=resolver
         )
         self._init_session()
         self.recv_window = 5000
@@ -136,7 +141,7 @@ class BinanceHFTClient:
         METRICS['throughput'].inc()
 
     async def _signed_request(self, method: str, path: str, params: Dict) -> Dict:
-        # 增加公共参数
+        # 添加公共参数
         params.update({
             'timestamp': int(time.time() * 1000 + self._time_diff),
             'recvWindow': self.recv_window
@@ -155,7 +160,7 @@ class BinanceHFTClient:
             raise
 
         full_query = f"{query}&signature={signature}"
-        # 使用 USDC-M Futures 专用路径前缀
+        # 使用 USDC-M Futures 专用路径前缀 "/sapi/v1/futures/usdc"
         url = f"{REST_URL}/sapi/v1/futures/usdc{path}?{full_query}"
         headers = {"X-MBX-APIKEY": API_KEY}
         if DEBUG:
@@ -216,7 +221,7 @@ class BinanceHFTClient:
             data = await self._signed_request('GET', '/klines', params)
             arr = np.empty((len(data), 6), dtype=np.float64)
             for i, candle in enumerate(data):
-                # 根据 Binance USDC-M Futures 文档字段下标（示例中取 [1,2,3,4,5,7]）
+                # 根据 Binance USDC-M Futures 文档，字段下标请确认，此处示例取 [1,2,3,4,5,7]
                 arr[i] = [float(candle[j]) for j in [1, 2, 3, 4, 5, 7]]
             return pd.DataFrame({
                 'open': arr[:, 0],
@@ -232,7 +237,6 @@ class BinanceHFTClient:
 
 class ETHUSDCStrategy:
     """策略交易实现（全问题修复版）"""
-
     def __init__(self, client: BinanceHFTClient):
         self.client = client
         self.config = TradingConfig()
@@ -240,7 +244,6 @@ class ETHUSDCStrategy:
     async def execute(self):
         await self.client.manage_leverage()
         await self.client.sync_server_time()
-
         while True:
             try:
                 cycle_start = time.monotonic()
@@ -254,7 +257,6 @@ class ETHUSDCStrategy:
                 ema_fast = pd.Series(close_prices).ewm(span=self.config.ema_fast, adjust=False).mean().values
                 ema_slow = pd.Series(close_prices).ewm(span=self.config.ema_slow, adjust=False).mean().values
                 atr = self._calculate_atr(df)
-
                 if ema_fast[-1] > ema_slow[-1] * 1.003:
                     stop_price = close_prices[-1] - (atr * self.config.volatility_multiplier)
                     formatted_stop = float(f"{stop_price:.{self.config.price_precision}f}")
@@ -263,7 +265,6 @@ class ETHUSDCStrategy:
                     stop_price = close_prices[-1] + (atr * self.config.volatility_multiplier)
                     formatted_stop = float(f"{stop_price:.{self.config.price_precision}f}")
                     await self._execute_order('SELL', formatted_stop)
-
                 cycle_time = (time.monotonic() - cycle_start) * 1000
                 METRICS['latency'].set(cycle_time)
                 await asyncio.sleep(max(0.05, 0.15 - cycle_time / 1000))
@@ -294,7 +295,7 @@ class ETHUSDCStrategy:
             params = {
                 'symbol': SYMBOL,
                 'side': side,
-                'type': 'STOP',  # 根据文档，USDC-M Futures可能要求使用 STOP_MARKET，如有需要请修改
+                'type': 'STOP',  # 如官方建议使用 STOP_MARKET，请根据实际文档修改此处
                 'stopPrice': float(f"{price:.{self.config.price_precision}f}"),
                 'quantity': formatted_qty,
                 'timeInForce': 'GTC',
