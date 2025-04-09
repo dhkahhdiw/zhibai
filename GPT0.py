@@ -11,7 +11,7 @@ import hmac
 import hashlib
 import urllib.parse
 import logging
-from typing import Optional, Dict, Deque, Any
+from typing import Dict
 from collections import deque, defaultdict
 from dataclasses import dataclass
 
@@ -23,19 +23,25 @@ from dotenv import load_dotenv
 from prometheus_client import Gauge, start_http_server
 import psutil
 
-# ========== 环境配置 ==========
-load_dotenv()
-# 加上 strip() 去掉可能存在的多余空格
+# ========== 强制指定加载的 .env 文件 ==========
+# 注意：请确保 /root/zhibai/.env 存在，并包含如下内容（请使用正确的 API 密钥）：
+# BINANCE_API_KEY=你的正确Futures_API_KEY
+# BINANCE_SECRET_KEY=你的正确Futures_SECRET_KEY
+# TRADING_PAIR=ETHUSDC
+# LEVERAGE=10
+# QUANTITY=0.06
+load_dotenv('/root/zhibai/.env')
+
+# 去除多余空格，保证格式正确
 API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
-SYMBOL = os.getenv('TRADING_PAIR', 'ETHUSDC').strip()  # 此处建议使用 'ETHUSDC' 合约标的（根据实际情况调整）
+SYMBOL = os.getenv('TRADING_PAIR', 'ETHUSDC').strip()
 LEVERAGE = int(os.getenv('LEVERAGE', 10))
-QUANTITY = float(os.getenv('QUANTITY', 0.01))
+QUANTITY = float(os.getenv('QUANTITY', 0.06))
 REST_URL = 'https://fapi.binance.com'
 
-# 检查 API_KEY 与 SECRET_KEY 是否有效
 if not API_KEY or not SECRET_KEY:
-    raise Exception("请在 .env 中正确配置 BINANCE_API_KEY 与 BINANCE_SECRET_KEY")
+    raise Exception("请在 /root/zhibai/.env 中正确配置 BINANCE_API_KEY 与 BINANCE_SECRET_KEY")
 
 # ========== 高频参数 ==========
 # 各接口的 (请求上限, 时间周期[s])
@@ -55,7 +61,7 @@ METRICS = {
 
 # ========== 日志配置 ==========
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO,  # 若需要更多调试信息，可将 level 调整为 DEBUG
     format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
@@ -67,6 +73,7 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger('HFT-Core')
+DEBUG = False  # 设置为 True 可启用调试日志
 
 
 @dataclass
@@ -86,9 +93,8 @@ class BinanceHFTClient:
     """高频交易客户端（Vultr终极优化版）"""
 
     def __init__(self):
-        # 先初始化配置，确保后续使用时 self._config 存在
+        # 先初始化配置
         self._config = TradingConfig()
-
         self.connector = TCPConnector(
             limit=64,              # 增大连接池
             ssl=False,
@@ -97,7 +103,6 @@ class BinanceHFTClient:
             ttl_dns_cache=180,     # DNS缓存时间（秒）
             enable_cleanup_closed=True
         )
-        # 初始化 session 依赖 _config.order_timeout
         self._init_session()
         self.recv_window = 5000
         self.request_timestamps = defaultdict(
@@ -158,10 +163,13 @@ class BinanceHFTClient:
             ).hexdigest()
         except Exception as e:
             logger.error(f"签名生成失败: {str(e)}")
-            await self.sync_server_time()  # 调用同步时间（不再使用签名请求）
+            await self.sync_server_time()
             raise
 
         headers = {"X-MBX-APIKEY": API_KEY}
+        url = REST_URL + path
+        if DEBUG:
+            logger.debug(f"请求 {method} {url} 参数: {params}, 签名: {signature}")
         for attempt in range(self._config.max_retries):
             try:
                 endpoint = path.split('/')[-1]
@@ -169,12 +177,18 @@ class BinanceHFTClient:
                 post_data = {**params, 'signature': signature}
                 async with self.session.request(
                         method,
-                        REST_URL + path,
+                        url,
                         headers=headers,
                         data=post_data
                 ) as resp:
+                    resp_text = await resp.text()
+                    if DEBUG:
+                        logger.debug(f"返回状态 {resp.status}, 内容: {resp_text}")
                     if resp.status != 200:
-                        error = await resp.json()
+                        try:
+                            error = await resp.json()
+                        except Exception:
+                            error = resp_text
                         logger.error(f"API Error {resp.status}: {error}")
                         continue
                     return await resp.json()
@@ -200,7 +214,7 @@ class BinanceHFTClient:
             except Exception as e:
                 logger.error(f"时间同步失败: {str(e)}")
         if time_diffs:
-            self._time_diff = int(np.mean(time_diffs[-3:]))  # 使用最后三次平均值
+            self._time_diff = int(np.mean(time_diffs[-3:]))
             if abs(self._time_diff) > 500:
                 logger.warning(f"时间偏差警告: {self._time_diff}ms")
         else:
@@ -216,7 +230,6 @@ class BinanceHFTClient:
         params = {'symbol': SYMBOL, 'interval': '1m', 'limit': 100}
         try:
             data = await self._signed_request('GET', '/fapi/v1/klines', params)
-            # 预分配内存 + 向量化处理
             arr = np.empty((len(data), 6), dtype=np.float64)
             for i, candle in enumerate(data):
                 arr[i] = [float(candle[j]) for j in [0, 1, 2, 3, 4, 5]]
@@ -238,7 +251,7 @@ class VolatilityStrategy:
 
     def __init__(self, client: BinanceHFTClient):
         self.client = client
-        self.config = TradingConfig()  # 独立配置
+        self.config = TradingConfig()
         self._init_indicators()
 
     def _init_indicators(self):
@@ -263,7 +276,6 @@ class VolatilityStrategy:
 
         while True:
             try:
-                # 实时监控内存使用
                 METRICS['memory'].set(psutil.Process().memory_info().rss // 1024 // 1024)
                 df = await self.client.fetch_klines()
                 if df is None:
@@ -274,7 +286,7 @@ class VolatilityStrategy:
                 ema_f = self.ema_fast(pd.Series(close_view))[-1]
                 ema_s = self.ema_slow(pd.Series(close_view))[-1]
 
-                if ema_f > ema_s * 1.002:  # 提高触发阈值
+                if ema_f > ema_s * 1.002:
                     atr_val = self.calculate_atr(
                         df['high'].values,
                         df['low'].values,
@@ -284,8 +296,7 @@ class VolatilityStrategy:
                     stop_price = round(stop_price, self.config.price_precision)
                     await self._execute_order('BUY', stop_price)
 
-                await asyncio.sleep(0.25)  # 250ms 循环周期
-
+                await asyncio.sleep(0.25)
             except Exception as e:
                 logger.error(f"策略异常: {str(e)}")
                 await asyncio.sleep(1)
