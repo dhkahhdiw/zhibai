@@ -11,7 +11,7 @@ import hmac
 import hashlib
 import urllib.parse
 import logging
-from typing import Dict
+from typing import Dict, Optional  # 增加 Optional 导入
 from collections import deque, defaultdict
 from dataclasses import dataclass
 
@@ -30,7 +30,7 @@ if not os.path.exists(_env_path):
 
 load_dotenv(_env_path)
 
-# 去除多余空格，保证格式正确
+# 去除多余空格，确保格式正确
 API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
 SYMBOL = os.getenv('TRADING_PAIR', 'ETHUSDC').strip()
@@ -39,7 +39,7 @@ QUANTITY = float(os.getenv('QUANTITY', 0.06))
 # USDC合约接口使用 dapi
 REST_URL = 'https://dapi.binance.com'
 
-# 简单检查密钥格式（示例：真实密钥通常为64个字符，请根据实际要求调整）
+# 简单验证密钥（这里只作示例，请根据实际要求调整验证规则）
 if len(API_KEY) != 64 or len(SECRET_KEY) != 64:
     raise ValueError("API密钥格式错误，应为64位字符，请检查 BINANCE_API_KEY 与 BINANCE_SECRET_KEY")
 
@@ -62,7 +62,7 @@ METRICS = {
 
 # ========== 日志配置 ==========
 logging.basicConfig(
-    level=logging.INFO,  # 如需调试可将 level 改为 DEBUG
+    level=logging.INFO,  # 如需更详细调试可修改为 DEBUG
     format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
@@ -71,7 +71,7 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger('ETH-USDC-HFT')
-DEBUG = False  # 设置为 True 则输出更多调试信息
+DEBUG = False  # 调试开关
 
 @dataclass
 class TradingConfig:
@@ -136,13 +136,11 @@ class BinanceHFTClient:
         METRICS['throughput'].inc()
 
     async def _signed_request(self, method: str, path: str, params: Dict) -> Dict:
-        """增强型签名请求：手动构造完整URL，确保参数顺序与签名一致"""
-        # 添加公共参数
+        """增强型签名请求：构造签名并拼接到URL上"""
         params.update({
             'timestamp': int(time.time() * 1000 + self._time_diff),
             'recvWindow': self.recv_window
         })
-        # 对参数进行排序并编码
         sorted_params = sorted(params.items())
         query = urllib.parse.urlencode(sorted_params)
         try:
@@ -155,8 +153,7 @@ class BinanceHFTClient:
             logger.error(f"签名生成失败: {str(e)}")
             await self.sync_server_time()
             raise
-
-        # 将签名加到query中
+        # 将签名附加到查询字符串中
         full_query = f"{query}&signature={signature}"
         url = f"{REST_URL}{path}?{full_query}"
         headers = {"X-MBX-APIKEY": API_KEY}
@@ -169,7 +166,7 @@ class BinanceHFTClient:
                 async with self.session.request(method, url, headers=headers) as resp:
                     resp_text = await resp.text()
                     if DEBUG:
-                        logger.debug(f"返回状态 {resp.status}，内容: {resp_text}")
+                        logger.debug(f"返回状态 {resp.status}, 内容: {resp_text}")
                     if resp.status == 401:
                         logger.error(f"API错误 401: {resp_text}")
                         raise Exception("API-key format invalid，请检查API密钥格式")
@@ -221,7 +218,7 @@ class BinanceHFTClient:
             data = await self._signed_request('GET', '/dapi/v1/klines', params)
             arr = np.empty((len(data), 6), dtype=np.float64)
             for i, candle in enumerate(data):
-                # 根据文档：K线数据各字段下标可能不同，请参考Binance USDC-m Futures文档调整
+                # 根据Binance USDC-M文档，K线数据字段下标可能需要调整
                 arr[i] = [float(candle[j]) for j in [1, 2, 3, 4, 5, 7]]
             return pd.DataFrame({
                 'open': arr[:, 0],
