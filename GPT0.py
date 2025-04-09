@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# 高频交易引擎 v3.6 (Vultr VHF-1C-1GB 终极优化版)
+# 高频交易引擎 v3.61 (Vultr VHF-1C-1GB 终极优化版)
 
 import uvloop
 
@@ -34,9 +34,10 @@ QUANTITY = float(os.getenv('QUANTITY', 0.01))
 REST_URL = 'https://fapi.binance.com'
 
 # ========== 高频参数 ==========
+# 各接口的 (请求上限, 时间周期[s])
 RATE_LIMITS = {
-    'klines': (40, 5),  # (limit, period) 提升K线请求限制
-    'orders': (160, 10),  # 订单速率优化
+    'klines': (40, 5),  # K线请求：最多40次，每5秒
+    'orders': (160, 10),  # 订单请求：最多160次，每10秒
     'leverage': (15, 60)
 }
 
@@ -72,7 +73,7 @@ class TradingConfig:
     ema_slow: int = 21
     volatility_multiplier: float = 2.0  # 提高波动率系数
     max_retries: int = 7
-    order_timeout: float = 0.25  # 超时时间优化（秒）
+    order_timeout: float = 0.25  # 超时时间（秒）
     price_precision: int = 2
     position_ratio: float = 0.95  # 仓位利用率
 
@@ -81,7 +82,7 @@ class BinanceHFTClient:
     """高频交易客户端（Vultr终极优化版）"""
 
     def __init__(self):
-        # 先加载配置
+        # 先初始化配置，确保后续使用 self._config 时不会出错
         self._config = TradingConfig()
 
         self.connector = TCPConnector(
@@ -89,10 +90,10 @@ class BinanceHFTClient:
             ssl=False,
             force_close=True,  # 强制关闭空闲连接
             use_dns_cache=True,
-            ttl_dns_cache=180,  # 更短DNS缓存
+            ttl_dns_cache=180,  # DNS缓存时间（秒）
             enable_cleanup_closed=True
         )
-        # 初始化 session 时使用 _config
+        # 初始化 session 依赖 _config.order_timeout
         self._init_session()
         self.recv_window = 5000
         self.request_timestamps = defaultdict(
@@ -103,7 +104,7 @@ class BinanceHFTClient:
     def _init_session(self):
         """初始化智能会话"""
         retry_opts = ExponentialRetry(
-            attempts=7,
+            attempts=self._config.max_retries,
             start_timeout=0.03,  # 更激进超时设置
             max_timeout=1.5,
             statuses={408, 429, 500, 502, 503, 504},
@@ -119,7 +120,6 @@ class BinanceHFTClient:
         """动态速率限制（带自适应调整）"""
         limit, period = RATE_LIMITS.get(endpoint, (60, 1))
         dq = self.request_timestamps[endpoint]
-
         now = time.time()
         while dq and dq[0] < now - period:
             dq.popleft()
@@ -226,11 +226,11 @@ class VolatilityStrategy:
 
     def __init__(self, client: BinanceHFTClient):
         self.client = client
-        self.config = TradingConfig()  # 可独立配置或使用客户端配置
+        self.config = TradingConfig()  # 使用独立配置或共享客户端配置
         self._init_indicators()
 
     def _init_indicators(self):
-        """预编译JIT加速（通过 lambda 方式调用 pandas 内置函数）"""
+        """预编译加速（通过lambda调用pandas内置函数）"""
         self.ema_fast = lambda x: x.ewm(span=self.config.ema_fast, adjust=False).mean().values
         self.ema_slow = lambda x: x.ewm(span=self.config.ema_slow, adjust=False).mean().values
 
@@ -251,7 +251,7 @@ class VolatilityStrategy:
 
         while True:
             try:
-                # 实时资源监控
+                # 实时监控内存使用
                 METRICS['memory'].set(psutil.Process().memory_info().rss // 1024 // 1024)
 
                 df = await self.client.fetch_klines()
