@@ -32,13 +32,16 @@ load_dotenv(_env_path)
 # 去除多余空格，确保格式正确
 API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
-SYMBOL = os.getenv('TRADING_PAIR', 'ETHUSDC').strip()  # 本示例使用 "ETHUSDC"；若你使用其它合约请调整
+SYMBOL = os.getenv('TRADING_PAIR', 'ETHUSDC').strip()  # 对于 USDC-M Futures，交易对通常为 "ETHUSDC"
 LEVERAGE = int(os.getenv('LEVERAGE', 10))
 QUANTITY = float(os.getenv('QUANTITY', 0.06))
-# 对于 USDC-M Futures，基础 URL 修改为 Binance USDC-M Futures 正式地址（请参照官方文档确认）
-REST_URL = 'https://api.binance.usdc.com'
+# 对于 USDC-M Futures，采用官方基础 URL（v1 接口）
+REST_URL = 'https://api.binance.com'
 
-# 检查密钥格式（此处示例要求为64字符，如不符请按实际情况修改）
+if not API_KEY or not SECRET_KEY:
+    raise Exception("请在 /root/zhibai/.env 中正确配置 BINANCE_API_KEY 与 BINANCE_SECRET_KEY")
+
+# 简单密钥格式验证（示例要求密钥为 64 个字符，请根据实际情况调整）
 if len(API_KEY) != 64 or len(SECRET_KEY) != 64:
     raise ValueError("API密钥格式错误，应为64位字符，请检查 BINANCE_API_KEY 与 BINANCE_SECRET_KEY")
 
@@ -61,7 +64,7 @@ METRICS = {
 
 # ========== 日志配置 ==========
 logging.basicConfig(
-    level=logging.INFO,  # 如需更详细调试信息，可设置为 DEBUG
+    level=logging.INFO,  # 如需调试可改为 DEBUG
     format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
@@ -214,7 +217,7 @@ class BinanceHFTClient:
             data = await self._signed_request('GET', '/api/v1/klines', params)
             arr = np.empty((len(data), 6), dtype=np.float64)
             for i, candle in enumerate(data):
-                # 根据 USDC-M Futures 文档，字段下标请参考实际文档（此处示例使用 [1,2,3,4,5,7]）
+                # 根据 Binance USDC-M Futures 文档，请确认字段下标，此处示例取 [1,2,3,4,5,7]
                 arr[i] = [float(candle[j]) for j in [1, 2, 3, 4, 5, 7]]
             return pd.DataFrame({
                 'open': arr[:, 0],
@@ -292,7 +295,7 @@ class ETHUSDCStrategy:
             params = {
                 'symbol': SYMBOL,
                 'side': side,
-                'type': 'STOP',  # 如USDC-M要求使用STOP_MARKET，请根据最新文档调整此处
+                'type': 'STOP',  # 根据最新文档，可能需要使用 STOP_MARKET
                 'stopPrice': float(f"{price:.{self.config.price_precision}f}"),
                 'quantity': formatted_qty,
                 'timeInForce': 'GTC',
