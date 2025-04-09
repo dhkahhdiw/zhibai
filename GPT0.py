@@ -24,7 +24,7 @@ from prometheus_client import Gauge, start_http_server
 import psutil
 
 # ========== 强制指定加载的 .env 文件 ==========
-# 注意：请确保 /root/zhibai/.env 存在，并包含如下内容（请使用正确的 API 密钥）：
+# 请确保 /root/zhibai/.env 存在，并包含如下内容（请使用正确的 Futures API 密钥）：
 # BINANCE_API_KEY=你的正确Futures_API_KEY
 # BINANCE_SECRET_KEY=你的正确Futures_SECRET_KEY
 # TRADING_PAIR=ETHUSDC
@@ -66,15 +66,11 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("/var/log/hft_engine.log",
-                            encoding="utf-8",
-                            mode='a',
-                            delay=True)
+        logging.FileHandler("/var/log/hft_engine.log", encoding="utf-8", mode='a', delay=True)
     ]
 )
 logger = logging.getLogger('HFT-Core')
-DEBUG = False  # 设置为 True 可启用调试日志
-
+DEBUG = False  # 若设置为 True，则输出更详细的调试日志
 
 @dataclass
 class TradingConfig:
@@ -88,12 +84,10 @@ class TradingConfig:
     price_precision: int = 2
     position_ratio: float = 0.95  # 仓位利用率
 
-
 class BinanceHFTClient:
     """高频交易客户端（Vultr终极优化版）"""
 
     def __init__(self):
-        # 先初始化配置
         self._config = TradingConfig()
         self.connector = TCPConnector(
             limit=64,              # 增大连接池
@@ -184,6 +178,14 @@ class BinanceHFTClient:
                     resp_text = await resp.text()
                     if DEBUG:
                         logger.debug(f"返回状态 {resp.status}, 内容: {resp_text}")
+                    # 当返回401时直接抛出异常，避免重复重试
+                    if resp.status == 401:
+                        try:
+                            error = await resp.json()
+                        except Exception:
+                            error = resp_text
+                        logger.error(f"API Error 401: {error}")
+                        raise Exception("API-key format invalid, 请检查你的 API 密钥格式")
                     if resp.status != 200:
                         try:
                             error = await resp.json()
@@ -244,7 +246,6 @@ class BinanceHFTClient:
         except Exception as e:
             logger.error(f"获取K线失败: {str(e)}")
             return None
-
 
 class VolatilityStrategy:
     """波动率策略（终极优化版）"""
