@@ -1,0 +1,6 @@
+uvloop==0.21.0
+numpy==2.2.4
+pandas==2.2.3
+aiohttp==3.11.16
+aiohttp-retry==2.9.1
+python-dotenv==1.1.0
