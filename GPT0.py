@@ -32,16 +32,14 @@ load_dotenv(_env_path)
 # 去除多余空格，确保格式正确
 API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
-SYMBOL = os.getenv('TRADING_PAIR', 'ETHUSDC').strip()  # 对于 USDC-M Futures，交易对通常为 "ETHUSDC"
+SYMBOL = os.getenv('TRADING_PAIR', 'ETHUSDC').strip()  # 对于 USDC-M Futures，交易对应填写 "ETHUSDC"
 LEVERAGE = int(os.getenv('LEVERAGE', 10))
 QUANTITY = float(os.getenv('QUANTITY', 0.06))
-# 对于 USDC-M Futures，采用官方基础 URL（v1 接口）
+# 对于 USDC-M Futures，采用基础 URL 为 api.binance.com，接口路径将带有产品前缀
 REST_URL = 'https://api.binance.com'
 
 if not API_KEY or not SECRET_KEY:
     raise Exception("请在 /root/zhibai/.env 中正确配置 BINANCE_API_KEY 与 BINANCE_SECRET_KEY")
-
-# 简单密钥格式验证（示例要求密钥为 64 个字符，请根据实际情况调整）
 if len(API_KEY) != 64 or len(SECRET_KEY) != 64:
     raise ValueError("API密钥格式错误，应为64位字符，请检查 BINANCE_API_KEY 与 BINANCE_SECRET_KEY")
 
@@ -64,7 +62,7 @@ METRICS = {
 
 # ========== 日志配置 ==========
 logging.basicConfig(
-    level=logging.INFO,  # 如需调试可改为 DEBUG
+    level=logging.INFO,  # 如需调试，可修改为 DEBUG
     format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
@@ -73,7 +71,7 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger('ETH-USDC-HFT')
-DEBUG = False
+DEBUG = False  # 调试开关
 
 @dataclass
 class TradingConfig:
@@ -138,7 +136,7 @@ class BinanceHFTClient:
         METRICS['throughput'].inc()
 
     async def _signed_request(self, method: str, path: str, params: Dict) -> Dict:
-        # 添加公共参数
+        # 增加公共参数
         params.update({
             'timestamp': int(time.time() * 1000 + self._time_diff),
             'recvWindow': self.recv_window
@@ -157,7 +155,8 @@ class BinanceHFTClient:
             raise
 
         full_query = f"{query}&signature={signature}"
-        url = f"{REST_URL}{path}?{full_query}"
+        # 使用 USDC-M Futures 专用路径前缀
+        url = f"{REST_URL}/sapi/v1/futures/usdc{path}?{full_query}"
         headers = {"X-MBX-APIKEY": API_KEY}
         if DEBUG:
             logger.debug(f"请求 {method} {url}")
@@ -186,7 +185,7 @@ class BinanceHFTClient:
         raise Exception("超过最大重试次数")
 
     async def sync_server_time(self):
-        url = f"{REST_URL}/api/v1/time"
+        url = f"{REST_URL}/sapi/v1/futures/usdc/time"
         time_diffs = []
         for _ in range(7):
             try:
@@ -209,15 +208,15 @@ class BinanceHFTClient:
 
     async def manage_leverage(self):
         params = {'symbol': SYMBOL, 'leverage': LEVERAGE, 'dualSidePosition': 'true'}
-        return await self._signed_request('POST', '/api/v1/leverage', params)
+        return await self._signed_request('POST', '/leverage', params)
 
     async def fetch_klines(self) -> Optional[pd.DataFrame]:
         params = {'symbol': SYMBOL, 'interval': '1m', 'limit': 100, 'contractType': 'PERPETUAL'}
         try:
-            data = await self._signed_request('GET', '/api/v1/klines', params)
+            data = await self._signed_request('GET', '/klines', params)
             arr = np.empty((len(data), 6), dtype=np.float64)
             for i, candle in enumerate(data):
-                # 根据 Binance USDC-M Futures 文档，请确认字段下标，此处示例取 [1,2,3,4,5,7]
+                # 根据 Binance USDC-M Futures 文档字段下标（示例中取 [1,2,3,4,5,7]）
                 arr[i] = [float(candle[j]) for j in [1, 2, 3, 4, 5, 7]]
             return pd.DataFrame({
                 'open': arr[:, 0],
@@ -295,14 +294,14 @@ class ETHUSDCStrategy:
             params = {
                 'symbol': SYMBOL,
                 'side': side,
-                'type': 'STOP',  # 根据最新文档，可能需要使用 STOP_MARKET
+                'type': 'STOP',  # 根据文档，USDC-M Futures可能要求使用 STOP_MARKET，如有需要请修改
                 'stopPrice': float(f"{price:.{self.config.price_precision}f}"),
                 'quantity': formatted_qty,
                 'timeInForce': 'GTC',
                 'workingType': 'MARK_PRICE',
                 'priceProtect': 'true'
             }
-            response = await self.client._signed_request('POST', '/api/v1/order', params)
+            response = await self.client._signed_request('POST', '/order', params)
             if side == 'BUY':
                 self.client.position += qty
             else:
