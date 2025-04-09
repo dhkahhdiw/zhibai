@@ -11,7 +11,7 @@ import hmac
 import hashlib
 import urllib.parse
 import logging
-from typing import Dict, Optional  # 增加 Optional 导入
+from typing import Dict, Optional
 from collections import deque, defaultdict
 from dataclasses import dataclass
 
@@ -33,15 +33,15 @@ load_dotenv(_env_path)
 # 去除多余空格，确保格式正确
 API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
-SYMBOL = os.getenv('TRADING_PAIR', 'ETHUSDC').strip()
+# 修改默认交易对为 "ETHUSD_PERP"（合约交割合约的常用符号），请根据需要在 .env 中覆盖
+SYMBOL = os.getenv('TRADING_PAIR', 'ETHUSD_PERP').strip()
 LEVERAGE = int(os.getenv('LEVERAGE', 10))
 QUANTITY = float(os.getenv('QUANTITY', 0.06))
-# USDC合约接口使用 dapi
+# 使用 dapi 接口（适用于币本位交割合约），如果是USDC合约请检查文档和接口
 REST_URL = 'https://dapi.binance.com'
 
-# 简单验证密钥（这里只作示例，请根据实际要求调整验证规则）
-if len(API_KEY) != 64 or len(SECRET_KEY) != 64:
-    raise ValueError("API密钥格式错误，应为64位字符，请检查 BINANCE_API_KEY 与 BINANCE_SECRET_KEY")
+if not API_KEY or not SECRET_KEY:
+    raise Exception("请在 /root/zhibai/.env 中正确配置 BINANCE_API_KEY 与 BINANCE_SECRET_KEY")
 
 # ========== 高频参数 ==========
 RATE_LIMITS = {
@@ -62,7 +62,7 @@ METRICS = {
 
 # ========== 日志配置 ==========
 logging.basicConfig(
-    level=logging.INFO,  # 如需更详细调试可修改为 DEBUG
+    level=logging.INFO,  # 若需要更详细调试可修改为 DEBUG
     format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
@@ -136,7 +136,7 @@ class BinanceHFTClient:
         METRICS['throughput'].inc()
 
     async def _signed_request(self, method: str, path: str, params: Dict) -> Dict:
-        """增强型签名请求：构造签名并拼接到URL上"""
+        """增强型签名请求：构造完整 URL 后发送请求"""
         params.update({
             'timestamp': int(time.time() * 1000 + self._time_diff),
             'recvWindow': self.recv_window
@@ -153,7 +153,7 @@ class BinanceHFTClient:
             logger.error(f"签名生成失败: {str(e)}")
             await self.sync_server_time()
             raise
-        # 将签名附加到查询字符串中
+
         full_query = f"{query}&signature={signature}"
         url = f"{REST_URL}{path}?{full_query}"
         headers = {"X-MBX-APIKEY": API_KEY}
@@ -218,7 +218,7 @@ class BinanceHFTClient:
             data = await self._signed_request('GET', '/dapi/v1/klines', params)
             arr = np.empty((len(data), 6), dtype=np.float64)
             for i, candle in enumerate(data):
-                # 根据Binance USDC-M文档，K线数据字段下标可能需要调整
+                # 根据 Binance USDC 合约 API 文档，请确保字段下标正确（此处示例取 [1, 2, 3, 4, 5, 7]）
                 arr[i] = [float(candle[j]) for j in [1, 2, 3, 4, 5, 7]]
             return pd.DataFrame({
                 'open': arr[:, 0],
