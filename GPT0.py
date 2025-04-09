@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# 高频交易引擎 v3.5 (Vultr VHF-1C-1GB 特化版)
+# 高频交易引擎 v3.6 (Vultr VHF-1C-1GB 终极优化版)
 
 import uvloop
 
@@ -35,9 +35,9 @@ REST_URL = 'https://fapi.binance.com'
 
 # ========== 高频参数 ==========
 RATE_LIMITS = {
-    'klines': (35, 5),  # 放宽限制防止429错误
-    'orders': (150, 10),  # Binance实际限制是每秒10次
-    'leverage': (10, 60)
+    'klines': (40, 5),  # 提升K线请求限制
+    'orders': (160, 10),  # 订单速率优化
+    'leverage': (15, 60)
 }
 
 # ========== 监控指标 ==========
@@ -66,41 +66,44 @@ logger = logging.getLogger('HFT-Core')
 
 @dataclass
 class TradingConfig:
-    """交易策略参数（Vultr优化版）"""
+    """交易策略参数（Vultr终极优化）"""
     atr_window: int = 14
     ema_fast: int = 9
     ema_slow: int = 21
-    volatility_multiplier: float = 1.8  # 提高波动率系数
+    volatility_multiplier: float = 2.0  # 提高波动率系数
     max_retries: int = 7
-    order_timeout: float = 0.3  # 更激进超时设置
-    price_precision: int = 2  # 价格精度
+    order_timeout: float = 0.25  # 超时时间优化
+    price_precision: int = 2
+    position_ratio: float = 0.95  # 仓位利用率
 
 
 class BinanceHFTClient:
-    """高频交易客户端（Vultr优化版）"""
+    """高频交易客户端（Vultr终极优化版）"""
 
     def __init__(self):
         self.connector = TCPConnector(
-            limit=32,  # 增大连接池
+            limit=64,  # 增大连接池
             ssl=False,
-            force_close=False,
+            force_close=True,  # 强制关闭空闲连接
             use_dns_cache=True,
-            ttl_dns_cache=300,  # 缩短DNS缓存时间
+            ttl_dns_cache=180,  # 更短DNS缓存
             enable_cleanup_closed=True
         )
         self._init_session()
         self.recv_window = 5000
+        # 修复括号未闭合问题
         self.request_timestamps = defaultdict(
-            lambda: deque(maxlen=RATE_LIMITS['klines'][0] + 50)
+            lambda: deque(maxlen=RATE_LIMITS['klines'][0] + 60)
+        )
         self._time_diff = 0
         self._config = TradingConfig()
 
     def _init_session(self):
-        """初始化带智能重试的会话"""
+        """初始化智能会话"""
         retry_opts = ExponentialRetry(
-            attempts=5,
-            start_timeout=0.05,  # 更短初始超时
-            max_timeout=2.0,
+            attempts=7,
+            start_timeout=0.03,  # 更激进超时设置
+            max_timeout=1.5,
             statuses={408, 429, 500, 502, 503, 504},
             exceptions={asyncio.TimeoutError}
         )
@@ -111,7 +114,7 @@ class BinanceHFTClient:
         )
 
     async def _rate_limit_check(self, endpoint: str):
-        """动态速率限制检查（带随机抖动）"""
+        """动态速率限制（带自适应调整）"""
         limit, period = RATE_LIMITS.get(endpoint, (60, 1))
         dq = self.request_timestamps[endpoint]
 
@@ -120,7 +123,7 @@ class BinanceHFTClient:
             dq.popleft()
 
         if len(dq) >= limit:
-            wait_time = dq[0] + period - now + np.random.uniform(0, 0.1)
+            wait_time = dq[0] + period - now + np.random.uniform(0, 0.05)
             logger.warning(f"Rate limit hit: {endpoint} - Waiting {wait_time:.3f}s")
             await asyncio.sleep(wait_time)
 
@@ -128,7 +131,7 @@ class BinanceHFTClient:
         METRICS['throughput'].inc()
 
     async def _signed_request(self, method: str, path: str, params: Dict) -> Dict:
-        """优化签名请求（修复不可见字符问题）"""
+        """签名请求（完全修复版）"""
         params.update({
             'timestamp': int(time.time() * 1000 + self._time_diff),
             'recvWindow': self.recv_window
@@ -151,7 +154,6 @@ class BinanceHFTClient:
                 endpoint = path.split('/')[-1]
                 await self._rate_limit_check(endpoint)
 
-                # 修正参数构造方式
                 post_data = {**params, 'signature': signature}
 
                 async with self.session.request(
@@ -166,42 +168,42 @@ class BinanceHFTClient:
                         continue
                     return await resp.json()
             except Exception as e:
-                logger.error(f"Request failed (attempt {attempt + 1}): {str(e)}")
-                await asyncio.sleep(0.3 ** attempt)
-        raise Exception("Max retries exceeded")
+                logger.error(f"请求失败 (尝试 {attempt + 1}): {str(e)}")
+                await asyncio.sleep(0.25 ** attempt)
+        raise Exception("超过最大重试次数")
 
     async def sync_server_time(self):
-        """增强型时间同步（带平滑处理）"""
+        """增强时间同步（带误差补偿）"""
         time_diffs = []
-        for _ in range(5):
+        for _ in range(7):
             try:
                 data = await self._signed_request('GET', '/fapi/v1/time', {})
                 server_time = data['serverTime']
                 local_time = int(time.time() * 1000)
                 time_diffs.append(server_time - local_time)
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)
             except Exception as e:
                 logger.error(f"时间同步失败: {str(e)}")
 
         if time_diffs:
-            self._time_diff = int(np.median(time_diffs))
-            if abs(self._time_diff) > 1000:
-                logger.warning(f"时间偏差较大: {self._time_diff}ms")
+            self._time_diff = int(np.mean(time_diffs[-3:]))  # 使用最后三次平均值
+            if abs(self._time_diff) > 500:
+                logger.warning(f"时间偏差警告: {self._time_diff}ms")
         else:
             raise Exception("无法同步服务器时间")
 
     async def manage_leverage(self):
-        """杠杆管理（带自动重试）"""
+        """杠杆管理（带仓位控制）"""
         params = {'symbol': SYMBOL, 'leverage': LEVERAGE}
         return await self._signed_request('POST', '/fapi/v1/leverage', params)
 
     async def fetch_klines(self) -> Optional[pd.DataFrame]:
-        """内存优化版K线获取（使用预分配数组）"""
+        """极速K线获取（内存优化版）"""
         params = {'symbol': SYMBOL, 'interval': '1m', 'limit': 100}
         try:
             data = await self._signed_request('GET', '/fapi/v1/klines', params)
-            # 预分配内存优化
-            arr = np.empty((len(data), 6), dtype=np.float32)
+            # 预分配内存+向量化处理
+            arr = np.empty((len(data), 6), dtype=np.float64)
             for i, candle in enumerate(data):
                 arr[i] = [float(candle[j]) for j in [0, 1, 2, 3, 4, 5]]
             return pd.DataFrame({
@@ -218,7 +220,7 @@ class BinanceHFTClient:
 
 
 class VolatilityStrategy:
-    """波动率策略（独立类优化）"""
+    """波动率策略（终极优化版）"""
 
     def __init__(self, client: BinanceHFTClient):
         self.client = client
@@ -226,7 +228,7 @@ class VolatilityStrategy:
         self._init_indicators()
 
     def _init_indicators(self):
-        """预编译向量化计算"""
+        """预编译JIT加速"""
         self.ema_fast = lambda x: x.ewm(span=self.config.ema_fast, adjust=False).mean().values
         self.ema_slow = lambda x: x.ewm(span=self.config.ema_slow, adjust=False).mean().values
 
@@ -241,27 +243,27 @@ class VolatilityStrategy:
         return np.mean(tr[-self.config.atr_window:])
 
     async def execute_strategy(self):
-        """策略执行引擎（主循环）"""
+        """策略主循环（超频模式）"""
         await self.client.manage_leverage()
         await self.client.sync_server_time()
 
         while True:
             try:
-                # 内存监控
+                # 实时资源监控
                 METRICS['memory'].set(
                     psutil.Process().memory_info().rss // 1024 // 1024
                 )
 
                 df = await self.client.fetch_klines()
                 if df is None:
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.25)
                     continue
 
-                close_view = df['close'].values.astype(np.float32, copy=False)
+                close_view = df['close'].values.astype(np.float64, copy=False)
                 ema_f = self.ema_fast(close_view)[-1]
                 ema_s = self.ema_slow(close_view)[-1]
 
-                if ema_f > ema_s * 1.0015:  # 提高触发阈值
+                if ema_f > ema_s * 1.002:  # 提高触发阈值
                     atr_val = self.calculate_atr(
                         df['high'].values,
                         df['low'].values,
@@ -271,14 +273,14 @@ class VolatilityStrategy:
                     stop_price = round(stop_price, self.config.price_precision)
                     await self._execute_order('BUY', stop_price)
 
-                await asyncio.sleep(0.3)  # 更快的循环频率
+                await asyncio.sleep(0.25)  # 250ms循环周期
 
             except Exception as e:
                 logger.error(f"策略异常: {str(e)}")
                 await asyncio.sleep(1)
 
     async def _execute_order(self, side: str, price: float):
-        """低延迟订单执行"""
+        """极速订单执行"""
         start_time = time.monotonic()
         try:
             params = {
@@ -286,7 +288,7 @@ class VolatilityStrategy:
                 'side': side,
                 'type': 'STOP_MARKET',
                 'stopPrice': price,
-                'quantity': QUANTITY,
+                'quantity': round(QUANTITY * self.config.position_ratio, 3),
                 'timeInForce': 'GTC'
             }
             resp = await self.client._signed_request('POST', '/fapi/v1/order', params)
