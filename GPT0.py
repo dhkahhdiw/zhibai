@@ -35,6 +35,7 @@ SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
 SYMBOL = 'ETHUSDC'
 LEVERAGE = 10
 QUANTITY = 0.06
+# 对于USDC永续合约，接口地址为此（注意后续所有请求均基于此地址构造）
 REST_URL = 'https://api.binance.com'
 
 # ==================== 高频参数 ====================
@@ -75,13 +76,13 @@ class TradingConfig:
     ema_slow: int = 21
     volatility_multiplier: float = 2.5
     max_retries: int = 7  # 增加重试次数
-    order_timeout: float = 2.0  # 延长至2秒
-    network_timeout: float = 5.0  # 延长至5秒
+    order_timeout: float = 2.0  # 订单请求超时延长至2秒
+    network_timeout: float = 5.0  # 网络请求超时延长至5秒
     price_precision: int = 2
     quantity_precision: int = 3
     max_position: float = 10.0
     slippage: float = 0.001
-    dual_side_position: str = "true"  # 严格遵循API要求
+    dual_side_position: str = "true"  # 符合API要求
 
 
 class BinanceHFTClient:
@@ -95,8 +96,8 @@ class BinanceHFTClient:
             family=AF_INET
         )
         self._init_session()
-        self.recv_window = 6000  # 确保参数名正确
-        # 修复括号未闭合的问题
+        self.recv_window = 6000  # 参数名与币安文档一致
+        # 修正括号闭合问题
         self.request_timestamps = defaultdict(
             lambda: deque(maxlen=RATE_LIMITS['klines'][0] + 200)
         )
@@ -121,25 +122,37 @@ class BinanceHFTClient:
         )
 
     async def sync_server_time(self):
-        """增强型时间同步（带指数退避重试）"""
+        """
+        使用 USDC 永续接口进行时间同步；
+        若返回数据不符合预期，则以本地时间作为基础（_time_diff = 0）。
+        """
+        url = f"{REST_URL}/sapi/v1/futures/usdc/time"
         for retry in range(5):
             try:
-                # 对于USDC永续，使用官方推荐接口
-                async with self.session.get(f"{REST_URL}/sapi/v1/futures/usdc/time") as resp:
+                async with self.session.get(url) as resp:
+                    # 检查 Content-Type 是否为 JSON
+                    content_type = resp.headers.get('Content-Type', '')
+                    if 'application/json' not in content_type:
+                        raise ValueError(f"Unexpected content type: {content_type}")
                     data = await resp.json()
+                    if 'serverTime' not in data:
+                        raise ValueError("返回数据中缺少 serverTime 字段")
                     server_time = data['serverTime']
                     local_time = int(time.time() * 1000)
                     self._time_diff = server_time - local_time
                     if abs(self._time_diff) > 500:
                         logger.warning(f"时间偏差警告: {self._time_diff}ms")
+                    logger.info(f"时间同步成功，时间差: {self._time_diff}ms")
                     return
             except Exception as e:
                 logger.error(f"时间同步失败(重试 {retry + 1}): {str(e)}")
                 await asyncio.sleep(2 ** retry)
-        raise ConnectionError("无法同步服务器时间")
+        # 如果多次尝试仍无法获取服务器时间，回退使用本地时间
+        logger.warning("无法同步服务器时间，回退使用本地时间")
+        self._time_diff = 0
 
     async def _signed_request(self, method: str, path: str, params: Dict) -> Dict:
-        # 更新参数，并确保无隐藏字符
+        # 更新参数，确保传递 recvWindow 等值正确
         params.update({
             "timestamp": int(time.time() * 1000 + self._time_diff),
             "recvWindow": self.recv_window
@@ -171,7 +184,7 @@ class BinanceHFTClient:
         raise Exception("超过最大重试次数")
 
     async def _rate_limit_check(self, endpoint: str):
-        """智能速率限制管理"""
+        """智能速率限制管理，根据各接口设定速率限制"""
         limit, period = RATE_LIMITS.get(endpoint, (60, 1))
         dq = self.request_timestamps[endpoint]
         now = time.monotonic()
@@ -186,7 +199,7 @@ class BinanceHFTClient:
         METRICS['throughput'].inc()
 
     async def manage_leverage(self):
-        """修正杠杆设置参数"""
+        """设置杠杆，使用配置参数提交请求"""
         params = {
             'symbol': SYMBOL,
             'leverage': LEVERAGE,
@@ -195,7 +208,7 @@ class BinanceHFTClient:
         return await self._signed_request('POST', '/leverage', params)
 
     async def fetch_klines(self) -> Optional[pd.DataFrame]:
-        """优化K线获取（增加异常处理）"""
+        """获取K线数据并转换为DataFrame"""
         try:
             data = await self._signed_request('GET', '/klines', {
                 'symbol': SYMBOL,
@@ -233,7 +246,7 @@ class ETHUSDCStrategy:
         self._indicator_cache = defaultdict(lambda: None)
 
     async def execute(self):
-        """执行策略：先同步时间，再设置杠杆，随后循环执行交易逻辑"""
+        """先同步时间，再设置杠杆，随后循环执行策略逻辑"""
         await self.client.sync_server_time()
         await self.client.manage_leverage()
 
@@ -245,7 +258,6 @@ class ETHUSDCStrategy:
                     await asyncio.sleep(1)
                     continue
 
-                # 向量化指标计算
                 close_prices = df['close'].values.astype(np.float32)
                 high_prices = df['high'].values.astype(np.float32)
                 low_prices = df['low'].values.astype(np.float32)
@@ -253,10 +265,8 @@ class ETHUSDCStrategy:
                 atr_array = self._vectorized_atr(high_prices, low_prices, close_prices)
                 atr_val = atr_array[-1]
 
-                # 生成信号
                 signals = await self.generate_signals(df, atr_val)
 
-                # 若信号有效，则下单
                 if signals.action:
                     current_price = close_prices[-1]
                     adjusted_price = current_price * (1 + self.config.slippage *
@@ -268,27 +278,24 @@ class ETHUSDCStrategy:
                         stop_loss=signals.sl
                     )
 
-                # 记录延迟
                 METRICS['latency'].set((time.monotonic() - start_time) * 1000)
                 await asyncio.sleep(max(0.5, 1.0 - (time.monotonic() - start_time)))
-
             except Exception as e:
                 logger.error(f"策略异常: {str(e)}", exc_info=True)
                 await asyncio.sleep(5)
 
     def _vectorized_atr(self, high, low, close) -> np.ndarray:
-        """优化ATR计算（避免零除错误）"""
+        """向量化ATR计算，避免除零错误"""
         tr = np.maximum(
             high[1:] - low[1:],
             np.abs(high[1:] - close[:-1]),
             np.abs(low[1:] - close[:-1])
         )
-        # 计算ATR，注意卷积窗口
         atr = np.convolve(tr, np.ones(self.config.atr_window), 'valid') / self.config.atr_window
         return atr
 
     async def generate_signals(self, df: pd.DataFrame, atr_val: float) -> Signal:
-        """增强信号生成逻辑：基于EMA金叉、波动率以及价格区间判断"""
+        """基于EMA金叉、波动率和价格区间生成买卖信号"""
         ema_fast = df['close'].ewm(span=self.config.ema_fast, adjust=False).mean().values
         ema_slow = df['close'].ewm(span=self.config.ema_slow, adjust=False).mean().values
         ema_cross = ema_fast[-1] > ema_slow[-1]
@@ -307,7 +314,7 @@ class ETHUSDCStrategy:
         )
 
     async def place_limit_order(self, side: str, limit_price: float, tp: float, sl: float):
-        """增强订单处理：校验价格及数量，提交限价单"""
+        """构造并提交限价单，同时对价格和数量进行校验"""
         formatted_price = round(limit_price, self.config.price_precision)
         formatted_qty = round(QUANTITY, self.config.quantity_precision)
 
@@ -327,11 +334,8 @@ class ETHUSDCStrategy:
         try:
             await self.client._signed_request('POST', '/order', params)
             logger.info(f"挂单成功 {side}@{formatted_price} | TP: {tp:.2f} SL: {sl:.2f}")
-
-            # 根据持仓动态调整杠杆
             if abs(self.client.position) > self.config.max_position * 0.75:
                 await self.client.manage_leverage()
-
         except Exception as e:
             logger.error(f"订单失败: {str(e)}")
             METRICS['errors'].inc()
