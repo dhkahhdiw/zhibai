@@ -20,20 +20,16 @@ import numpy as np
 import pandas as pd
 from aiohttp import ClientTimeout, TCPConnector
 from aiohttp_retry import RetryClient, ExponentialRetry
-
-# 尝试导入 aiodns 的 AsyncResolver，若未安装则提示但不报错
+# 尽量不在模块级别创建 AsyncResolver，避免事件循环问题
 try:
     from aiohttp.resolver import AsyncResolver
-    resolver = AsyncResolver(nameservers=["8.8.8.8", "1.1.1.1"])
 except Exception:
-    resolver = None
-    print("Warning: aiodns 库未安装，使用默认解析器")
-
+    AsyncResolver = None
 from dotenv import load_dotenv
 from prometheus_client import Gauge, start_http_server
 import psutil
 
-# ==================== 环境变量加载 ====================
+# ==================== 加载环境变量 ====================
 _env_path = '/root/zhibai/.env'
 if not os.path.exists(_env_path):
     raise FileNotFoundError(f"未找到环境文件: {_env_path}")
@@ -41,10 +37,10 @@ load_dotenv(_env_path)
 
 API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
-SYMBOL = os.getenv('TRADING_PAIR', 'ETHUSDC').strip()   # 对于 USDC-M Futures，通常使用 "ETHUSDC"
+SYMBOL = os.getenv('TRADING_PAIR', 'ETHUSDC').strip()  # 对于 USDC-M Futures 一般为 "ETHUSDC"
 LEVERAGE = int(os.getenv('LEVERAGE', 10))
 QUANTITY = float(os.getenv('QUANTITY', 0.06))
-# 使用 Binance 正式基础 URL
+# 使用 Binance 正式接口基础 URL
 REST_URL = 'https://api.binance.com'
 
 if not API_KEY or not SECRET_KEY:
@@ -71,7 +67,7 @@ METRICS = {
 
 # ==================== 日志配置 ====================
 logging.basicConfig(
-    level=logging.INFO,  # 若调试请改为 DEBUG
+    level=logging.INFO,  # 调试时可设置为 DEBUG
     format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
@@ -80,7 +76,7 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger('ETH-USDC-HFT')
-DEBUG = False
+DEBUG = False  # 设置为 True 可输出详细调试日志
 
 @dataclass
 class TradingConfig:
@@ -100,6 +96,7 @@ class BinanceHFTClient:
     """高频交易客户端（终极修复版）"""
     def __init__(self):
         self.config = TradingConfig()
+        # 构建 TCPConnector（强制使用 IPv4）；此处不使用 AsyncResolver，避免事件循环冲突
         connector_args = {
             "limit": 128,
             "ssl": True,
@@ -107,8 +104,6 @@ class BinanceHFTClient:
             "force_close": True,
             "family": AF_INET
         }
-        if resolver is not None:
-            connector_args["resolver"] = resolver
         self.connector = TCPConnector(**connector_args)
         self._init_session()
         self.recv_window = 5000
@@ -143,7 +138,6 @@ class BinanceHFTClient:
         METRICS['throughput'].inc()
 
     async def _signed_request(self, method: str, path: str, params: Dict) -> Dict:
-        # 添加公共参数
         params.update({
             'timestamp': int(time.time() * 1000 + self._time_diff),
             'recvWindow': self.recv_window
@@ -157,7 +151,7 @@ class BinanceHFTClient:
             await self.sync_server_time()
             raise
         full_query = f"{query}&signature={signature}"
-        # 注意：确保 path 参数正确，此处 path 应为例如 '/leverage'
+        # 使用 USDC-M Futures 专用接口路径前缀
         url = f"{REST_URL}/sapi/v1/futures/usdc{path}?{full_query}"
         headers = {"X-MBX-APIKEY": API_KEY}
         if DEBUG:
@@ -218,7 +212,7 @@ class BinanceHFTClient:
             data = await self._signed_request('GET', '/klines', params)
             arr = np.empty((len(data), 6), dtype=np.float64)
             for i, candle in enumerate(data):
-                # 根据 Binance USDC-M Futures 文档，调整字段下标，如示例中取 [1, 2, 3, 4, 5, 7]
+                # 根据 Binance USDC-M Futures 文档，请调整字段下标
                 arr[i] = [float(candle[j]) for j in [1, 2, 3, 4, 5, 7]]
             return pd.DataFrame({
                 'open': arr[:, 0],
@@ -291,7 +285,7 @@ class ETHUSDCStrategy:
             params = {
                 'symbol': SYMBOL,
                 'side': side,
-                'type': 'STOP',  # 若官方要求使用 STOP_MARKET，请根据最新文档调整
+                'type': 'STOP',  # 如果官方要求使用 STOP_MARKET，请修改此处
                 'stopPrice': float(f"{price:.{self.config.price_precision}f}"),
                 'quantity': formatted_qty,
                 'timeInForce': 'GTC',
