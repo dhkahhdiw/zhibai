@@ -1,5 +1,3 @@
-GTP20
-
 #!/usr/bin/env python3
 # ETH/USDC高频交易引擎 v5.1 (修复版)
 
@@ -125,8 +123,8 @@ class BinanceHFTClient:
 
     async def sync_server_time(self):
         """
-        使用 USDC 永续接口同步服务器时间，检查返回内容类型，
-        若返回内容不符合预期则重试，多次失败后回退使用本地时间。
+        使用 USDC 永续接口同步服务器时间，检查返回的 Content-Type，
+        若返回内容异常则重试，多次失败后回退使用本地时间。
         """
         url = REST_URL + "/sapi/v1/futures/usdc/time"
         for retry in range(5):
@@ -151,7 +149,7 @@ class BinanceHFTClient:
 
     async def _signed_request(self, method: str, path: str, params: Dict) -> Dict:
         """
-        签名请求，采用显式字符串拼接构造 URL，确保路径正确。
+        采用签名请求，确保构造 URL 正确。该方法在请求时增加必要的参数并生成签名。
         """
         params.update({
             "timestamp": int(time.time() * 1000 + self._time_diff),
@@ -160,7 +158,6 @@ class BinanceHFTClient:
         sorted_params = sorted(params.items())
         query = urllib.parse.urlencode(sorted_params, doseq=True)
         signature = hmac.new(SECRET_KEY.encode(), query.encode(), hashlib.sha256).hexdigest()
-        # 显式拼接 URL 避免隐藏字符干扰
         url = REST_URL + "/sapi/v1/futures/usdc" + path + "?" + query + "&signature=" + signature
         headers = {
             "X-MBX-APIKEY": API_KEY,
@@ -187,7 +184,7 @@ class BinanceHFTClient:
         raise Exception("超过最大重试次数")
 
     async def _rate_limit_check(self, endpoint: str):
-        """智能管理速率限制"""
+        """智能管理速率限制，根据预设参数检测请求频率"""
         limit, period = RATE_LIMITS.get(endpoint, (60, 1))
         dq = self.request_timestamps[endpoint]
         now = time.monotonic()
@@ -202,7 +199,7 @@ class BinanceHFTClient:
         METRICS['throughput'].inc()
 
     async def manage_leverage(self):
-        """设置杠杆，提交请求前采用配置参数"""
+        """设置杠杆，依据配置提交请求"""
         params = {
             'symbol': SYMBOL,
             'leverage': LEVERAGE,
@@ -211,7 +208,7 @@ class BinanceHFTClient:
         return await self._signed_request('POST', '/leverage', params)
 
     async def fetch_klines(self) -> Optional[pd.DataFrame]:
-        """获取K线数据并转换成 DataFrame 格式"""
+        """获取K线数据，并转换为 DataFrame 格式"""
         try:
             data = await self._signed_request('GET', '/klines', {
                 'symbol': SYMBOL,
@@ -249,7 +246,7 @@ class ETHUSDCStrategy:
         self._indicator_cache = defaultdict(lambda: None)
 
     async def execute(self):
-        """先同步时间、设置杠杆，再进入循环执行策略"""
+        """先同步时间、设置杠杆，再进入策略主循环"""
         await self.client.sync_server_time()
         await self.client.manage_leverage()
 
@@ -317,7 +314,7 @@ class ETHUSDCStrategy:
         )
 
     async def place_limit_order(self, side: str, limit_price: float, tp: float, sl: float):
-        """构造并提交限价单，校验参数后下单"""
+        """构造并提交限价单，校验价格及数量有效性"""
         formatted_price = round(limit_price, self.config.price_precision)
         formatted_qty = round(QUANTITY, self.config.quantity_precision)
 
