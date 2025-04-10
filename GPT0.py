@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-# ETH/USDC高频交易引擎 v4.7 (Vultr终极优化版)
+# ETH/USDC高频交易引擎 v4.8 (Vultr终极优化版)
 
 import uvloop
 
 uvloop.install()
 
 import os
+import re  # 新增正则表达式处理
 import asyncio
 import time
 import hmac
@@ -83,7 +84,7 @@ class TradingConfig:
     price_precision: int = 2
     quantity_precision: int = 3
     max_position: float = 10.0
-    slippage: float = 0.001  # 动态滑点
+    slippage: float = 0.001
 
 
 # ==================== 核心交易模块 ====================
@@ -91,8 +92,8 @@ class BinanceHFTClient:
     def __init__(self):
         self.config = TradingConfig()
         self.connector = TCPConnector(
-            limit=512,  # 增大连接池
-            resolver=AsyncResolver(),  # 异步DNS解析[2](@ref)
+            limit=512,
+            resolver=AsyncResolver(),
             ttl_dns_cache=300,
             force_close=True,
             family=AF_INET
@@ -122,7 +123,7 @@ class BinanceHFTClient:
         )
 
     async def sync_server_time(self):
-        """增强型时间同步（带熔断机制）[1](@ref)"""
+        """增强型时间同步（带熔断机制）"""
         for retry in range(5):
             try:
                 data = await self._signed_request('GET', '/sapi/v1/futures/usdc/time', {})
@@ -137,7 +138,9 @@ class BinanceHFTClient:
                     logger.warning(f"时间偏差警告: {self._time_diff}ms")
                 return
             except Exception as e:
-                logger.error(f"时间同步失败(重试{retry + 1}): {str(e)}")
+                # 修复U+200B字符问题[2,3](@ref)
+                cleaned_msg = re.sub(r'[\x00-\x1F\x7F-\x9F\u200B-\u200F\u2028-\u202E]', '', str(e))
+                logger.error(f"时间同步失败(重试{retry + 1}): {cleaned_msg}")
                 await asyncio.sleep(0.5 ​ ** retry)
                 raise Exception("无法同步服务器时间")
 
@@ -172,7 +175,7 @@ class BinanceHFTClient:
                 raise Exception("超过最大重试次数")
 
             async def _rate_limit_check(self, endpoint: str):
-                """动态速率限制管理[2](@ref)"""
+                """动态速率限制管理"""
                 limit, period = RATE_LIMITS.get(endpoint, (60, 1))
                 dq = self.request_timestamps[endpoint]
                 now = time.monotonic()
@@ -190,7 +193,7 @@ class BinanceHFTClient:
                 return await self._signed_request('POST', '/leverage', params)
 
             async def fetch_klines(self) -> Optional[pd.DataFrame]:
-                """优化K线解析（向量化加速）[1](@ref)"""
+                """优化K线解析（向量化加速）"""
                 try:
                     data = await self._signed_request('GET', '/klines', {
                         'symbol': SYMBOL,
@@ -198,7 +201,6 @@ class BinanceHFTClient:
                         'limit': 100,
                         'contractType': 'PERPETUAL'
                     })
-                    # 使用NumPy结构化数组加速处理
                     dtype = [('open', 'f8'), ('high', 'f8'), ('low', 'f8'),
                              ('close', 'f8'), ('volume', 'f8'), ('timestamp', 'u8')]
                     arr = np.array([(c[1], c[2], c[3], c[4], c[5], c[6]) for c in data], dtype=dtype)
@@ -226,20 +228,16 @@ class BinanceHFTClient:
                             await asyncio.sleep(0.5)
                             continue
 
-                        # 向量化指标计算
                         close_prices = df['close'].values.astype(np.float32)
                         high_prices = df['high'].values.astype(np.float32)
                         low_prices = df['low'].values.astype(np.float32)
 
-                        # 计算ATR（带缓存）
                         if not self._indicator_cache['atr']:
                             self._indicator_cache['atr'] = self._vectorized_atr(high_prices, low_prices, close_prices)
                         atr_val = self._indicator_cache['atr'][-1]
 
-                        # 多周期信号生成
                         signals = await self.generate_signals(df)
 
-                        # 动态滑点补偿[1](@ref)
                         current_price = close_prices[-1]
                         adjusted_price = current_price * (
                                     1 + self.config.slippage * (-1 if signals.side == 'BUY' else 1))
@@ -260,7 +258,6 @@ class BinanceHFTClient:
                         await asyncio.sleep(5)
 
             def _vectorized_atr(self, high, low, close) -> np.ndarray:
-                """向量化ATR计算[1](@ref)"""
                 tr = np.maximum(
                     high[1:] - low[1:],
                     np.abs(high[1:] - close[:-1]),
@@ -269,34 +266,22 @@ class BinanceHFTClient:
                 return np.convolve(tr, np.ones(14) / 14, 'valid')
 
             async def generate_signals(self, df: pd.DataFrame) -> Tuple:
-                """多因子信号生成[4](@ref)"""
-                # 此处整合网页1的订单流分析技术
-                signals = CombinedSignals()
-
-                # 1. 多周期EMA交叉信号
                 ema_fast = df['close'].ewm(span=self.config.ema_fast).mean().values
                 ema_slow = df['close'].ewm(span=self.config.ema_slow).mean().values
+                signals = CombinedSignals()
                 signals.ema_cross = ema_fast[-1] > ema_slow[-1]
-
-                # 2. 波动率自适应ATR
-                atr = self._vectorized_atr(df['high'], df['low'], df['close'])
-                volatility_ratio = atr[-1] / df['close'].values[-1]
-
-                # 3. 订单簿不平衡度（模拟实现）
-                bid_ask_spread = (df['high'].values[-1] - df['low'].values[-1]) / df['close'].values[-1]
-                signals.orderbook_imbalance = bid_ask_spread < 0.005  # 价差小于0.5%
-
-                # 生成交易决策
+                volatility_ratio = self._indicator_cache['atr'][-1] / df['close'].values[-1]
+                signals.orderbook_imbalance = (df['high'].values[-1] - df['low'].values[-1]) / df['close'].values[
+                    -1] < 0.005
                 action = signals.ema_cross and (volatility_ratio > 0.02) and signals.orderbook_imbalance
                 return Signal(
                     action=action,
                     side='BUY' if action else 'SELL',
-                    tp=df['close'].values[-1] + atr[-1] * 2,
-                    sl=df['close'].values[-1] - atr[-1] * 1.5
+                    tp=df['close'].values[-1] + self._indicator_cache['atr'][-1] * 2,
+                    sl=df['close'].values[-1] - self._indicator_cache['atr'][-1] * 1.5
                 )
 
             async def place_limit_order(self, side: str, limit_price: float, tp: float, sl: float):
-                """增强订单管理[2](@ref)"""
                 formatted_price = float(f"{limit_price:.{self.config.price_precision}f}")
                 formatted_qty = float(f"{QUANTITY:.{self.config.quantity_precision}f}")
                 params = {
@@ -310,7 +295,6 @@ class BinanceHFTClient:
                 try:
                     order_resp = await self.client._signed_request('POST', '/order', params)
                     logger.info(f"挂单 {side}@{formatted_price} 成功 | 止盈:{tp:.2f} 止损:{sl:.2f}")
-                    # 动态调整杠杆[7](@ref)
                     if abs(self.client.position) > self.config.max_position * 0.8:
                         await self.client.manage_leverage()
                 except Exception as e:
