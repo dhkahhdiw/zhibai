@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ETH/USDC高频交易引擎 v5.1 (修复版)
+# ETH/USDT高频交易引擎 v5.1 (修复版)
 
 import uvloop
 uvloop.install()
@@ -32,11 +32,12 @@ load_dotenv(_env_path)
 
 API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
-SYMBOL = 'ETHUSDC'
+# 将交易对从 ETHUSDC 改为 ETHUSDT
+SYMBOL = 'ETHUSDT'
 LEVERAGE = 10
 QUANTITY = 0.06
-# 对于 USDC 永续合约，基础 URL 使用币安官方地址
-REST_URL = 'https://api.binance.com'
+# 对于 USDT 永续合约，基础 URL 为 fapi.binance.com
+REST_URL = 'https://fapi.binance.com'
 
 # ==================== 高频参数 ====================
 RATE_LIMITS = {
@@ -62,10 +63,10 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("/var/log/eth_usdc_hft.log", encoding="utf-8", mode='a')
+        logging.FileHandler("/var/log/eth_usdt_hft.log", encoding="utf-8", mode='a')
     ]
 )
-logger = logging.getLogger('ETH-USDC-HFT')
+logger = logging.getLogger('ETH-USDT-HFT')
 
 
 @dataclass
@@ -88,7 +89,7 @@ class TradingConfig:
 class BinanceHFTClient:
     def __init__(self):
         self.config = TradingConfig()
-        # 如使用代理或遇到SSL问题，可设置 ssl=False
+        # 如使用代理或 SSL 问题，可设置 ssl=False；这里保留默认值如无特殊要求可删除该参数
         self.connector = TCPConnector(
             limit=512,
             resolver=AsyncResolver(),
@@ -123,10 +124,11 @@ class BinanceHFTClient:
 
     async def sync_server_time(self):
         """
-        使用 USDC 永续接口同步服务器时间，检查返回的 Content-Type，
-        若返回内容异常则重试，多次失败后回退使用本地时间。
+        使用 USDT 永续接口同步服务器时间，
+        如果返回的 Content-Type 不包含 "application/json"，则抛出异常进行重试，
+        多次重试失败后回退使用本地时间。
         """
-        url = REST_URL + "/sapi/v1/futures/usdc/time"
+        url = REST_URL + "/fapi/v1/time"
         for retry in range(5):
             try:
                 async with self.session.get(url, headers={"Accept": "application/json"}) as resp:
@@ -149,7 +151,7 @@ class BinanceHFTClient:
 
     async def _signed_request(self, method: str, path: str, params: Dict) -> Dict:
         """
-        采用签名请求，确保构造 URL 正确。该方法在请求时增加必要的参数并生成签名。
+        对请求进行签名并发送，构造 URL 时采用显式拼接以避免隐藏字符干扰。
         """
         params.update({
             "timestamp": int(time.time() * 1000 + self._time_diff),
@@ -158,12 +160,12 @@ class BinanceHFTClient:
         sorted_params = sorted(params.items())
         query = urllib.parse.urlencode(sorted_params, doseq=True)
         signature = hmac.new(SECRET_KEY.encode(), query.encode(), hashlib.sha256).hexdigest()
-        url = REST_URL + "/sapi/v1/futures/usdc" + path + "?" + query + "&signature=" + signature
+        # 使用 USD-M 永续合约接口：路径前缀为 /fapi/v1
+        url = REST_URL + "/fapi/v1" + path + "?" + query + "&signature=" + signature
         headers = {
             "X-MBX-APIKEY": API_KEY,
             "Accept": "application/json"
         }
-
         logger.debug(f"请求URL: {url.split('?')[0]} 参数: {sorted_params}")
 
         for attempt in range(self.config.max_retries + 1):
@@ -184,7 +186,7 @@ class BinanceHFTClient:
         raise Exception("超过最大重试次数")
 
     async def _rate_limit_check(self, endpoint: str):
-        """智能管理速率限制，根据预设参数检测请求频率"""
+        """智能管理速率限制，根据设定的速率限制控制请求频率"""
         limit, period = RATE_LIMITS.get(endpoint, (60, 1))
         dq = self.request_timestamps[endpoint]
         now = time.monotonic()
@@ -199,7 +201,7 @@ class BinanceHFTClient:
         METRICS['throughput'].inc()
 
     async def manage_leverage(self):
-        """设置杠杆，依据配置提交请求"""
+        """设置杠杆，提交请求时使用 USD-M 接口 /leverage"""
         params = {
             'symbol': SYMBOL,
             'leverage': LEVERAGE,
@@ -208,7 +210,7 @@ class BinanceHFTClient:
         return await self._signed_request('POST', '/leverage', params)
 
     async def fetch_klines(self) -> Optional[pd.DataFrame]:
-        """获取K线数据，并转换为 DataFrame 格式"""
+        """获取K线数据并转换为 DataFrame 格式，交易对使用 USD-M 接口 /klines"""
         try:
             data = await self._signed_request('GET', '/klines', {
                 'symbol': SYMBOL,
@@ -239,14 +241,14 @@ class Signal:
     sl: float
 
 
-class ETHUSDCStrategy:
+class ETHUSDTStrategy:
     def __init__(self, client: BinanceHFTClient):
         self.client = client
         self.config = TradingConfig()
         self._indicator_cache = defaultdict(lambda: None)
 
     async def execute(self):
-        """先同步时间、设置杠杆，再进入策略主循环"""
+        """先同步时间、设置杠杆，再进入循环执行策略"""
         await self.client.sync_server_time()
         await self.client.manage_leverage()
 
@@ -295,7 +297,7 @@ class ETHUSDCStrategy:
         return atr
 
     async def generate_signals(self, df: pd.DataFrame, atr_val: float) -> Signal:
-        """基于 EMA 金叉、ATR 和价格区间生成买卖信号"""
+        """基于 EMA 金叉、ATR 及价格区间生成买卖信号"""
         ema_fast = df['close'].ewm(span=self.config.ema_fast, adjust=False).mean().values
         ema_slow = df['close'].ewm(span=self.config.ema_slow, adjust=False).mean().values
         ema_cross = ema_fast[-1] > ema_slow[-1]
@@ -314,7 +316,7 @@ class ETHUSDCStrategy:
         )
 
     async def place_limit_order(self, side: str, limit_price: float, tp: float, sl: float):
-        """构造并提交限价单，校验价格及数量有效性"""
+        """构造并提交限价单，检查价格及数量有效性"""
         formatted_price = round(limit_price, self.config.price_precision)
         formatted_qty = round(QUANTITY, self.config.quantity_precision)
 
@@ -343,7 +345,7 @@ class ETHUSDCStrategy:
 
 async def main():
     client = BinanceHFTClient()
-    strategy = ETHUSDCStrategy(client)
+    strategy = ETHUSDTStrategy(client)
     try:
         await strategy.execute()
     except KeyboardInterrupt:
