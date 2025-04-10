@@ -35,7 +35,7 @@ SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
 SYMBOL = 'ETHUSDC'
 LEVERAGE = 10
 QUANTITY = 0.06
-# 对于USDC永续合约，接口地址为此（注意后续所有请求均基于此地址构造）
+# 对于 USDC 永续合约，基础 URL 保持为 api.binance.com
 REST_URL = 'https://api.binance.com'
 
 # ==================== 高频参数 ====================
@@ -75,14 +75,14 @@ class TradingConfig:
     ema_fast: int = 9
     ema_slow: int = 21
     volatility_multiplier: float = 2.5
-    max_retries: int = 7  # 增加重试次数
-    order_timeout: float = 2.0  # 订单请求超时延长至2秒
-    network_timeout: float = 5.0  # 网络请求超时延长至5秒
+    max_retries: int = 7      # 增加重试次数
+    order_timeout: float = 2.0  # 请求超时延长至2秒
+    network_timeout: float = 5.0  # 网络总超时延长至5秒
     price_precision: int = 2
     quantity_precision: int = 3
     max_position: float = 10.0
     slippage: float = 0.001
-    dual_side_position: str = "true"  # 符合API要求
+    dual_side_position: str = "true"  # 根据API要求设置
 
 
 class BinanceHFTClient:
@@ -96,11 +96,9 @@ class BinanceHFTClient:
             family=AF_INET
         )
         self._init_session()
-        self.recv_window = 6000  # 参数名与币安文档一致
+        self.recv_window = 6000  # 与 Binance 参数一致
         # 修正括号闭合问题
-        self.request_timestamps = defaultdict(
-            lambda: deque(maxlen=RATE_LIMITS['klines'][0] + 200)
-        )
+        self.request_timestamps = defaultdict(lambda: deque(maxlen=RATE_LIMITS['klines'][0] + 200))
         self._time_diff = 0
         self.position = 0.0
 
@@ -123,16 +121,15 @@ class BinanceHFTClient:
 
     async def sync_server_time(self):
         """
-        使用 USDC 永续接口进行时间同步；
-        若返回数据不符合预期，则以本地时间作为基础（_time_diff = 0）。
+        使用 USDC 永续接口同步服务器时间
+        若返回的 Content-Type 不是 JSON，则抛出异常，经重试后回退使用本地时间
         """
         url = f"{REST_URL}/sapi/v1/futures/usdc/time"
         for retry in range(5):
             try:
-                async with self.session.get(url) as resp:
-                    # 检查 Content-Type 是否为 JSON
-                    content_type = resp.headers.get('Content-Type', '')
-                    if 'application/json' not in content_type:
+                async with self.session.get(url, headers={"Accept": "application/json"}) as resp:
+                    content_type = resp.headers.get("Content-Type", "")
+                    if "application/json" not in content_type:
                         raise ValueError(f"Unexpected content type: {content_type}")
                     data = await resp.json()
                     if 'serverTime' not in data:
@@ -140,32 +137,28 @@ class BinanceHFTClient:
                     server_time = data['serverTime']
                     local_time = int(time.time() * 1000)
                     self._time_diff = server_time - local_time
-                    if abs(self._time_diff) > 500:
-                        logger.warning(f"时间偏差警告: {self._time_diff}ms")
                     logger.info(f"时间同步成功，时间差: {self._time_diff}ms")
                     return
             except Exception as e:
                 logger.error(f"时间同步失败(重试 {retry + 1}): {str(e)}")
                 await asyncio.sleep(2 ** retry)
-        # 如果多次尝试仍无法获取服务器时间，回退使用本地时间
         logger.warning("无法同步服务器时间，回退使用本地时间")
         self._time_diff = 0
 
     async def _signed_request(self, method: str, path: str, params: Dict) -> Dict:
-        # 更新参数，确保传递 recvWindow 等值正确
+        # 更新参数，确保携带正确的 timestamp 和 recvWindow
         params.update({
             "timestamp": int(time.time() * 1000 + self._time_diff),
             "recvWindow": self.recv_window
         })
         sorted_params = sorted(params.items())
         query = urllib.parse.urlencode(sorted_params, doseq=True)
-        signature = hmac.new(
-            SECRET_KEY.encode(),
-            query.encode(),
-            hashlib.sha256
-        ).hexdigest()
+        signature = hmac.new(SECRET_KEY.encode(), query.encode(), hashlib.sha256).hexdigest()
         url = f"{REST_URL}/sapi/v1/futures/usdc{path}?{query}&signature={signature}"
-        headers = {"X-MBX-APIKEY": API_KEY}
+        headers = {
+            "X-MBX-APIKEY": API_KEY,
+            "Accept": "application/json"
+        }
 
         logger.debug(f"请求URL: {url.split('?')[0]} 参数: {sorted_params}")
 
@@ -174,7 +167,10 @@ class BinanceHFTClient:
                 endpoint = path.split('/')[-1]
                 await self._rate_limit_check(endpoint)
                 async with self.session.request(method, url, headers=headers) as resp:
-                    resp.raise_for_status()
+                    content_type = resp.headers.get("Content-Type", "")
+                    if "application/json" not in content_type:
+                        text = await resp.text()
+                        raise Exception(f"Unexpected Content-Type: {content_type}. Response text: {text}")
                     return await resp.json()
             except Exception as e:
                 logger.error(f"请求失败 (尝试 {attempt + 1}): {type(e).__name__} {str(e)}")
@@ -184,7 +180,7 @@ class BinanceHFTClient:
         raise Exception("超过最大重试次数")
 
     async def _rate_limit_check(self, endpoint: str):
-        """智能速率限制管理，根据各接口设定速率限制"""
+        """基于速率限制参数智能管理请求频率"""
         limit, period = RATE_LIMITS.get(endpoint, (60, 1))
         dq = self.request_timestamps[endpoint]
         now = time.monotonic()
@@ -199,7 +195,7 @@ class BinanceHFTClient:
         METRICS['throughput'].inc()
 
     async def manage_leverage(self):
-        """设置杠杆，使用配置参数提交请求"""
+        """设置杠杆，提交请求前使用配置参数"""
         params = {
             'symbol': SYMBOL,
             'leverage': LEVERAGE,
@@ -208,7 +204,7 @@ class BinanceHFTClient:
         return await self._signed_request('POST', '/leverage', params)
 
     async def fetch_klines(self) -> Optional[pd.DataFrame]:
-        """获取K线数据并转换为DataFrame"""
+        """获取K线数据并转换成DataFrame格式"""
         try:
             data = await self._signed_request('GET', '/klines', {
                 'symbol': SYMBOL,
@@ -246,7 +242,7 @@ class ETHUSDCStrategy:
         self._indicator_cache = defaultdict(lambda: None)
 
     async def execute(self):
-        """先同步时间，再设置杠杆，随后循环执行策略逻辑"""
+        """先同步时间，设置杠杆，进入循环执行策略逻辑"""
         await self.client.sync_server_time()
         await self.client.manage_leverage()
 
@@ -269,8 +265,7 @@ class ETHUSDCStrategy:
 
                 if signals.action:
                     current_price = close_prices[-1]
-                    adjusted_price = current_price * (1 + self.config.slippage *
-                                                      (-1 if signals.side == 'BUY' else 1))
+                    adjusted_price = current_price * (1 + self.config.slippage * (-1 if signals.side == 'BUY' else 1))
                     await self.place_limit_order(
                         side=signals.side,
                         limit_price=adjusted_price,
@@ -295,7 +290,7 @@ class ETHUSDCStrategy:
         return atr
 
     async def generate_signals(self, df: pd.DataFrame, atr_val: float) -> Signal:
-        """基于EMA金叉、波动率和价格区间生成买卖信号"""
+        """基于EMA金叉、波动率及价格区间生成买卖信号"""
         ema_fast = df['close'].ewm(span=self.config.ema_fast, adjust=False).mean().values
         ema_slow = df['close'].ewm(span=self.config.ema_slow, adjust=False).mean().values
         ema_cross = ema_fast[-1] > ema_slow[-1]
@@ -314,7 +309,7 @@ class ETHUSDCStrategy:
         )
 
     async def place_limit_order(self, side: str, limit_price: float, tp: float, sl: float):
-        """构造并提交限价单，同时对价格和数量进行校验"""
+        """构造并提交限价单，同时校验价格和数量有效性"""
         formatted_price = round(limit_price, self.config.price_precision)
         formatted_qty = round(QUANTITY, self.config.quantity_precision)
 
