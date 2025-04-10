@@ -1,8 +1,7 @@
-# /usr/bin/env python3
+#!/usr/bin/env python3
 # ETH/USDC高频交易引擎 v5.1 (修复版)
 
 import uvloop
-
 uvloop.install()
 
 import os
@@ -13,7 +12,7 @@ import hmac
 import hashlib
 import urllib.parse
 import logging
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 from collections import deque, defaultdict
 from dataclasses import dataclass
 from socket import AF_INET
@@ -97,8 +96,10 @@ class BinanceHFTClient:
         )
         self._init_session()
         self.recv_window = 6000  # 确保参数名正确
+        # 修复括号未闭合的问题
         self.request_timestamps = defaultdict(
             lambda: deque(maxlen=RATE_LIMITS['klines'][0] + 200)
+        )
         self._time_diff = 0
         self.position = 0.0
 
@@ -123,7 +124,8 @@ class BinanceHFTClient:
         """增强型时间同步（带指数退避重试）"""
         for retry in range(5):
             try:
-                async with self.session.get(f"{REST_URL}/api/v3/time") as resp:
+                # 对于USDC永续，使用官方推荐接口
+                async with self.session.get(f"{REST_URL}/sapi/v1/futures/usdc/time") as resp:
                     data = await resp.json()
                     server_time = data['serverTime']
                     local_time = int(time.time() * 1000)
@@ -137,10 +139,10 @@ class BinanceHFTClient:
         raise ConnectionError("无法同步服务器时间")
 
     async def _signed_request(self, method: str, path: str, params: Dict) -> Dict:
-        # 确保参数名正确且无隐藏字符
+        # 更新参数，并确保无隐藏字符
         params.update({
             "timestamp": int(time.time() * 1000 + self._time_diff),
-            "recvWindow": self.recv_window  # 修正参数名
+            "recvWindow": self.recv_window
         })
         sorted_params = sorted(params.items())
         query = urllib.parse.urlencode(sorted_params, doseq=True)
@@ -188,7 +190,7 @@ class BinanceHFTClient:
         params = {
             'symbol': SYMBOL,
             'leverage': LEVERAGE,
-            'dualSidePosition': self.config.dual_side_position  # 使用配置参数
+            'dualSidePosition': self.config.dual_side_position
         }
         return await self._signed_request('POST', '/leverage', params)
 
@@ -203,7 +205,6 @@ class BinanceHFTClient:
             })
             if not isinstance(data, list):
                 raise ValueError("K线数据格式异常")
-
             df = pd.DataFrame(data, columns=[
                 'timestamp', 'open', 'high', 'low', 'close', 'volume',
                 'close_time', 'quote_asset_volume', 'trades',
@@ -217,6 +218,14 @@ class BinanceHFTClient:
             return None
 
 
+@dataclass
+class Signal:
+    action: bool
+    side: str
+    tp: float
+    sl: float
+
+
 class ETHUSDCStrategy:
     def __init__(self, client: BinanceHFTClient):
         self.client = client
@@ -224,9 +233,9 @@ class ETHUSDCStrategy:
         self._indicator_cache = defaultdict(lambda: None)
 
     async def execute(self):
-        """执行策略（增加初始化顺序）"""
-        await self.client.sync_server_time()  # 先同步时间
-        await self.client.manage_leverage()  # 再设置杠杆
+        """执行策略：先同步时间，再设置杠杆，随后循环执行交易逻辑"""
+        await self.client.sync_server_time()
+        await self.client.manage_leverage()
 
         while True:
             try:
@@ -241,13 +250,13 @@ class ETHUSDCStrategy:
                 high_prices = df['high'].values.astype(np.float32)
                 low_prices = df['low'].values.astype(np.float32)
 
-                # ATR计算
-                atr_val = self._vectorized_atr(high_prices, low_prices, close_prices)[-1]
+                atr_array = self._vectorized_atr(high_prices, low_prices, close_prices)
+                atr_val = atr_array[-1]
 
                 # 生成信号
                 signals = await self.generate_signals(df, atr_val)
 
-                # 执行订单
+                # 若信号有效，则下单
                 if signals.action:
                     current_price = close_prices[-1]
                     adjusted_price = current_price * (1 + self.config.slippage *
@@ -259,7 +268,7 @@ class ETHUSDCStrategy:
                         stop_loss=signals.sl
                     )
 
-                # 性能监控
+                # 记录延迟
                 METRICS['latency'].set((time.monotonic() - start_time) * 1000)
                 await asyncio.sleep(max(0.5, 1.0 - (time.monotonic() - start_time)))
 
@@ -274,15 +283,12 @@ class ETHUSDCStrategy:
             np.abs(high[1:] - close[:-1]),
             np.abs(low[1:] - close[:-1])
         )
-        atr = np.zeros_like(close)
-        atr[self.config.atr_window:] = (
-                np.convolve(tr, np.ones(self.config.atr_window), 'valid')
-                / self.config.atr_window
-        )
+        # 计算ATR，注意卷积窗口
+        atr = np.convolve(tr, np.ones(self.config.atr_window), 'valid') / self.config.atr_window
         return atr
 
     async def generate_signals(self, df: pd.DataFrame, atr_val: float) -> Signal:
-        """增强信号生成逻辑"""
+        """增强信号生成逻辑：基于EMA金叉、波动率以及价格区间判断"""
         ema_fast = df['close'].ewm(span=self.config.ema_fast, adjust=False).mean().values
         ema_slow = df['close'].ewm(span=self.config.ema_slow, adjust=False).mean().values
         ema_cross = ema_fast[-1] > ema_slow[-1]
@@ -301,7 +307,7 @@ class ETHUSDCStrategy:
         )
 
     async def place_limit_order(self, side: str, limit_price: float, tp: float, sl: float):
-        """增强订单处理（增加价格验证）"""
+        """增强订单处理：校验价格及数量，提交限价单"""
         formatted_price = round(limit_price, self.config.price_precision)
         formatted_qty = round(QUANTITY, self.config.quantity_precision)
 
@@ -322,7 +328,7 @@ class ETHUSDCStrategy:
             await self.client._signed_request('POST', '/order', params)
             logger.info(f"挂单成功 {side}@{formatted_price} | TP: {tp:.2f} SL: {sl:.2f}")
 
-            # 动态杠杆管理
+            # 根据持仓动态调整杠杆
             if abs(self.client.position) > self.config.max_position * 0.75:
                 await self.client.manage_leverage()
 
