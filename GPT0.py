@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-# ETH/USDC 合约高频交易引擎 v4.2 (整合多周期指标与限价挂单示例)
+# ETH/USDC高频交易引擎 v4.2 (整合多周期指标与限价挂单示例)
 
 import uvloop
-
 uvloop.install()
 
 import os
@@ -22,15 +21,7 @@ import pandas as pd
 from aiohttp import ClientTimeout, TCPConnector
 from aiohttp_retry import RetryClient, ExponentialRetry
 
-# 尝试导入 aiodns，如果未安装则使用默认解析器
-try:
-    from aiohttp.resolver import AsyncResolver
-
-    resolver = AsyncResolver(nameservers=["8.8.8.8", "1.1.1.1"])
-except Exception:
-    resolver = None
-    print("Warning: aiodns 库未安装，使用默认解析器")
-
+# 不使用 AsyncResolver（避免顶层创建的警告），建议安装 aiodns 后在 async 函数中创建
 from dotenv import load_dotenv
 from prometheus_client import Gauge, start_http_server
 import psutil
@@ -43,11 +34,10 @@ load_dotenv(_env_path)
 
 API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
-# 这里交易对为 USDC 合约交易对，示例使用 "ETHUSDC"
-SYMBOL = os.getenv('TRADING_PAIR', 'ETHUSDC').strip()
+SYMBOL = os.getenv('TRADING_PAIR', 'ETHUSDC').strip()  # 交易对名称，USDC合约通常为 "ETHUSDC"
 LEVERAGE = int(os.getenv('LEVERAGE', 10))
 QUANTITY = float(os.getenv('QUANTITY', 0.06))
-# Binance Futures USDC-M 基础 URL 使用正式地址
+# 使用 Binance 正式接口基础 URL
 REST_URL = 'https://api.binance.com'
 
 # 检查 API 密钥
@@ -58,13 +48,14 @@ if len(API_KEY) != 64 or len(SECRET_KEY) != 64:
 
 # ==================== 高频参数 ====================
 RATE_LIMITS = {
-    'klines': (60, 5),  # 每5秒最多60次请求
+    'klines': (60, 5),
     'orders': (300, 10),
     'leverage': (30, 60)
 }
 
 # ==================== 监控指标 ====================
-start_http_server(8000)
+# 修改为8001，防止端口冲突
+start_http_server(8001)
 METRICS = {
     'memory': Gauge('hft_memory', '内存(MB)'),
     'latency': Gauge('order_latency', '延迟(ms)'),
@@ -75,7 +66,7 @@ METRICS = {
 
 # ==================== 日志配置 ====================
 logging.basicConfig(
-    level=logging.INFO,  # 如需调试可设为 DEBUG
+    level=logging.INFO,  # 调试时可设置为 DEBUG
     format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
@@ -86,7 +77,6 @@ logging.basicConfig(
 logger = logging.getLogger('ETH-USDC-HFT')
 DEBUG = False
 
-
 @dataclass
 class TradingConfig:
     """交易参数配置"""
@@ -95,17 +85,15 @@ class TradingConfig:
     ema_slow: int = 21
     volatility_multiplier: float = 2.5
     max_retries: int = 3
-    order_timeout: float = 0.5  # 500ms连接超时
-    network_timeout: float = 2.0  # 2秒总超时
+    order_timeout: float = 0.5      # 500ms连接超时
+    network_timeout: float = 2.0    # 2秒总超时
     price_precision: int = int(os.getenv('PRICE_PRECISION', '2'))
     quantity_precision: int = int(os.getenv('QUANTITY_PRECISION', '3'))
     max_position: float = 10.0
 
-
 # ==================== 数据获取及下单模块 ====================
 class BinanceHFTClient:
-    """获取K线数据、发送签名请求以及下单"""
-
+    """高频交易客户端（整合 USDC-M Futures 接口）"""
     def __init__(self):
         self.config = TradingConfig()
         connector_args = {
@@ -115,8 +103,7 @@ class BinanceHFTClient:
             "force_close": True,
             "family": AF_INET
         }
-        if resolver is not None:
-            connector_args["resolver"] = resolver
+        # 使用默认解析器，避免事件循环冲突
         self.connector = TCPConnector(**connector_args)
         self._init_session()
         self.recv_window = 5000
@@ -164,7 +151,7 @@ class BinanceHFTClient:
             await self.sync_server_time()
             raise
         full_query = f"{query}&signature={signature}"
-        # 使用 USDC-M Futures 专用路径前缀 /sapi/v1/futures/usdc
+        # 使用 USDC-M Futures 接口路径前缀，例如设置杠杆接口为 /sapi/v1/futures/usdc/leverage
         url = f"{REST_URL}/sapi/v1/futures/usdc{path}?{full_query}"
         headers = {"X-MBX-APIKEY": API_KEY}
         if DEBUG:
@@ -174,6 +161,7 @@ class BinanceHFTClient:
                 endpoint = path.split('/')[-1]
                 await self._rate_limit_check(endpoint)
                 async with self.session.request(method, url, headers=headers) as resp:
+                    # 使用 content_type=None 避免 MIME 检查问题
                     resp_text = await resp.text()
                     if DEBUG:
                         logger.debug(f"返回状态 {resp.status}, 内容: {resp_text}")
@@ -184,9 +172,9 @@ class BinanceHFTClient:
                         logger.error(f"API错误 {resp.status}: {resp_text}")
                         METRICS['errors'].inc()
                         continue
-                    return await resp.json()
+                    return await resp.json(content_type=None)
             except Exception as e:
-                logger.error(f"请求失败 (尝试 {attempt + 1}): {str(e)}")
+                logger.error(f"请求失败 (尝试 {attempt+1}): {str(e)}")
                 if attempt < self.config.max_retries:
                     await asyncio.sleep(0.1 * (2 ** attempt))
                 else:
@@ -199,7 +187,7 @@ class BinanceHFTClient:
         for _ in range(7):
             try:
                 async with self.session.get(url) as resp:
-                    data = await resp.json()
+                    data = await resp.json(content_type=None)
                     server_time = data.get('serverTime')
                     if server_time is None:
                         raise Exception("serverTime 未返回")
@@ -225,7 +213,7 @@ class BinanceHFTClient:
             data = await self._signed_request('GET', '/klines', params)
             arr = np.empty((len(data), 6), dtype=np.float64)
             for i, candle in enumerate(data):
-                # 根据文档字段，下标调整为：1=open, 2=high, 3=low, 4=close, 5=volume, 7=结束时间
+                # 根据 Binance USDC-M Futures 文档，字段下标可能需要调整，此处示例取 [1,2,3,4,5,7]
                 arr[i] = [float(candle[j]) for j in [1, 2, 3, 4, 5, 7]]
             return pd.DataFrame({
                 'open': arr[:, 0],
@@ -239,13 +227,8 @@ class BinanceHFTClient:
             logger.error(f"获取K线失败: {str(e)}")
             return None
 
-
-# ==================== 多周期数据与指标计算模块 ====================
+# ==================== 指标和信号模块 ====================
 def resample_data(df: pd.DataFrame, interval: str) -> pd.DataFrame:
-    """
-    重采样 K 线数据到指定周期
-    interval 格式如 '3T'(3分钟), '15T'(15分钟), '1H', '6H'
-    """
     df.index = pd.to_datetime(df['timestamp'], unit='ms')
     resampled = df.resample(interval).agg({
         'open': 'first',
@@ -256,10 +239,8 @@ def resample_data(df: pd.DataFrame, interval: str) -> pd.DataFrame:
     }).dropna()
     return resampled
 
-
 def SMA(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window=window).mean()
-
 
 def RSI(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
@@ -270,7 +251,6 @@ def RSI(series: pd.Series, period: int = 14) -> pd.Series:
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-
 def MACD(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
     ema_fast = series.ewm(span=fast, adjust=False).mean()
     ema_slow = series.ewm(span=slow, adjust=False).mean()
@@ -279,9 +259,7 @@ def MACD(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> 
     histogram = macd_line - signal_line
     return pd.DataFrame({'macd': macd_line, 'signal': signal_line, 'histogram': histogram})
 
-
-def KDJ(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 9, k_period: int = 3,
-        d_period: int = 3) -> pd.DataFrame:
+def KDJ(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 9, k_period: int = 3, d_period: int = 3) -> pd.DataFrame:
     low_min = low.rolling(n, min_periods=n).min()
     high_max = high.rolling(n, min_periods=n).max()
     rsv = (close - low_min) / (high_max - low_min) * 100
@@ -290,20 +268,16 @@ def KDJ(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 9, k_period:
     j = 3 * k - 2 * d
     return pd.DataFrame({'K': k, 'D': d, 'J': j})
 
-
 def BBI(series: pd.Series) -> pd.Series:
     return (SMA(series, 3) + SMA(series, 6) + SMA(series, 12) + SMA(series, 24)) / 4
 
-
 def MTM(series: pd.Series, period: int = 10) -> pd.Series:
     return series.diff(period)
-
 
 def LWR(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14) -> pd.Series:
     highest = high.rolling(n, min_periods=n).max()
     lowest = low.rolling(n, min_periods=n).min()
     return 100 * (close - lowest) / (highest - lowest)
-
 
 def ATR(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
     tr = pd.concat([
@@ -313,23 +287,16 @@ def ATR(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     ], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
-
 def PSR(returns: pd.Series, window: int = 30) -> float:
-    """
-    简化的概率夏普比率计算：利用滚动窗口收益均值/标准差计算 Sharpe Ratio,
-    并转化为概率。这里只给出一个示例，实际计算可参考论文方法。
-    """
+    # 简单示例：使用滚动收益平均值除以滚动标准差，再转换为概率（sigmoid函数）
     r = returns.rolling(window).mean().iloc[-1]
     sigma = returns.rolling(window).std().iloc[-1]
     if sigma == 0:
         return 0.0
     sharpe = r / sigma
-    # 概率值的简化版本：归一化 Sharpe (此处仅为示例)
     psr = 1 / (1 + np.exp(-sharpe))
     return psr
 
-
-# ==================== 策略模块 ====================
 @dataclass
 class CombinedSignals:
     ea_long: bool = False
@@ -349,55 +316,40 @@ class CombinedSignals:
     psr_long: bool = False
     psr_short: bool = False
 
-
+# ==================== 策略模块 ====================
 class ETHUSDCStrategy:
-    """集成多指标策略，挂限价单并设置动态止盈止损"""
-
+    """集成多周期与多指标策略，下单仅挂限价单并设置动态止盈止损"""
     def __init__(self, client: BinanceHFTClient):
         self.client = client
         self.config = TradingConfig()
 
     async def execute(self):
-        # 设置杠杆并同步时间
         await self.client.manage_leverage()
         await self.client.sync_server_time()
-
         while True:
             try:
                 start_cycle = time.monotonic()
-                # 获取1分钟K线数据
                 df = await self.client.fetch_klines()
                 if df is None or df.empty:
                     await asyncio.sleep(0.2)
                     continue
 
-                # 计算 ATR 用于止盈止损，使用1分钟数据
-                atr = ATR(df['high'], df['low'], df['close'], period=14).iloc[-1]
-
-                # EA信号（使用SMA交叉）在各周期上，重采样数据
+                # 计算1分钟数据指标
+                atr_val = ATR(df['high'], df['low'], df['close'], period=self.config.atr_window).iloc[-1]
+                # EA信号：在 1分钟、3分钟、15分钟、1小时、6小时上计算 SMA 交叉信号
                 signals = CombinedSignals()
-                # 1分钟
                 s1 = self.compute_ea_signal(df, short_period=5, long_period=20)
-                # 3分钟
-                df3m = resample_data(df, '3T')
-                s3 = self.compute_ea_signal(df3m, short_period=5, long_period=30)
-                # 15分钟
-                df15m = resample_data(df, '15T')
-                s15 = self.compute_ea_signal(df15m, short_period=7, long_period=50)
-                # 1小时
-                df1h = resample_data(df, '1H')
-                s1h = self.compute_ea_signal(df1h, short_period=10, long_period=60)
-                # 6小时
-                df6h = resample_data(df, '6H')
-                s6h = self.compute_ea_signal(df6h, short_period=20, long_period=120)
-                # 综合 EA 信号：多数周期金叉看多，多数周期死叉看空
+                s3 = self.compute_ea_signal(resample_data(df, '3T'), short_period=5, long_period=30)
+                s15 = self.compute_ea_signal(resample_data(df, '15T'), short_period=7, long_period=50)
+                s1h = self.compute_ea_signal(resample_data(df, '1H'), short_period=10, long_period=60)
+                s6h = self.compute_ea_signal(resample_data(df, '6H'), short_period=20, long_period=120)
                 signals.ea_long = sum([s1, s3, s15, s1h, s6h]) >= 3
                 signals.ea_short = sum([not s1, not s3, not s15, not s1h, not s6h]) >= 3
 
-                # RSI（14）
-                rsi = RSI(df['close'], period=14)
-                signals.rsi_long = rsi.iloc[-1] > 60
-                signals.rsi_short = rsi.iloc[-1] < 40
+                # RSI(14)
+                rsi_val = RSI(df['close'], period=14).iloc[-1]
+                signals.rsi_long = rsi_val > 60
+                signals.rsi_short = rsi_val < 40
 
                 # MACD
                 macd_df = MACD(df['close'], fast=12, slow=26, signal=9)
@@ -409,60 +361,56 @@ class ETHUSDCStrategy:
                 signals.kdj_long = kdj_df['J'].iloc[-1] > 50
                 signals.kdj_short = kdj_df['J'].iloc[-1] < 50
 
-                # BBI（大周期均线综合）
-                signals.bbi_long = BBI(df['close']).iloc[-1] < df['close'].iloc[-1]
-                signals.bbi_short = BBI(df['close']).iloc[-1] > df['close'].iloc[-1]
+                # BBI
+                bbi_val = BBI(df['close']).iloc[-1]
+                signals.bbi_long = bbi_val < df['close'].iloc[-1]
+                signals.bbi_short = bbi_val > df['close'].iloc[-1]
 
-                # MTM（动量指标）
-                mtm = MTM(df['close'], period=10)
-                signals.mtm_long = mtm.iloc[-1] > 0
-                signals.mtm_short = mtm.iloc[-1] < 0
+                # MTM(10)
+                mtm_val = MTM(df['close'], period=10).iloc[-1]
+                signals.mtm_long = mtm_val > 0
+                signals.mtm_short = mtm_val < 0
 
-                # LWR（Williams %R）
-                lwr = LWR(df['high'], df['low'], df['close'], n=14)
-                signals.lwr_long = lwr.iloc[-1] < 20  # 超买区
-                signals.lwr_short = lwr.iloc[-1] > 80  # 超卖区
+                # LWR(14)
+                lwr_val = LWR(df['high'], df['low'], df['close'], n=14).iloc[-1]
+                signals.lwr_long = lwr_val < 20
+                signals.lwr_short = lwr_val > 80
 
-                # PSR，基于最近30分钟的收益（简化示例）
+                # PSR 基于1分钟收益（简化示例）
                 returns = df['close'].pct_change().dropna()
                 psr_val = PSR(returns, window=30)
                 signals.psr_long = psr_val > 0.7
                 signals.psr_short = psr_val < 0.3
 
-                # 综合信号：如多仓信号：至少EA、RSI、MACD、KDJ、PSR 五项多数信号看多
-                long_count = sum(
-                    [signals.ea_long, signals.rsi_long, signals.macd_long, signals.kdj_long, signals.psr_long])
-                short_count = sum(
-                    [signals.ea_short, signals.rsi_short, signals.macd_short, signals.kdj_short, signals.psr_short])
-                # 简单逻辑：多仓信号大于3项则看多，空仓同理
+                # 综合信号: 多头条件：至少 EA, RSI, MACD, KDJ, PSR 五项信号中多数看多
+                long_count = sum([signals.ea_long, signals.rsi_long, signals.macd_long, signals.kdj_long, signals.psr_long])
+                short_count = sum([signals.ea_short, signals.rsi_short, signals.macd_short, signals.kdj_short, signals.psr_short])
                 if long_count >= 3:
-                    order_side = 'BUY'
-                    # 限价单价格设为当前价减去 ATR 的一定比例
-                    limit_price = df['close'].iloc[-1] - atr * 0.5
-                    take_profit = df['close'].iloc[-1] + atr * 2.5
-                    stop_loss = df['close'].iloc[-1] - atr * 1.5
-                    print("多仓信号：", long_count)
-                    await self.place_limit_order(order_side, limit_price, take_profit, stop_loss)
+                    side = 'BUY'
+                    # 限价单价格设置：当前收盘价减去一定比例ATR（例如0.5倍ATR）
+                    limit_price = df['close'].iloc[-1] - atr_val * 0.5
+                    take_profit = df['close'].iloc[-1] + atr_val * 2.5
+                    stop_loss = df['close'].iloc[-1] - atr_val * 1.5
+                    print("多仓信号，信号计数：", long_count)
+                    await self.place_limit_order(side, limit_price, take_profit, stop_loss)
                 elif short_count >= 3:
-                    order_side = 'SELL'
-                    limit_price = df['close'].iloc[-1] + atr * 0.5
-                    take_profit = df['close'].iloc[-1] - atr * 2.5
-                    stop_loss = df['close'].iloc[-1] + atr * 1.5
-                    print("空仓信号：", short_count)
-                    await self.place_limit_order(order_side, limit_price, take_profit, stop_loss)
+                    side = 'SELL'
+                    limit_price = df['close'].iloc[-1] + atr_val * 0.5
+                    take_profit = df['close'].iloc[-1] - atr_val * 2.5
+                    stop_loss = df['close'].iloc[-1] + atr_val * 1.5
+                    print("空仓信号，信号计数：", short_count)
+                    await self.place_limit_order(side, limit_price, take_profit, stop_loss)
                 else:
-                    print("综合信号不足，多空双方信号数量：", long_count, short_count)
-                # 计算并记录本周期耗时
+                    print("综合信号不足，多仓信号：", long_count, " 空仓信号：", short_count)
                 cycle_time = (time.monotonic() - start_cycle) * 1000
                 METRICS['latency'].set(cycle_time)
-                await asyncio.sleep(max(0.5, 1 - cycle_time / 1000))
+                await asyncio.sleep(max(0.5, 1 - cycle_time/1000))
             except Exception as e:
                 logger.error(f"策略异常: {str(e)}")
                 await asyncio.sleep(1)
 
     async def place_limit_order(self, side: str, limit_price: float, tp: float, sl: float):
-        # 下单时只使用限价单挂单, 此处示例直接挂单，不含自动取消逻辑，可根据需要扩展
-        # 格式化数量及价格
+        # 下单只使用限价单挂单
         formatted_price = float(f"{limit_price:.{self.config.price_precision}f}")
         formatted_qty = float(f"{QUANTITY:.{self.config.quantity_precision}f}")
         params = {
@@ -475,21 +423,17 @@ class ETHUSDCStrategy:
         }
         order_resp = await self.client._signed_request('POST', '/order', params)
         print(f"挂单 {side} 限价 {formatted_price} 返回:", order_resp)
-        # 动态止盈止损逻辑（示例仅打印，如可接入追单模块）
+        # 输出动态止盈止损设置（示例，仅打印，可扩展为挂单修改机制）
         print(f"设置止盈: {tp:.{self.config.price_precision}f} ，止损: {sl:.{self.config.price_precision}f}")
 
     def compute_ea_signal(self, df: pd.DataFrame, short_period: int, long_period: int) -> bool:
-        """利用 SMA 均线计算 EA 信号：短期上穿长期为看多"""
-        short_sma = df['close'].rolling(short_period).mean()
-        long_sma = df['close'].rolling(long_period).mean()
-        # 如果最后一个点短均线上穿长期均线，则信号为 True
+        short_sma = df['close'].rolling(window=short_period).mean()
+        long_sma = df['close'].rolling(window=long_period).mean()
         return short_sma.iloc[-1] > long_sma.iloc[-1]
-
 
 # ==================== 主函数 ====================
 async def main():
     # 初始化 Binance 客户端
-    from GPT0 import BinanceHFTClient  # 若是单文件运行，此步不需要
     client = BinanceHFTClient()
     strategy = ETHUSDCStrategy(client)
     try:
@@ -497,14 +441,11 @@ async def main():
     finally:
         await client.session.close()
 
-
 if __name__ == "__main__":
     asyncio.run(main())
 
-
 # ==================== 辅助函数 ====================
 def resample_data(df: pd.DataFrame, interval: str) -> pd.DataFrame:
-    """利用 1 分钟数据重采样到其他周期，interval 格式如 '3T','15T','1H','6H'"""
     df.index = pd.to_datetime(df['timestamp'], unit='ms')
     resampled = df.resample(interval).agg({
         'open': 'first',
