@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ETH/USDC 高频交易引擎 v7.4（整合优化版）
+# ETH/USDC 高频交易引擎 v7.4（整合优化版：基于实时3m Bollinger Bands %B 下单信号）
 
 import uvloop
 
@@ -286,19 +286,14 @@ class ETHUSDCStrategy:
     async def order_signal_loop(self):
         while True:
             try:
+                # 只在 %B 极端状态触发（≤0 或 ≥1）下单
                 signal, order_list = await self.analyze_order_signals_3m()
                 if signal.action:
-                    if self.last_trade_side == 'LONG':
-                        long_qty = QUANTITY * 1
-                        short_qty = QUANTITY * 0.5
-                    elif self.last_trade_side == 'SHORT':
-                        long_qty = QUANTITY * 0.5
-                        short_qty = QUANTITY * 1
-                    else:
-                        long_qty = short_qty = QUANTITY
-                    await self.place_dynamic_limit_orders(signal.side, order_list, long_qty, short_qty)
+                    # 直接基于信号触发时记录的 trigger_price 下挂固定限价单
+                    await self.place_dynamic_limit_orders(signal.side, order_list,
+                                                          trigger_price=signal.order_details.get("trigger_price"))
                 else:
-                    # 没有下单信号时撤销未成交订单
+                    # 无信号时撤销所有未成交订单，避免挂单滞留
                     await self.cancel_all_orders()
             except Exception as e:
                 logger.error(f"下单信号异常: {str(e)}")
@@ -395,7 +390,7 @@ class ETHUSDCStrategy:
 
     async def rebalance_hedge(self):
         logger.info("执行持仓再平衡，调整对冲仓位至1:1")
-        # 实际实现时需要查询持仓情况，并下单对冲
+        # 实际实现时需要查询持仓并下单对冲
 
     async def close_position(self, side: str, ratio: float):
         df = await self.client.fetch_klines(interval='3m', limit=50)
@@ -418,11 +413,14 @@ class ETHUSDCStrategy:
 
     async def analyze_order_signals_3m(self):
         """
-        使用实时3分钟 Bollinger Bands %B（周期20, 标准差2）判断下单信号：
-          - 当 %B 处于极端状态（≥1 或 ≤0）时触发下单；
-          - 补充条件：当前持仓为 LONG 时，当 %B 从极端值回落至约0.95以下，
-            或 SHORT 时当 %B 从极端值上升至约0.05以上，也触发信号；
-          - 返回订单参数列表，每档订单基于最新价格偏移固定比例。
+        使用实时3m Bollinger Bands %B（周期20, 标准差2）判断下单信号：
+          当 %B ≤ 0 或 ≥ 1 时触发信号，记录信号触发时的当前价格作为基准，
+          并返回固定挂单档位：
+            - 基准价 ±0.05% 挂单30%
+            - 基准价 ±0.1%  挂单20%
+            - 基准价 ±0.45% 挂单10%
+            - 基准价 ±0.65% 挂单20%
+            - 基准价 ±1.1%  挂单20%
         """
         df = await self.client.fetch_klines(interval='3m', limit=50)
         if df.empty:
@@ -437,56 +435,51 @@ class ETHUSDCStrategy:
         percent_b = 0.0 if bb_range == 0 else (latest_price - lower_band[-1]) / bb_range
         logger.info(f"实时3m %B: {percent_b:.3f}")
 
-        order_list = []
-        signal_trigger = False
-        signal_side = 'NONE'
-
-        if percent_b >= 1.0:
-            signal_side = 'SELL'
-            signal_trigger = True
-        elif percent_b <= 0.0:
+        # 仅当 %B ≤ 0 或 ≥ 1 时触发信号
+        if percent_b <= 0.0:
             signal_side = 'BUY'
             signal_trigger = True
-        elif self.last_trade_side == 'LONG' and percent_b < 0.95:
+        elif percent_b >= 1.0:
             signal_side = 'SELL'
             signal_trigger = True
-        elif self.last_trade_side == 'SHORT' and percent_b > 0.05:
-            signal_side = 'BUY'
-            signal_trigger = True
+        else:
+            signal_side = 'NONE'
+            signal_trigger = False
 
         if signal_trigger:
+            # 固定挂单档位定义（offset为百分比，已转换为小数）
             order_list = [
-                {'offset': 0.0025, 'ratio': 0.30},
-                {'offset': 0.0040, 'ratio': 0.20},
-                {'offset': 0.0060, 'ratio': 0.10},
-                {'offset': 0.0080, 'ratio': 0.20},
-                {'offset': 0.0160, 'ratio': 0.20},
+                {'offset': 0.0005, 'ratio': 0.30},
+                {'offset': 0.0010, 'ratio': 0.20},
+                {'offset': 0.0045, 'ratio': 0.10},
+                {'offset': 0.0065, 'ratio': 0.20},
+                {'offset': 0.0110, 'ratio': 0.20},
             ]
-            logger.info(f"触发下单信号: side={signal_side}, %B={percent_b:.3f}")
-            return Signal(True, signal_side, 0, 0, order_details={'percent_b': percent_b}), order_list
+            # 将信号触发时的最新价格作为下单基准价格传递
+            return Signal(True, signal_side, 0, 0,
+                          order_details={'trigger_price': latest_price, 'percent_b': percent_b}), order_list
         else:
             return Signal(False, 'NONE', 0, 0), []
 
-    async def place_dynamic_limit_orders(self, side: str, order_list: list, long_qty: float, short_qty: float):
+    async def place_dynamic_limit_orders(self, side: str, order_list: list, trigger_price: float):
         """
-        基于最新3m数据及预设档位偏移挂单，下单价格依据最新3m均价计算。
+        基于信号触发时记录的 trigger_price 挂单，下单价格基于该价格±固定百分比计算。
+        对于 BUY 信号（%B ≤ 0）挂单价格下调；
+        对于 SELL 信号（%B ≥ 1）挂单价格上调。
         """
-        df_now = await self.client.fetch_klines(interval='3m', limit=50)
-        if df_now.empty:
-            return
-        current_price = df_now['close'].values[-1]
+        base_price = trigger_price
         for order in order_list:
-            dynamic_offset = order['offset']
+            offset = order['offset']
             ratio = order['ratio']
             order_qty = round(QUANTITY * ratio, self.config.quantity_precision)
-            if not order_qty or order_qty <= 0:
+            if order_qty <= 0:
                 logger.error("计算得到无效订单数量，跳过当前档")
                 continue
             if side == 'BUY':
-                limit_price = round(current_price * (1 - dynamic_offset), self.config.price_precision)
+                limit_price = round(base_price * (1 - offset), self.config.price_precision)
             else:
-                limit_price = round(current_price * (1 + dynamic_offset), self.config.price_precision)
-            if not limit_price or limit_price <= 0:
+                limit_price = round(base_price * (1 + offset), self.config.price_precision)
+            if limit_price <= 0:
                 logger.error("计算得到无效挂单价格，跳过当前档")
                 continue
             params = {
@@ -499,8 +492,7 @@ class ETHUSDCStrategy:
             }
             try:
                 await self.client._signed_request('POST', '/order', params)
-                logger.info(
-                    f"挂单成功 {side}@{limit_price}，数量: {order_qty}（偏移 {dynamic_offset * 100:.2f}%, ratio {ratio}）")
+                logger.info(f"挂单成功 {side}@{limit_price}，数量: {order_qty}（偏移 {offset * 100:.2f}%, ratio {ratio}）")
             except Exception as e:
                 logger.error(f"挂单失败: {str(e)}")
         asyncio.create_task(self.adjust_pending_orders(side))
@@ -538,7 +530,7 @@ class ETHUSDCStrategy:
         """
         根据最新3m K线数据更新动态止损：
           - 以最新3m价格为基准；
-          - 计算 Bollinger Bands 带宽（周期20，标准差2）；
+          - 计算 Bollinger Bands 带宽（周期20, 标准差2）；
           - 对于 LONG 仓位：止损价 = 最新价 - (带宽×系数)，仅当新止损高于旧值时更新；
           - 对于 SHORT 仓位：止损价 = 最新价 + (带宽×系数)。
         """
@@ -620,7 +612,7 @@ class ETHUSDCStrategy:
         if df_now.empty:
             return
         current_price = df_now['close'].values[-1]
-        tp_offsets = [0.0025, 0.004, 0.006, 0.008, 0.012]
+        tp_offsets = [0.0005, 0.0010, 0.0045, 0.0065, 0.0110]
         remaining_qty = QUANTITY
         qty_each = round(remaining_qty / len(tp_offsets), self.config.quantity_precision)
         for offset in tp_offsets:
