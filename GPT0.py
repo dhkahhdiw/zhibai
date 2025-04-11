@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ETH/USDC 高频交易引擎 v7.4（优化版）
+# ETH/USDC 高频交易引擎 v7.4（整合优化版）
 
 import uvloop
 
@@ -22,13 +22,12 @@ from prometheus_client import Gauge, start_http_server
 _env_path = '/root/zhibai/.env'
 load_dotenv(_env_path)
 
-# 修改为合约 ETH USDC
+# 合约参数
 API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
 SYMBOL = 'ETHUSDC'
-LEVERAGE = 50
-QUANTITY = 0.12
-# 使用永续合约接口
+LEVERAGE = 10
+QUANTITY = 0.06
 REST_URL = 'https://fapi.binance.com'
 
 # ==================== 高频参数 ====================
@@ -298,7 +297,7 @@ class ETHUSDCStrategy:
     async def stop_loss_profit_management_loop(self):
         while True:
             try:
-                # 每次都实时更新最新价格、%B以及基于Bollinger带宽的动态止损
+                # 利用最新3m数据更新动态止损及监控止盈/止损信号
                 await self.update_dynamic_stop_loss()
                 await self.manage_profit_targets()
             except Exception as e:
@@ -387,13 +386,13 @@ class ETHUSDCStrategy:
 
     async def rebalance_hedge(self):
         logger.info("执行持仓再平衡，调整对冲仓位至1:1")
-        # 实际实现时查询持仓并下单对冲
+        # 实际实现时需查询持仓，并下单对冲
 
     async def close_position(self, side: str, ratio: float):
-        df = await self.client.fetch_klines(interval='1m', limit=1)
+        df = await self.client.fetch_klines(interval='3m', limit=50)
         if df.empty:
             return
-        current_price = df['close'].values[0]
+        current_price = df['close'].values[-1]
         if side == 'BUY':
             price_limit = current_price * (1 + self.config.max_slippage_market)
         else:
@@ -410,30 +409,43 @@ class ETHUSDCStrategy:
 
     async def analyze_order_signals_3m(self):
         """
-        使用 3 分钟 Bollinger Bands %B（20-2）判断下单信号：
-        当 %B ≤ 0 或 ≥ 1 时触发信号，
-        返回订单参数列表：
-          - 最新价 ±0.25%挂单30%
-          - 最新价 ±0.4%  挂单20%
-          - 最新价 ±0.6%  挂单10%
-          - 最新价 ±0.8%  挂单20%
-          - 最新价 ±1.6%  挂单20%
+        使用实时3分钟 Bollinger Bands %B（周期20, 标准差2）判断下单信号：
+          - 当 %B 处于极端状态（≥1 或 ≤0）时，触发下单信号；
+          - 补充条件：当前持仓为 LONG 时，当 %B 从极端值回落至约0.95以下，
+            或 SHORT 时当 %B 从极端值上升至约0.05以上，也触发信号；
+          - 返回订单参数列表，每档订单基于最新价格偏移固定比例。
         """
         df = await self.client.fetch_klines(interval='3m', limit=50)
         if df.empty:
             return Signal(False, 'NONE', 0, 0), []
-        close = df['close'].values.astype(np.float64)
-        sma = pd.Series(close).rolling(window=self.config.bb_period).mean().values
-        std = pd.Series(close).rolling(window=self.config.bb_period).std().values
+        close_prices = df['close'].values.astype(np.float64)
+        sma = pd.Series(close_prices).rolling(window=self.config.bb_period).mean().values
+        std = pd.Series(close_prices).rolling(window=self.config.bb_period).std().values
         upper_band = sma + self.config.bb_std * std
         lower_band = sma - self.config.bb_std * std
-        last_close = close[-1]
         bb_range = upper_band[-1] - lower_band[-1]
-        percent_b = 0.0 if bb_range == 0 else (last_close - lower_band[-1]) / bb_range
-        logger.info(f"3分钟 %B = {percent_b:.3f}")
+        latest_price = close_prices[-1]
+        percent_b = 0.0 if bb_range == 0 else (latest_price - lower_band[-1]) / bb_range
+        logger.info(f"实时3m %B: {percent_b:.3f}")
+
         order_list = []
-        if percent_b <= 0 or percent_b >= 1:
-            side = 'BUY' if percent_b <= 0 else 'SELL'
+        signal_trigger = False
+        signal_side = 'NONE'
+
+        if percent_b >= 1.0:
+            signal_side = 'SELL'
+            signal_trigger = True
+        elif percent_b <= 0.0:
+            signal_side = 'BUY'
+            signal_trigger = True
+        elif self.last_trade_side == 'LONG' and percent_b < 0.95:
+            signal_side = 'SELL'
+            signal_trigger = True
+        elif self.last_trade_side == 'SHORT' and percent_b > 0.05:
+            signal_side = 'BUY'
+            signal_trigger = True
+
+        if signal_trigger:
             order_list = [
                 {'offset': 0.0025, 'ratio': 0.30},
                 {'offset': 0.0040, 'ratio': 0.20},
@@ -441,14 +453,19 @@ class ETHUSDCStrategy:
                 {'offset': 0.0080, 'ratio': 0.20},
                 {'offset': 0.0160, 'ratio': 0.20},
             ]
-            return Signal(True, side, 0, 0, order_details={'percent_b': percent_b}), order_list
-        return Signal(False, 'NONE', 0, 0), []
+            logger.info(f"触发下单信号: side={signal_side}, %B={percent_b:.3f}")
+            return Signal(True, signal_side, 0, 0, order_details={'percent_b': percent_b}), order_list
+        else:
+            return Signal(False, 'NONE', 0, 0), []
 
     async def place_dynamic_limit_orders(self, side: str, order_list: list, long_qty: float, short_qty: float):
-        df_now = await self.client.fetch_klines(interval='1m', limit=1)
+        """
+        基于最新3m数据及预设档位偏移挂单，下单价格基于最新3m均价计算。
+        """
+        df_now = await self.client.fetch_klines(interval='3m', limit=50)
         if df_now.empty:
             return
-        current_price = df_now['close'].values[0]
+        current_price = df_now['close'].values[-1]
         for order in order_list:
             dynamic_offset = order['offset']
             ratio = order['ratio']
@@ -490,13 +507,14 @@ class ETHUSDCStrategy:
         df = await self.client.fetch_klines(interval='3m', limit=50)
         if df.empty:
             return 0.5
-        close = df['close'].values.astype(np.float64)
-        sma = pd.Series(close).rolling(window=self.config.bb_period).mean().values
-        std = pd.Series(close).rolling(window=self.config.bb_period).std().values
+        close_prices = df['close'].values.astype(np.float64)
+        sma = pd.Series(close_prices).rolling(window=self.config.bb_period).mean().values
+        std = pd.Series(close_prices).rolling(window=self.config.bb_period).std().values
         upper_band = sma + self.config.bb_std * std
         lower_band = sma - self.config.bb_std * std
         bb_range = upper_band[-1] - lower_band[-1]
-        percent_b = 0.0 if bb_range == 0 else (close[-1] - lower_band[-1]) / bb_range
+        percent_b = 0.0 if bb_range == 0 else (close_prices[-1] - lower_band[-1]) / bb_range
+        logger.info(f"实时3m %B = {percent_b:.3f}")
         return percent_b
 
     async def cancel_all_orders(self):
@@ -509,78 +527,50 @@ class ETHUSDCStrategy:
 
     async def update_dynamic_stop_loss(self):
         """
-        根据最新3分钟K线数据计算止损位置和更新动态止损：
-          - 以最新3分钟价格为基准；
-          - 使用3分钟K线数据计算 Bollinger Bands（周期20，标准差2）；
-          - 计算带宽，并依据预设系数确定止损偏移；
-          - 对于 LONG 仓位，止损价 = 最新价 - (带宽×系数)（仅允许向上调整止损）；
-          - 对于 SHORT 仓位，止损价 = 最新价 + (带宽×系数)。
+        根据最新3m K线数据更新动态止损：
+          - 以最新3m价格为基准；
+          - 计算 Bollinger Bands 带宽（周期20，标准差2）；
+          - 对于 LONG 仓位：止损价 = 最新价 - (带宽×系数)，仅当新止损高于旧值时更新；
+          - 对于 SHORT 仓位：止损价 = 最新价 + (带宽×系数)。
         """
         df_bb = await self.client.fetch_klines(interval='3m', limit=50)
         if df_bb.empty or self.last_trade_side is None:
             return
-
-        # 使用3m最新K线的最后一条数据作为当前价格
-        current_price = df_bb['close'].values[-1]
-
-        # 计算 Bollinger Bands（周期20，标准差2）
-        close_bb = df_bb['close'].values.astype(np.float64)
-        sma = pd.Series(close_bb).rolling(window=self.config.bb_period).mean().values
-        std = pd.Series(close_bb).rolling(window=self.config.bb_period).std().values
+        latest_price = df_bb['close'].values[-1]
+        close_prices = df_bb['close'].values.astype(np.float64)
+        sma = pd.Series(close_prices).rolling(window=self.config.bb_period).mean().values
+        std = pd.Series(close_prices).rolling(window=self.config.bb_period).std().values
         upper_band = sma + self.config.bb_std * std
         lower_band = sma - self.config.bb_std * std
-
-        # 计算当前带宽
         bb_width = upper_band[-1] - lower_band[-1]
-        # 根据市场波动性设置系数（此处系数可根据实测调优）
         coeff = 0.5
         dynamic_offset = bb_width * coeff
 
-        # 根据仓位方向调整止损
         if self.last_trade_side == 'LONG':
-            new_stop = current_price - dynamic_offset
-            # 仅当新止损高于之前的止损时进行更新（保证“向上移动止损”策略）
+            new_stop = latest_price - dynamic_offset
             if self.hard_stop is None or new_stop > self.hard_stop:
                 self.hard_stop = new_stop
-            self.trailing_stop = current_price - dynamic_offset
+            self.trailing_stop = latest_price - dynamic_offset
             logger.info(
-                f"LONG 动态止损更新：当前价={current_price:.2f}, 带宽={bb_width:.4f}, 新止损={self.hard_stop:.2f}")
+                f"LONG 动态止损更新：当前价={latest_price:.2f}, 带宽={bb_width:.4f}, 新止损={self.hard_stop:.2f}")
         elif self.last_trade_side == 'SHORT':
-            new_stop = current_price + dynamic_offset
+            new_stop = latest_price + dynamic_offset
             if self.hard_stop is None or new_stop < self.hard_stop:
                 self.hard_stop = new_stop
-            self.trailing_stop = current_price + dynamic_offset
+            self.trailing_stop = latest_price + dynamic_offset
             logger.info(
-                f"SHORT 动态止损更新：当前价={current_price:.2f}, 带宽={bb_width:.4f}, 新止损={self.hard_stop:.2f}")
-
-    async def get_current_percentb(self) -> float:
-        """
-        使用3分钟K线数据计算当前 Bollinger Bands %B（周期20，标准差2）。
-        """
-        df = await self.client.fetch_klines(interval='3m', limit=50)
-        if df.empty:
-            return 0.5
-        close = df['close'].values.astype(np.float64)
-        sma = pd.Series(close).rolling(window=self.config.bb_period).mean().values
-        std = pd.Series(close).rolling(window=self.config.bb_period).std().values
-        upper_band = sma + self.config.bb_std * std
-        lower_band = sma - self.config.bb_std * std
-        bb_range = upper_band[-1] - lower_band[-1]
-        percent_b = 0.0 if bb_range == 0 else (close[-1] - lower_band[-1]) / bb_range
-        logger.info(f"实时3m %B = {percent_b:.3f}")
-        return percent_b
+                f"SHORT 动态止损更新：当前价={latest_price:.2f}, 带宽={bb_width:.4f}, 新止损={self.hard_stop:.2f}")
 
     async def manage_profit_targets(self):
         """
-        根据最新3分钟价格和 Bollinger Bands %B（20-2）管理止盈逻辑：
-          - 判断是否触发首次止盈（基于 %B 越界，如 LONG 时 %B ≥ 0.82 或达到1，SHORT 时 %B ≤ 0.18 或达到0）；
-          - 挂止盈限价单（基于最新3分钟价格加/减固定百分比）；
-          - 同时检测当前价格是否突破动态止损水平，触发市价全平。
+        管理止盈逻辑：
+          - 利用最新3m数据和 %B 值判断是否首次触发止盈信号；
+          - 同时挂分档止盈订单；
+          - 检测是否突破动态止损水平，从而触发市价全平。
         """
         df = await self.client.fetch_klines(interval='3m', limit=50)
         if df.empty or self.entry_price is None:
             return
-
         current_price = df['close'].values[-1]
         current_b = await self.get_current_percentb()
 
@@ -605,47 +595,6 @@ class ETHUSDCStrategy:
                 self.tp_triggered_20 = True
             await self.place_take_profit_orders(side='BUY')
 
-        # 检测是否触及动态止损
-        if self.last_trade_side == 'LONG' and current_price < self.hard_stop:
-            logger.info("LONG 价格低于动态止损，触发平仓")
-            await self.close_position(side='SELL', ratio=1.0)
-        elif self.last_trade_side == 'SHORT' and current_price > self.hard_stop:
-            logger.info("SHORT 价格高于动态止损，触发平仓")
-            await self.close_position(side='BUY', ratio=1.0)
-    async def manage_profit_targets(self):
-        """
-        管理止盈逻辑：
-         - 根据当前%B判断是否触发市价平仓信号；
-         - 同时挂止盈限价单用于分批获利；
-         - 实时监控价格是否突破动态止损水平，及时平仓。
-        """
-        df = await self.client.fetch_klines(interval='1m', limit=1)
-        if df.empty or self.entry_price is None:
-            return
-        current_price = df['close'].values[0]
-        current_b = await self.get_current_percentb()
-        # 止盈逻辑
-        if self.last_trade_side == 'LONG':
-            if current_b >= 0.82 and not self.tp_triggered_30:
-                logger.info("触发首次止盈信号：LONG，市价平仓30%")
-                await self.close_position(side='SELL', ratio=0.3)
-                self.tp_triggered_30 = True
-            elif current_b >= 1 and not self.tp_triggered_20:
-                logger.info("触发首次止盈信号：LONG，市价平仓20%")
-                await self.close_position(side='SELL', ratio=0.2)
-                self.tp_triggered_20 = True
-            await self.place_take_profit_orders(side='SELL')
-        elif self.last_trade_side == 'SHORT':
-            if current_b <= 0.18 and not self.tp_triggered_30:
-                logger.info("触发首次止盈信号：SHORT，市价平仓30%")
-                await self.close_position(side='BUY', ratio=0.3)
-                self.tp_triggered_30 = True
-            elif current_b <= 0 and not self.tp_triggered_20:
-                logger.info("触发首次止盈信号：SHORT，市价平仓20%")
-                await self.close_position(side='BUY', ratio=0.2)
-                self.tp_triggered_20 = True
-            await self.place_take_profit_orders(side='BUY')
-        # 检测是否触及动态止损（硬止损或移动止盈）
         if self.last_trade_side == 'LONG' and current_price < self.hard_stop:
             logger.info("LONG 价格低于动态止损，触发平仓")
             await self.close_position(side='SELL', ratio=1.0)
@@ -655,20 +604,20 @@ class ETHUSDCStrategy:
 
     async def place_take_profit_orders(self, side: str):
         """
-        针对剩余仓位，以最新价格分别偏移 ±0.25%、±0.4%、±0.6%、±0.8%、±1.2%
-        均匀挂止盈限价单，每个订单数量为剩余仓位的平均分配（此处以 QUANTITY 模拟）
+        针对剩余仓位，基于最新3m数据，分别按固定偏移挂止盈单，
+        每个订单数量为剩余仓位的平均分配。
         """
-        df_now = await self.client.fetch_klines(interval='1m', limit=1)
+        df_now = await self.client.fetch_klines(interval='3m', limit=50)
         if df_now.empty:
             return
-        current_price = df_now['close'].values[0]
+        current_price = df_now['close'].values[-1]
         tp_offsets = [0.0025, 0.004, 0.006, 0.008, 0.012]
         remaining_qty = QUANTITY
         qty_each = round(remaining_qty / len(tp_offsets), self.config.quantity_precision)
         for offset in tp_offsets:
-            if side == 'SELL':  # LONG仓位止盈，挂卖单
+            if side == 'SELL':  # LONG仓位止盈挂卖单
                 tp_price = round(current_price * (1 + offset), self.config.price_precision)
-            else:  # SHORT仓位止盈，挂买单
+            else:  # SHORT仓位止盈挂买单
                 tp_price = round(current_price * (1 - offset), self.config.price_precision)
             params = {
                 'symbol': SYMBOL,
@@ -706,7 +655,6 @@ class ETHUSDCStrategy:
     async def on_order(self, is_buy: bool, price: float):
         self.entry_price = price
         if is_buy:
-            # 初始设置一个基础止损，后续会通过动态逻辑更新
             self.hard_stop = price * 0.98
             self.last_trade_side = 'LONG'
         else:
