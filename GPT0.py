@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ETH/USDT 高频交易引擎 v7.2（修正后仅返回 LONG 或 SHORT 状态）
+# ETH/USDC 高频交易引擎 v7.3（修正并优化下单信号判断后版本）
 
 import uvloop
 uvloop.install()
@@ -22,11 +22,13 @@ from prometheus_client import Gauge, start_http_server
 _env_path = '/root/zhibai/.env'
 load_dotenv(_env_path)
 
+# 切换为合约 ETH USDC
 API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
-SYMBOL = 'ETHUSDT'
+SYMBOL = 'ETHUSDC'
 LEVERAGE = 10
 QUANTITY = 0.06
+# 对于USDC永续合约，仍然使用USD-M接口（如有特殊调整请参考Binance官方文档）
 REST_URL = 'https://fapi.binance.com'
 
 # ==================== 高频参数 ====================
@@ -53,10 +55,10 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("/var/log/eth_usdt_hft.log", encoding="utf-8", mode='a')
+        logging.FileHandler("/var/log/eth_usdc_hft.log", encoding="utf-8", mode='a')
     ]
 )
-logger = logging.getLogger('ETH-USDT-HFT')
+logger = logging.getLogger('ETH-USDC-HFT')
 
 
 @dataclass
@@ -71,8 +73,8 @@ class TradingConfig:
     macd_fast: int = 12
     macd_slow: int = 26
     macd_signal: int = 9
-    bb_period: int = 20             # 布林带周期
-    bb_std: float = 2.0             # 标准差倍数
+    bb_period: int = 20             # Bollinger Bands 周期（20）
+    bb_std: float = 2.0             # 标准差倍数（2倍）
     max_retries: int = 7
     order_timeout: float = 2.0
     network_timeout: float = 5.0
@@ -254,7 +256,7 @@ class Signal:
     order_details: dict = None  # 额外订单参数
 
 
-class ETHUSDTStrategy:
+class ETHUSDCStrategy:
     def __init__(self, client: BinanceHFTClient):
         self.client = client
         self.config = TradingConfig()
@@ -268,10 +270,9 @@ class ETHUSDTStrategy:
         self.atr_baseline = None
 
     async def execute(self):
-        """初始化同步时间、杠杆，并并行执行策略各子模块"""
+        """初始化同步时间、杠杆，并并行执行各子模块"""
         await self.client.sync_server_time()
         await self.client.manage_leverage()
-        # 异步并行执行各任务
         await asyncio.gather(
             self.trend_monitoring_loop(),
             self.order_signal_loop(),
@@ -285,16 +286,13 @@ class ETHUSDTStrategy:
             try:
                 trend = await self.analyze_trend_15m()
                 logger.info(f"15分钟趋势判断：{trend}")
-                # 根据趋势调整仓位比例及风控
                 if trend in ['LONG', 'SHORT']:
                     await self.adjust_position_ratio(trend)
-                # 趋势反转时处理仓位对冲并启动分批调仓任务
                 if self.last_trade_side and trend != self.last_trade_side:
                     await self.handle_trend_reversal(new_trend=trend)
                 self.last_trade_side = trend
             except Exception as e:
                 logger.error(f"趋势监控异常: {str(e)}")
-            # 每分钟更新一次15分钟趋势
             await asyncio.sleep(60)
 
     async def order_signal_loop(self):
@@ -303,7 +301,6 @@ class ETHUSDTStrategy:
             try:
                 signal, order_list = await self.analyze_order_signals_3m()
                 if signal.action:
-                    # 根据趋势设置仓位比例（LONG：多仓=1, 空仓=0.5；SHORT：多仓=0.5, 空仓=1）
                     if self.last_trade_side == 'LONG':
                         long_qty = QUANTITY * 1
                         short_qty = QUANTITY * 0.5
@@ -327,7 +324,7 @@ class ETHUSDTStrategy:
             await asyncio.sleep(3)
 
     async def risk_control_loop(self):
-        """风险监控：监控每日亏损及连续亏损次数"""
+        """风险监控，监控每日亏损及连续亏损次数"""
         while True:
             try:
                 await self.monitor_risk()
@@ -338,28 +335,23 @@ class ETHUSDTStrategy:
     async def analyze_trend_15m(self) -> str:
         """
         利用15分钟数据计算超级趋势和MACD，
-        返回状态仅为 'LONG' 或 'SHORT'。
-        其中，当价格既不大于最终上轨也不低于基础下轨时，
-        通过判断 MACD 值来决定趋势。
+        返回状态仅为 'LONG' 或 'SHORT'；
+        当价格位于区间内时，根据MACD值判断趋势。
         """
         df = await self.client.fetch_klines(interval='15m', limit=100)
         if df.empty:
-            # 默认返回 LONG
             return 'LONG'
         close = df['close'].values.astype(np.float64)
         high = df['high'].values.astype(np.float64)
         low = df['low'].values.astype(np.float64)
 
-        # 计算ATR（采用 st_period）
         atr = self._vectorized_atr(high, low, close, period=self.config.st_period)
         last_atr = atr[-1]
 
-        # 计算基础趋势线：HL2 ± st_multiplier * ATR
         hl2 = (df['high'] + df['low']) / 2
         basic_upper = hl2 + self.config.st_multiplier * last_atr
         basic_lower = hl2 - self.config.st_multiplier * last_atr
 
-        # 超级趋势动态迭代（仅计算上轨）
         final_upper = []
         for i, price in enumerate(close):
             if i == 0:
@@ -371,13 +363,11 @@ class ETHUSDTStrategy:
                     final_upper.append(final_upper[-1])
         last_final_upper = final_upper[-1]
 
-        # 初步判断
         if close[-1] > last_final_upper:
             st_trend = 'LONG'
         elif close[-1] < basic_lower.iloc[-1]:
             st_trend = 'SHORT'
         else:
-            # 如果位于区间内，通过判断 MACD 值决定趋势
             ema_fast = pd.Series(close).ewm(span=self.config.macd_fast, adjust=False).mean().values
             ema_slow = pd.Series(close).ewm(span=self.config.macd_slow, adjust=False).mean().values
             macd_line = ema_fast - ema_slow
@@ -414,24 +404,23 @@ class ETHUSDTStrategy:
                 await self.close_position(side='SELL', ratio=0.5)
             elif new_trend == 'SHORT':
                 await self.close_position(side='BUY', ratio=0.5)
-            # 启动异步任务，分12次每5分钟调整到1:1仓位（1小时内完成）
             asyncio.create_task(self.gradual_position_adjustment())
         except Exception as e:
             logger.error(f"趋势反转平仓异常：{str(e)}")
 
     async def gradual_position_adjustment(self):
-        """分批调整持仓至1:1，每5分钟调整一次，共1小时"""
+        """分批调整持仓至1:1，每5分钟一次，共1小时"""
         for _ in range(12):
             await self.rebalance_hedge()
             await asyncio.sleep(300)
 
     async def rebalance_hedge(self):
-        """执行持仓再平衡操作，确保对冲比例调整至1:1（此处为占位函数）"""
+        """执行持仓再平衡，确保对冲比例调整至1:1（此处为占位函数）"""
         logger.info("执行持仓再平衡，调整对冲仓位至1:1")
-        # 此处应查询当前持仓并计算差额后下单
+        # 具体实现需查询当前持仓、计算对冲差额后下单
 
     async def close_position(self, side: str, ratio: float):
-        """以市价单平仓，加入滑点控制"""
+        """以市价单平仓，加入滑点控制，并检查价格及数量有效性"""
         df = await self.client.fetch_klines(interval='1m', limit=1)
         if df.empty:
             return
@@ -447,12 +436,19 @@ class ETHUSDTStrategy:
             'type': 'MARKET',
             'quantity': QUANTITY * ratio,
         }
+        if not params['quantity'] or params['quantity'] <= 0:
+            logger.error("无效订单数量，跳过平仓")
+            return
+        if not price_limit or price_limit <= 0:
+            logger.error("无效订单价格，跳过平仓")
+            return
         await self.client._signed_request('POST', '/order', params)
 
     async def analyze_order_signals_3m(self):
         """
-        计算3分钟布林带%B，并判断挂单信号，
-        当%B接近0或1时构造订单参数列表。
+        计算3分钟级Bollinger Bands %B（20-2），
+        当%B ≤ 0或 ≥ 1时，以当前最新价格作为下单信号，
+        构造订单参数列表（此处直接挂单，不采用价格偏移）。
         """
         df = await self.client.fetch_klines(interval='3m', limit=50)
         if df.empty:
@@ -467,23 +463,19 @@ class ETHUSDTStrategy:
         percent_b = 0.0 if bb_range == 0 else (last_close - lower_band[-1]) / bb_range
         logger.info(f"3分钟 %B = {percent_b:.3f}")
         order_list = []
-        if percent_b < 0.05 or percent_b > 0.95:
-            side = 'BUY' if percent_b < 0.05 else 'SELL'
-            order_list = [
-                {'offset': 0.0025, 'ratio': 0.30},
-                {'offset': 0.0040, 'ratio': 0.20},
-                {'offset': 0.0060, 'ratio': 0.10},
-                {'offset': 0.0080, 'ratio': 0.20},
-                {'offset': 0.0160, 'ratio': 0.20},
-            ]
+        # 当%B ≤ 0或 ≥ 1时，直接以当前价格挂单，offset设为0, ratio设为1（全仓），其余情况不触发下单
+        if percent_b <= 0 or percent_b >= 1:
+            side = 'BUY' if percent_b <= 0 else 'SELL'
+            order_list = [{"offset": 0.0, "ratio": 1.0}]
             return Signal(True, side, 0, 0, order_details={'percent_b': percent_b}), order_list
         return Signal(False, 'NONE', 0, 0), []
 
     async def place_dynamic_limit_orders(self, side: str, order_list: list, long_qty: float, short_qty: float):
         """
         根据订单列表构造挂单，
-        每单价格 = 当前价 ± dynamic_offset（挂单偏移根据ATR动态调整）；
-        若挂单后3分钟未成交则启动调整任务，同时根据%B条件撤销挂单。
+        对于此次下单信号，由于订单列表中offset为0，
+        则挂单价格直接为当前最新价格；
+        同时启动挂单调整任务，检测%B条件不符时撤单。
         """
         df_now = await self.client.fetch_klines(interval='1m', limit=1)
         if df_now.empty:
@@ -491,7 +483,10 @@ class ETHUSDTStrategy:
         current_price = df_now['close'].values[0]
         df_daily = await self.client.fetch_klines(interval='1d', limit=50)
         if not df_daily.empty:
-            atr_daily = self._vectorized_atr(df_daily['high'].values, df_daily['low'].values, df_daily['close'].values, period=self.config.atr_window)
+            atr_daily = self._vectorized_atr(df_daily['high'].values,
+                                             df_daily['low'].values,
+                                             df_daily['close'].values,
+                                             period=self.config.atr_window)
             daily_mean = np.mean(atr_daily) if atr_daily.size > 0 else 1.0
             current_atr = self._vectorized_atr(
                 np.array([df_now['high'].values[-1]]),
@@ -506,10 +501,16 @@ class ETHUSDTStrategy:
             dynamic_offset = order['offset'] * (1 + 0.5 * (atr_ratio - 1))
             ratio = order['ratio']
             order_qty = round(QUANTITY * ratio, self.config.quantity_precision)
+            if not order_qty or order_qty <= 0:
+                logger.error("计算得到无效订单数量，跳过当前档")
+                continue
             if side == 'BUY':
                 limit_price = round(current_price * (1 - dynamic_offset), self.config.price_precision)
             else:
                 limit_price = round(current_price * (1 + dynamic_offset), self.config.price_precision)
+            if not limit_price or limit_price <= 0:
+                logger.error("计算得到无效挂单价格，跳过当前档")
+                continue
             params = {
                 'symbol': SYMBOL,
                 'side': side,
@@ -526,7 +527,7 @@ class ETHUSDTStrategy:
         asyncio.create_task(self.adjust_pending_orders(side))
 
     async def adjust_pending_orders(self, side: str):
-        """等待3分钟后检查未成交订单，如%B条件不符则撤销"""
+        """等待3分钟后检查未成交订单，若%B条件不符则撤单"""
         await asyncio.sleep(180)
         current_b = await self.get_current_percentb()
         if (side == 'BUY' and current_b > 0.3) or (side == 'SELL' and current_b < 0.7):
@@ -534,7 +535,7 @@ class ETHUSDTStrategy:
             logger.info(f"根据%B={current_b:.3f}条件撤销未成交订单")
 
     async def get_current_percentb(self) -> float:
-        """实时获取最新%B值（使用3m数据）"""
+        """实时获取最新%B值（基于3分钟数据）"""
         df = await self.client.fetch_klines(interval='3m', limit=50)
         if df.empty:
             return 0.5
@@ -559,7 +560,7 @@ class ETHUSDTStrategy:
     async def manage_stop_loss_and_profit(self):
         """
         止盈止损管理：
-         1. 未记录开仓价则等待 on_order 回调；
+         1. 若未记录开仓价则等待 on_order 回调；
          2. 达到1%盈利后启动ATR跟踪止损；
          3. 硬止损为 entry_price*0.98（多单）或 entry_price*1.02（空单）。
         """
@@ -567,7 +568,7 @@ class ETHUSDTStrategy:
         if df.empty or self.entry_price is None:
             return
         current_price = df['close'].values[0]
-        highest_high = current_price  # 实际应记录持仓期间的最高价
+        highest_high = current_price  # 实际应用中应记录持仓期间最高价
         unrealized_pnl = ((current_price - self.entry_price) / self.entry_price
                           if self.last_trade_side == 'LONG'
                           else (self.entry_price - current_price) / self.entry_price)
@@ -589,13 +590,14 @@ class ETHUSDTStrategy:
         风控：
          1. 单日亏损超过20%时进入只平仓模式；
          2. 连续3次亏损时降低仓位至原计划50%；
-         3. 实际盈亏需根据交易回报更新 self.daily_pnl 与 self.consecutive_losses。
+         3. 实际盈亏由交易回报数据更新。
         """
         if self.daily_pnl < -self.config.daily_drawdown_limit:
             logger.warning("日内亏损超20%，进入只平仓模式")
             await self.close_position(side='SELL' if self.last_trade_side=='LONG' else 'BUY', ratio=1.0)
         if self.consecutive_losses >= 3:
             logger.warning("连续亏损3次，降低仓位至50%")
+            # 此处可根据实际情况调整仓位
 
     async def compute_atr_baseline(self):
         """每周重置ATR基准，用于自适应波动率"""
@@ -622,7 +624,7 @@ class ETHUSDTStrategy:
 
 async def main():
     client = BinanceHFTClient()
-    strategy = ETHUSDTStrategy(client)
+    strategy = ETHUSDCStrategy(client)
     try:
         await strategy.execute()
     except KeyboardInterrupt:
