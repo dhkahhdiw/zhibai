@@ -509,29 +509,37 @@ class ETHUSDCStrategy:
 
     async def update_dynamic_stop_loss(self):
         """
-        根据最新1分钟K线和3分钟Bollinger Bands计算止损位置：
-          - 以最新1分钟价格为基准；
-          - 利用3分钟K线计算Bollinger带宽，作为市场波动性的参考；
-          - 针对LONG仓位，动态调整：止损价 = 最新价 - (带宽×系数)
-          - 针对SHORT仓位，动态调整：止损价 = 最新价 + (带宽×系数)
+        根据最新3分钟K线数据计算止损位置和更新动态止损：
+          - 以最新3分钟价格为基准；
+          - 使用3分钟K线数据计算 Bollinger Bands（周期20，标准差2）；
+          - 计算带宽，并依据预设系数确定止损偏移；
+          - 对于 LONG 仓位，止损价 = 最新价 - (带宽×系数)（仅允许向上调整止损）；
+          - 对于 SHORT 仓位，止损价 = 最新价 + (带宽×系数)。
         """
-        df_price = await self.client.fetch_klines(interval='1m', limit=1)
         df_bb = await self.client.fetch_klines(interval='3m', limit=50)
-        if df_price.empty or df_bb.empty or self.last_trade_side is None:
+        if df_bb.empty or self.last_trade_side is None:
             return
-        current_price = df_price['close'].values[0]
+
+        # 使用3m最新K线的最后一条数据作为当前价格
+        current_price = df_bb['close'].values[-1]
+
+        # 计算 Bollinger Bands（周期20，标准差2）
         close_bb = df_bb['close'].values.astype(np.float64)
         sma = pd.Series(close_bb).rolling(window=self.config.bb_period).mean().values
         std = pd.Series(close_bb).rolling(window=self.config.bb_period).std().values
         upper_band = sma + self.config.bb_std * std
         lower_band = sma - self.config.bb_std * std
+
+        # 计算当前带宽
         bb_width = upper_band[-1] - lower_band[-1]
         # 根据市场波动性设置系数（此处系数可根据实测调优）
         coeff = 0.5
         dynamic_offset = bb_width * coeff
+
+        # 根据仓位方向调整止损
         if self.last_trade_side == 'LONG':
             new_stop = current_price - dynamic_offset
-            # 动态止损只允许“向上移动”，即不断提高止损价
+            # 仅当新止损高于之前的止损时进行更新（保证“向上移动止损”策略）
             if self.hard_stop is None or new_stop > self.hard_stop:
                 self.hard_stop = new_stop
             self.trailing_stop = current_price - dynamic_offset
@@ -545,6 +553,65 @@ class ETHUSDCStrategy:
             logger.info(
                 f"SHORT 动态止损更新：当前价={current_price:.2f}, 带宽={bb_width:.4f}, 新止损={self.hard_stop:.2f}")
 
+    async def get_current_percentb(self) -> float:
+        """
+        使用3分钟K线数据计算当前 Bollinger Bands %B（周期20，标准差2）。
+        """
+        df = await self.client.fetch_klines(interval='3m', limit=50)
+        if df.empty:
+            return 0.5
+        close = df['close'].values.astype(np.float64)
+        sma = pd.Series(close).rolling(window=self.config.bb_period).mean().values
+        std = pd.Series(close).rolling(window=self.config.bb_period).std().values
+        upper_band = sma + self.config.bb_std * std
+        lower_band = sma - self.config.bb_std * std
+        bb_range = upper_band[-1] - lower_band[-1]
+        percent_b = 0.0 if bb_range == 0 else (close[-1] - lower_band[-1]) / bb_range
+        logger.info(f"实时3m %B = {percent_b:.3f}")
+        return percent_b
+
+    async def manage_profit_targets(self):
+        """
+        根据最新3分钟价格和 Bollinger Bands %B（20-2）管理止盈逻辑：
+          - 判断是否触发首次止盈（基于 %B 越界，如 LONG 时 %B ≥ 0.82 或达到1，SHORT 时 %B ≤ 0.18 或达到0）；
+          - 挂止盈限价单（基于最新3分钟价格加/减固定百分比）；
+          - 同时检测当前价格是否突破动态止损水平，触发市价全平。
+        """
+        df = await self.client.fetch_klines(interval='3m', limit=50)
+        if df.empty or self.entry_price is None:
+            return
+
+        current_price = df['close'].values[-1]
+        current_b = await self.get_current_percentb()
+
+        if self.last_trade_side == 'LONG':
+            if current_b >= 0.82 and not self.tp_triggered_30:
+                logger.info("触发首次止盈信号：LONG，市价平仓30%")
+                await self.close_position(side='SELL', ratio=0.3)
+                self.tp_triggered_30 = True
+            elif current_b >= 1 and not self.tp_triggered_20:
+                logger.info("触发首次止盈信号：LONG，市价平仓20%")
+                await self.close_position(side='SELL', ratio=0.2)
+                self.tp_triggered_20 = True
+            await self.place_take_profit_orders(side='SELL')
+        elif self.last_trade_side == 'SHORT':
+            if current_b <= 0.18 and not self.tp_triggered_30:
+                logger.info("触发首次止盈信号：SHORT，市价平仓30%")
+                await self.close_position(side='BUY', ratio=0.3)
+                self.tp_triggered_30 = True
+            elif current_b <= 0 and not self.tp_triggered_20:
+                logger.info("触发首次止盈信号：SHORT，市价平仓20%")
+                await self.close_position(side='BUY', ratio=0.2)
+                self.tp_triggered_20 = True
+            await self.place_take_profit_orders(side='BUY')
+
+        # 检测是否触及动态止损
+        if self.last_trade_side == 'LONG' and current_price < self.hard_stop:
+            logger.info("LONG 价格低于动态止损，触发平仓")
+            await self.close_position(side='SELL', ratio=1.0)
+        elif self.last_trade_side == 'SHORT' and current_price > self.hard_stop:
+            logger.info("SHORT 价格高于动态止损，触发平仓")
+            await self.close_position(side='BUY', ratio=1.0)
     async def manage_profit_targets(self):
         """
         管理止盈逻辑：
