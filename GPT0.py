@@ -26,7 +26,7 @@ load_dotenv(_env_path)
 API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
 SYMBOL = 'ETHUSDC'
-LEVERAGE = 10
+LEVERAGE = 50
 QUANTITY = 0.06
 # 使用永续合约接口
 REST_URL = 'https://fapi.binance.com'
