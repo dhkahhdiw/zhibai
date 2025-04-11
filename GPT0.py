@@ -26,12 +26,12 @@ load_dotenv(_env_path)
 API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
 SYMBOL = 'ETHUSDC'
-LEVERAGE = 10
+LEVERAGE = 50
 # 多空交易量（基于趋势判断）：
-BULL_LONG_QTY = 0.1  # 趋势多时，多仓下单量（ETH）
-BULL_SHORT_QTY = 0.05  # 趋势多时，空仓对冲下单量
-BEAR_LONG_QTY = 0.05  # 趋势空时，多仓对冲下单量
-BEAR_SHORT_QTY = 0.1  # 趋势空时，空仓下单量
+BULL_LONG_QTY = 0.12  # 趋势多时，多仓下单量（ETH）
+BULL_SHORT_QTY = 0.06  # 趋势多时，空仓对冲下单量
+BEAR_LONG_QTY = 0.06  # 趋势空时，多仓对冲下单量
+BEAR_SHORT_QTY = 0.12  # 趋势空时，空仓下单量
 
 REST_URL = 'https://fapi.binance.com'
 
