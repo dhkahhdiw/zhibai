@@ -26,8 +26,8 @@ load_dotenv(_env_path)
 API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
 SYMBOL = 'ETHUSDC'
-LEVERAGE = 50
-QUANTITY = 0.12
+LEVERAGE = 10
+QUANTITY = 0.06
 REST_URL = 'https://fapi.binance.com'
 
 # ==================== 高频参数 ====================
@@ -144,13 +144,20 @@ class BinanceHFTClient:
         query = urllib.parse.urlencode(sorted_params, doseq=True)
         signature = hmac.new(SECRET_KEY.encode(), query.encode(), hashlib.sha256).hexdigest()
         url = REST_URL + "/fapi/v1" + path + "?" + query + "&signature=" + signature
-        headers = {"X-MBX-APIKEY": API_KEY, "Accept": "application/json"}
+        headers = {
+            "X-MBX-APIKEY": API_KEY,
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
         logger.debug(f"请求URL: {url.split('?')[0]} 参数: {sorted_params}")
         for attempt in range(self.config.max_retries + 1):
             try:
                 endpoint = path.split('/')[-1]
                 await self._rate_limit_check(endpoint)
                 async with self.session.request(method, url, headers=headers) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        raise Exception(f"HTTP Status {resp.status}. Response: {error_text}")
                     content_type = resp.headers.get("Content-Type", "")
                     if "application/json" not in content_type:
                         text = await resp.text()
@@ -290,6 +297,9 @@ class ETHUSDCStrategy:
                     else:
                         long_qty = short_qty = QUANTITY
                     await self.place_dynamic_limit_orders(signal.side, order_list, long_qty, short_qty)
+                else:
+                    # 没有下单信号时撤销未成交订单
+                    await self.cancel_all_orders()
             except Exception as e:
                 logger.error(f"下单信号异常: {str(e)}")
             await asyncio.sleep(self.config.order_adjust_interval)
@@ -297,7 +307,6 @@ class ETHUSDCStrategy:
     async def stop_loss_profit_management_loop(self):
         while True:
             try:
-                # 利用最新3m数据更新动态止损及监控止盈/止损信号
                 await self.update_dynamic_stop_loss()
                 await self.manage_profit_targets()
             except Exception as e:
@@ -386,7 +395,7 @@ class ETHUSDCStrategy:
 
     async def rebalance_hedge(self):
         logger.info("执行持仓再平衡，调整对冲仓位至1:1")
-        # 实际实现时需查询持仓，并下单对冲
+        # 实际实现时需要查询持仓情况，并下单对冲
 
     async def close_position(self, side: str, ratio: float):
         df = await self.client.fetch_klines(interval='3m', limit=50)
@@ -410,7 +419,7 @@ class ETHUSDCStrategy:
     async def analyze_order_signals_3m(self):
         """
         使用实时3分钟 Bollinger Bands %B（周期20, 标准差2）判断下单信号：
-          - 当 %B 处于极端状态（≥1 或 ≤0）时，触发下单信号；
+          - 当 %B 处于极端状态（≥1 或 ≤0）时触发下单；
           - 补充条件：当前持仓为 LONG 时，当 %B 从极端值回落至约0.95以下，
             或 SHORT 时当 %B 从极端值上升至约0.05以上，也触发信号；
           - 返回订单参数列表，每档订单基于最新价格偏移固定比例。
@@ -460,7 +469,7 @@ class ETHUSDCStrategy:
 
     async def place_dynamic_limit_orders(self, side: str, order_list: list, long_qty: float, short_qty: float):
         """
-        基于最新3m数据及预设档位偏移挂单，下单价格基于最新3m均价计算。
+        基于最新3m数据及预设档位偏移挂单，下单价格依据最新3m均价计算。
         """
         df_now = await self.client.fetch_klines(interval='3m', limit=50)
         if df_now.empty:
