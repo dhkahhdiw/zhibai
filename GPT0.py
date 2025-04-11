@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ETH/USDT 高频交易引擎 v7.1（修正后的完整运行版）
+# ETH/USDT 高频交易引擎 v7.2（修正后仅返回 LONG 或 SHORT 状态）
 
 import uvloop
 uvloop.install()
@@ -67,7 +67,7 @@ class TradingConfig:
     ema_slow: int = 21
     vol_multiplier: float = 2.5
     st_period: int = 20             # 超级趋势周期（MA周期）
-    st_multiplier: float = 3.0      # ATR倍数
+    st_multiplier: float = 3.0      # ATR 倍数
     macd_fast: int = 12
     macd_slow: int = 26
     macd_signal: int = 9
@@ -81,7 +81,7 @@ class TradingConfig:
     max_position: float = 10.0
     slippage: float = 0.001         # 默认滑点
     dual_side_position: str = "true"
-    order_adjust_interval: float = 180.0   # 3分钟
+    order_adjust_interval: float = 180.0   # 3 分钟
     max_slippage_market: float = 0.0015      # 0.15% 滑点上限
     daily_drawdown_limit: float = 0.20       # 单日亏损20%触发风险保护
 
@@ -336,59 +336,53 @@ class ETHUSDTStrategy:
             await asyncio.sleep(10)
 
     async def analyze_trend_15m(self) -> str:
-        """利用15分钟数据计算超级趋势、MACD，返回趋势状态"""
+        """
+        利用15分钟数据计算超级趋势和MACD，
+        返回状态仅为 'LONG' 或 'SHORT'。
+        其中，当价格既不大于最终上轨也不低于基础下轨时，
+        通过判断 MACD 值来决定趋势。
+        """
         df = await self.client.fetch_klines(interval='15m', limit=100)
         if df.empty:
-            return 'NEUTRAL'
+            # 默认返回 LONG
+            return 'LONG'
         close = df['close'].values.astype(np.float64)
         high = df['high'].values.astype(np.float64)
         low = df['low'].values.astype(np.float64)
 
-        # 计算ATR（采用st_period）
+        # 计算ATR（采用 st_period）
         atr = self._vectorized_atr(high, low, close, period=self.config.st_period)
         last_atr = atr[-1]
 
-        # 计算基础趋势线：以HL2 ± st_multiplier * ATR
+        # 计算基础趋势线：HL2 ± st_multiplier * ATR
         hl2 = (df['high'] + df['low']) / 2
         basic_upper = hl2 + self.config.st_multiplier * last_atr
         basic_lower = hl2 - self.config.st_multiplier * last_atr
 
-        # 超级趋势动态迭代，维护final_upper（示例仅计算上轨）
+        # 超级趋势动态迭代（仅计算上轨）
         final_upper = []
         for i, price in enumerate(close):
             if i == 0:
                 final_upper.append(basic_upper.iloc[i])
             else:
-                # 如果当前价格高于前一周期的最终上轨，则使用当前基础上轨，否则延续前轨
                 if price > final_upper[-1]:
                     final_upper.append(basic_upper.iloc[i])
                 else:
                     final_upper.append(final_upper[-1])
         last_final_upper = final_upper[-1]
 
-        # 趋势判断：价格高于最终上轨判断为 LONG，低于基础下轨判断为 SHORT
+        # 初步判断
         if close[-1] > last_final_upper:
             st_trend = 'LONG'
         elif close[-1] < basic_lower.iloc[-1]:
             st_trend = 'SHORT'
         else:
-            st_trend = 'NEUTRAL'
-
-        # 计算MACD —— EMA计算
-        ema_fast = pd.Series(close).ewm(span=self.config.macd_fast, adjust=False).mean().values
-        ema_slow = pd.Series(close).ewm(span=self.config.macd_slow, adjust=False).mean().values
-        macd_line = ema_fast - ema_slow
-        signal_line = pd.Series(macd_line).ewm(span=self.config.macd_signal, adjust=False).mean().values
-
-        # MACD 零轴穿越检测
-        crossover_up = (macd_line[-1] > 0) and (macd_line[-2] <= 0)
-        crossover_down = (macd_line[-1] < 0) and (macd_line[-2] >= 0)
-        if st_trend == 'LONG' and (macd_line[-1] > 0 or crossover_up):
-            return 'LONG'
-        elif st_trend == 'SHORT' and (macd_line[-1] < 0 or crossover_down):
-            return 'SHORT'
-        else:
-            return 'NEUTRAL'
+            # 如果位于区间内，通过判断 MACD 值决定趋势
+            ema_fast = pd.Series(close).ewm(span=self.config.macd_fast, adjust=False).mean().values
+            ema_slow = pd.Series(close).ewm(span=self.config.macd_slow, adjust=False).mean().values
+            macd_line = ema_fast - ema_slow
+            st_trend = 'LONG' if macd_line[-1] >= 0 else 'SHORT'
+        return st_trend
 
     def _vectorized_atr(self, high, low, close, period: int) -> np.ndarray:
         tr = np.maximum.reduce([
@@ -400,7 +394,7 @@ class ETHUSDTStrategy:
         return atr
 
     async def adjust_position_ratio(self, trend: str):
-        """调整仓位比例，记录日志用于下单时传递比例参数"""
+        """调整仓位比例，记录日志作为下单参数参考"""
         df = await self.client.fetch_klines(interval='15m', limit=50)
         if df.empty:
             return
@@ -411,7 +405,6 @@ class ETHUSDTStrategy:
         else:
             ratio = (1, 0.5)
         logger.info(f"调整仓位比例: 多仓 {ratio[0]}, 空仓 {ratio[1]}")
-        # 实际下单时可将此比例作为参数传入
 
     async def handle_trend_reversal(self, new_trend: str):
         """趋势反转处理：平掉与新趋势不符的50%仓位，并启动分批调仓至1:1"""
@@ -433,9 +426,9 @@ class ETHUSDTStrategy:
             await asyncio.sleep(300)
 
     async def rebalance_hedge(self):
-        """根据当前持仓对冲至1:1，示例仅记录日志，需根据实际API实现"""
+        """执行持仓再平衡操作，确保对冲比例调整至1:1（此处为占位函数）"""
         logger.info("执行持仓再平衡，调整对冲仓位至1:1")
-        # 示例：查询当前持仓并计算对冲差额后下单
+        # 此处应查询当前持仓并计算差额后下单
 
     async def close_position(self, side: str, ratio: float):
         """以市价单平仓，加入滑点控制"""
@@ -455,12 +448,11 @@ class ETHUSDTStrategy:
             'quantity': QUANTITY * ratio,
         }
         await self.client._signed_request('POST', '/order', params)
-        # 更新持仓状态，实际需根据API查询
 
     async def analyze_order_signals_3m(self):
         """
-        计算3分钟布林带%B并判断挂单信号，
-        当%B接近0或1时触发挂单，构造订单参数列表。
+        计算3分钟布林带%B，并判断挂单信号，
+        当%B接近0或1时构造订单参数列表。
         """
         df = await self.client.fetch_klines(interval='3m', limit=50)
         if df.empty:
@@ -490,15 +482,13 @@ class ETHUSDTStrategy:
     async def place_dynamic_limit_orders(self, side: str, order_list: list, long_qty: float, short_qty: float):
         """
         根据订单列表构造挂单，
-        每单价格 = 当前价 ± dynamic_offset，且挂单偏移根据ATR动态调整；
-        如果挂单后3分钟未成交则启动调整任务，同时根据%B条件撤销挂单。
+        每单价格 = 当前价 ± dynamic_offset（挂单偏移根据ATR动态调整）；
+        若挂单后3分钟未成交则启动调整任务，同时根据%B条件撤销挂单。
         """
         df_now = await self.client.fetch_klines(interval='1m', limit=1)
         if df_now.empty:
             return
         current_price = df_now['close'].values[0]
-
-        # 计算当前ATR与日均ATR比值，用于调整挂单偏移
         df_daily = await self.client.fetch_klines(interval='1d', limit=50)
         if not df_daily.empty:
             atr_daily = self._vectorized_atr(df_daily['high'].values, df_daily['low'].values, df_daily['close'].values, period=self.config.atr_window)
@@ -544,7 +534,7 @@ class ETHUSDTStrategy:
             logger.info(f"根据%B={current_b:.3f}条件撤销未成交订单")
 
     async def get_current_percentb(self) -> float:
-        """实时获取最新%B值，示例中使用3m数据计算"""
+        """实时获取最新%B值（使用3m数据）"""
         df = await self.client.fetch_klines(interval='3m', limit=50)
         if df.empty:
             return 0.5
@@ -558,7 +548,7 @@ class ETHUSDTStrategy:
         return percent_b
 
     async def cancel_all_orders(self):
-        """撤销所有未成交订单（需调用交易所撤单接口）"""
+        """撤销所有未成交订单（调用交易所撤单接口）"""
         logger.info("撤销所有未成交订单")
         params = {'symbol': SYMBOL}
         try:
@@ -569,7 +559,7 @@ class ETHUSDTStrategy:
     async def manage_stop_loss_and_profit(self):
         """
         止盈止损管理：
-         1. 如果未记录开仓价，等待 on_order 回调记录；
+         1. 未记录开仓价则等待 on_order 回调；
          2. 达到1%盈利后启动ATR跟踪止损；
          3. 硬止损为 entry_price*0.98（多单）或 entry_price*1.02（空单）。
         """
@@ -606,7 +596,6 @@ class ETHUSDTStrategy:
             await self.close_position(side='SELL' if self.last_trade_side=='LONG' else 'BUY', ratio=1.0)
         if self.consecutive_losses >= 3:
             logger.warning("连续亏损3次，降低仓位至50%")
-            # 此处可调整订单数量，此处仅记录日志
 
     async def compute_atr_baseline(self):
         """每周重置ATR基准，用于自适应波动率"""
