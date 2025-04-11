@@ -2,7 +2,6 @@
 # ETH/USDC 高频交易引擎 v7.4（整合优化版：基于实时3m Bollinger Bands %B 下单信号）
 
 import uvloop
-
 uvloop.install()
 
 import os, asyncio, time, hmac, hashlib, urllib.parse, logging, datetime
@@ -26,8 +25,8 @@ load_dotenv(_env_path)
 API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
 SYMBOL = 'ETHUSDC'
-LEVERAGE = 10
-QUANTITY = 0.06
+LEVERAGE = 50
+QUANTITY = 0.12
 REST_URL = 'https://fapi.binance.com'
 
 # ==================== 高频参数 ====================
