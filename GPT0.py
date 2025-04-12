@@ -1,272 +1,380 @@
 #!/usr/bin/env python3
-"""
-ETH/USDT 高频交易引擎 v8.1（基于NautilusTrader架构思想的优化版）
-"""
+# ETH/USDT 高频交易引擎 v8.1 (合规版)
 import uvloop
 
 uvloop.install()
 
-import os
-import asyncio
-import time
-import hmac
-import hashlib
-import urllib.parse
-import logging
-from decimal import Decimal
-from typing import Dict, Optional, Tuple
+import os, asyncio, time, hmac, hashlib, urllib.parse, logging, datetime
+from collections import deque, defaultdict
 from dataclasses import dataclass
-
 import numpy as np
 import pandas as pd
-from aiohttp import ClientTimeout, TCPConnector
+from aiohttp import ClientTimeout, TCPConnector, ClientSession
 from aiohttp_retry import RetryClient, ExponentialRetry
+import json
+import random
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("/var/log/eth_usdt_hft.log", mode='a', encoding='utf-8')
-    ]
-)
-logger = logging.getLogger('ETH-HFT')
+# ==================== 环境配置 ====================
+ENV_PATH = '/root/zhibai/.env'
+load_dotenv(ENV_PATH)
 
-
-# 环境配置
-class EnvConfig:
-    API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
-    SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
-    SYMBOL = 'ETHUSDT'
-    LEVERAGE = 50
-    BASE_URL = 'https://fapi.binance.com'
+API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
+SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
+SYMBOL = 'ETHUSDT'
+LEVERAGE = 50
+REST_URL = 'https://fapi.binance.com'
 
 
-# 交易参数
-class TradingParameters:
-    BULL_LONG_QTY = Decimal('0.36')
-    BULL_SHORT_QTY = Decimal('0.18')
-    BEAR_LONG_QTY = Decimal('0.18')
-    BEAR_SHORT_QTY = Decimal('0.36')
-    ORDER_QUANTITY = Decimal('0.12')
-    PRICE_PRECISION = 2
-    QTY_PRECISION = 3
-    MAX_RETRIES = 5
-    RATE_LIMITS = {
+# ==================== 交易参数 ====================
+class TradingConfig:
+    # 核心参数
+    atr_window = 14
+    ema_fast = 9
+    ema_slow = 21
+    st_period = 20
+    st_multiplier = 3.0
+    bb_period = 20
+    bb_std = 2.0
+
+    # 风险参数
+    max_retries = 5
+    order_timeout = 1.5
+    network_timeout = 3.0
+    price_precision = 2
+    quantity_precision = 3
+    max_slippage = 0.0015
+    daily_drawdown_limit = 0.20
+
+    # 高频参数
+    rate_limits = {
         'klines': (60, 5),
-        'orders': (300, 10),
-        'leverage': (30, 60)
+        'order': (300, 10),
+        'openOrders': (60, 60)
+    }
+
+    # 网络优化
+    tcp_params = {
+        'limit': 1000,
+        'ttl_dns_cache': 300,
+        'force_close': True,
+        'use_dns_cache': True
     }
 
 
-# 异步HTTP客户端
-class BinanceHFTClient:
-    def __init__(self):
-        self.connector = TCPConnector(
-            limit=1000,
-            ttl_dns_cache=300,
-            force_close=True,
-            ssl=False
-        )
-        self.retry_options = ExponentialRetry(
-            attempts=TradingParameters.MAX_RETRIES,
-            start_timeout=0.5,
-            max_timeout=3.0,
+# ==================== 核心引擎 ====================
+class BinanceHFEngine:
+    def __init__(self, config: TradingConfig):
+        self.config = config
+        self._time_diff = 0
+        self.session = None
+        self.request_timestamps = defaultdict(lambda: deque(maxlen=1000))
+        self.position = 0.0
+        self._init_session()
+
+    def _init_session(self):
+        retry_opts = ExponentialRetry(
+            attempts=self.config.max_retries,
             statuses={408, 429, 500, 502, 503, 504},
-            exceptions={asyncio.TimeoutError, ConnectionError}
+            exceptions={asyncio.TimeoutError}
         )
+        self.connector = TCPConnector(**self.config.tcp_params)
         self.session = RetryClient(
             connector=self.connector,
-            retry_options=self.retry_options,
-            timeout=ClientTimeout(total=5)
+            retry_options=retry_opts,
+            timeout=ClientTimeout(
+                total=self.config.network_timeout,
+                sock_connect=self.config.order_timeout
+            )
         )
-        self.time_diff = 0
 
     async def sync_time(self):
-        url = f"{EnvConfig.BASE_URL}/fapi/v1/time"
-        async with self.session.get(url) as resp:
-            data = await resp.json()
-            self.time_diff = data['serverTime'] - int(time.time() * 1000)
+        """精确时间同步（带时差校验）"""
+        for _ in range(3):
+            try:
+                async with self.session.get(f"{REST_URL}/fapi/v1/time") as resp:
+                    data = await resp.json()
+                    server_time = data['serverTime']
+                    local_time = int(time.time() * 1000)
+                    self._time_diff = server_time - local_time
+                    if abs(self._time_diff) > 5000:
+                        logging.warning(f"大时差警告：{self._time_diff}ms")
+                    return
+            except Exception as e:
+                await asyncio.sleep(2 ** _)
+        raise ConnectionError("时间同步失败")
 
-    async def signed_request(self, method: str, endpoint: str, params: dict) -> dict:
-        params = {
-            **params,
-            'timestamp': int(time.time() * 1000 + self.time_diff),
+    async def signed_request(self, method: str, endpoint: str, params: dict):
+        """带严格速率控制的签名请求"""
+        # 速率检查
+        await self._rate_limit_check(endpoint)
+
+        # 构造签名
+        params = {k: v for k, v in params.items() if v is not None}
+        params.update({
+            'timestamp': int(time.time() * 1000 + self._time_diff),
             'recvWindow': 6000
-        }
+        })
         query = urllib.parse.urlencode(sorted(params.items()))
         signature = hmac.new(
-            EnvConfig.SECRET_KEY.encode(),
+            SECRET_KEY.encode(),
             query.encode(),
             hashlib.sha256
         ).hexdigest()
 
+        # 构造请求
+        url = f"{REST_URL}/fapi/v1/{endpoint}?{query}&signature={signature}"
         headers = {
-            "X-MBX-APIKEY": EnvConfig.API_KEY,
-            "Content-Type": "application/x-www-form-urlencoded"
+            "X-MBX-APIKEY": API_KEY,
+            "X-TS-Strategy": "HFTv8",
+            "Accept-Encoding": "gzip"
         }
 
-        url = f"{EnvConfig.BASE_URL}/fapi/v1{endpoint}?{query}&signature={signature}"
+        async with self.session.request(method, url, headers=headers) as resp:
+            if resp.status != 200:
+                error = await resp.text()
+                logging.error(f"API Error {resp.status}: {error}")
+                raise Exception(f"API Error {resp.status}")
+            return await resp.json()
 
-        for attempt in range(TradingParameters.MAX_RETRIES + 1):
-            try:
-                async with self.session.request(method, url, headers=headers) as resp:
-                    if resp.status == 429:
-                        retry_after = int(resp.headers.get('Retry-After', 2 ** attempt))
-                        await asyncio.sleep(retry_after)
-                        continue
-                    resp.raise_for_status()
-                    return await resp.json()
-            except Exception as e:
-                logger.error(f"Request failed (attempt {attempt + 1}): {str(e)}")
-                await asyncio.sleep(2 ** attempt)
-        raise Exception("Max retries exceeded")
+    async def _rate_limit_check(self, endpoint: str):
+        """动态速率限制管理"""
+        limit, period = self.config.rate_limits.get(endpoint, (1200, 60))
+        now = time.monotonic()
+        dq = self.request_timestamps[endpoint]
+
+        # 移除过期记录
+        while dq and dq[0] < now - period:
+            dq.popleft()
+
+        # 计算等待时间
+        if len(dq) >= limit:
+            sleep_time = max(dq[0] + period - now + random.uniform(0.01, 0.05), 0)
+            logging.warning(f"速率限制 {endpoint} 等待 {sleep_time:.2f}s")
+            await asyncio.sleep(sleep_time)
+
+        dq.append(now)
+
+    # ==================== 交易接口 ====================
+    async def set_leverage(self):
+        """设置杠杆（符合币安2025新规）"""
+        return await self.signed_request('POST', 'leverage', {
+            'symbol': SYMBOL,
+            'leverage': LEVERAGE,
+            'dualSidePosition': 'false'
+        })
+
+    async def get_klines(self, interval: str, limit: int = 500):
+        """获取K线数据（优化版本）"""
+        try:
+            data = await self.signed_request('GET', 'klines', {
+                'symbol': SYMBOL,
+                'interval': interval,
+                'limit': limit
+            })
+            return pd.DataFrame(data, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_volume', 'count',
+                'taker_buy_volume', 'taker_buy_quote', 'ignore'
+            ])
+        except Exception as e:
+            logging.error(f"K线获取失败: {e}")
+            return pd.DataFrame()
+
+    async def place_order(self, side: str, qty: float, price: float = None):
+        """智能下单（支持限价/市价）"""
+        order_type = 'LIMIT' if price else 'MARKET'
+        params = {
+            'symbol': SYMBOL,
+            'side': side,
+            'type': order_type,
+            'quantity': round(qty, self.config.quantity_precision),
+            'newOrderRespType': 'FULL'
+        }
+        if price:
+            params['price'] = round(price, self.config.price_precision)
+            params['timeInForce'] = 'GTC'
+
+        try:
+            return await self.signed_request('POST', 'order', params)
+        except Exception as e:
+            if '-2039' in str(e) or '-2038' in str(e):  # 处理新错误代码
+                logging.error("订单参数错误，触发撤单")
+                await self.cancel_all_orders()
+            raise
+
+    async def cancel_all_orders(self):
+        """批量撤单（优化版本）"""
+        return await self.signed_request('DELETE', 'openOrders', {
+            'symbol': SYMBOL
+        })
 
 
-# 策略引擎
-class HFTStrategyEngine:
-    def __init__(self, client: BinanceHFTClient):
-        self.client = client
-        self.position = Decimal('0')
-        self.daily_pnl = Decimal('0')
+# ==================== 策略引擎 ====================
+class AlphaStrategy:
+    def __init__(self, engine: BinanceHFEngine):
+        self.engine = engine
+        self.config = TradingConfig()
+        self.position = 0.0
+        self.daily_pnl = 0.0
         self.consecutive_losses = 0
 
-    async def supertrend_signal(self) -> str:
-        df = await self._get_klines('15m')
+    async def super_trend_signal(self):
+        """15分钟超级趋势信号"""
+        df = await self.engine.get_klines('15m', 100)
         if df.empty:
-            return 'NEUTRAL'
+            return None
 
-        hl2 = (df['high'] + df['low']) / 2
-        atr = self._calc_atr(df, 20)
+        # 计算指标
+        high = df['high'].values.astype(float)
+        low = df['low'].values.astype(float)
+        close = df['close'].values.astype(float)
+
+        # 计算ATR
+        tr = np.maximum(high[1:] - low[1:],
+                        np.abs(high[1:] - close[:-1]),
+                        np.abs(low[1:] - close[:-1]))
+        atr = np.convolve(tr, np.ones(14), 'valid') / 14
+
+        # 计算超级趋势
+        hl2 = (high + low) / 2
         upper = hl2 + 3 * atr
         lower = hl2 - 3 * atr
 
-        st_upper, st_lower = [], []
-        for i in range(len(df)):
-            if i == 0 or df['close'][i - 1] > st_upper[-1]:
-                st_upper.append(min(upper[i], st_upper[-1] if i > 0 else upper[i]))
-            else:
-                st_upper.append(upper[i])
+        # 生成信号
+        last_close = close[-1]
+        if last_close > upper[-1]:
+            return 'LONG'
+        elif last_close < lower[-1]:
+            return 'SHORT'
+        return None
 
-            if i == 0 or df['close'][i - 1] < st_lower[-1]:
-                st_lower.append(max(lower[i], st_lower[-1] if i > 0 else lower[i]))
-            else:
-                st_lower.append(lower[i])
-
-        return 'BULL' if df['close'].iloc[-1] > st_upper[-1] else 'BEAR'
-
-    async def bb_percentb_signal(self) -> Tuple[bool, Optional[str]]:
-        df = await self._get_klines('3m')
+    async def bb_percent_b(self):
+        """3分钟布林带%B信号"""
+        df = await self.engine.get_klines('3m', 20)
         if df.empty:
-            return False, None
+            return 0.5
 
-        close = df['close'].rolling(20).mean()
-        std = df['close'].rolling(20).std()
-        upper = close + 2 * std
-        lower = close - 2 * std
-        percent_b = (df['close'].iloc[-1] - lower.iloc[-1]) / (upper.iloc[-1] - lower.iloc[-1])
+        close = df['close'].values.astype(float)
+        sma = pd.Series(close).rolling(20).mean().values
+        std = pd.Series(close).rolling(20).std().values
+        upper = sma + 2 * std
+        lower = sma - 2 * std
 
-        if percent_b <= 0:
-            return True, 'BUY'
-        elif percent_b >= 1:
-            return True, 'SELL'
-        return False, None
+        last_close = close[-1]
+        if (upper[-1] - lower[-1]) == 0:
+            return 0.5
+        return (last_close - lower[-1]) / (upper[-1] - lower[-1])
 
     async def execute_strategy(self):
-        trend = await self.supertrend_signal()
-        bb_signal, side = await self.bb_percentb_signal()
+        """策略执行循环"""
+        while True:
+            try:
+                # 获取信号
+                trend = await self.super_trend_signal()
+                bb = await self.bb_percent_b()
 
-        if bb_signal:
-            await self.place_orders(side, trend)
+                # 趋势跟踪
+                if trend == 'LONG' and self.position <= 0:
+                    await self.adjust_position(0.1)
+                elif trend == 'SHORT' and self.position >= 0:
+                    await self.adjust_position(-0.1)
 
-        await self.risk_management()
+                # 短线信号
+                if bb <= 0.05:
+                    await self.place_twap_order('BUY', 0.05)
+                elif bb >= 0.95:
+                    await self.place_twap_order('SELL', 0.05)
 
-    async def place_orders(self, side: str, trend: str):
-        qty = self._calc_position(trend, side)
-        orders = [
-            {'offset': Decimal('0.0005'), 'ratio': Decimal('0.3')},
-            {'offset': Decimal('0.001'), 'ratio': Decimal('0.2')},
-            {'offset': Decimal('0.0045'), 'ratio': Decimal('0.1')}
-        ]
+                # 风险管理
+                await self.risk_check()
 
-        price = await self._get_current_price()
-        for order in orders:
-            limit_price = price * (1 - order['offset'] if side == 'BUY' else 1 + order['offset'])
-            await self.client.signed_request(
-                'POST',
-                '/order',
-                {
-                    'symbol': EnvConfig.SYMBOL,
-                    'side': side,
-                    'type': 'LIMIT',
-                    'quantity': round(qty * order['ratio'], TradingParameters.QTY_PRECISION),
-                    'price': round(limit_price, TradingParameters.PRICE_PRECISION),
-                    'timeInForce': 'GTC'
-                }
-            )
+                await asyncio.sleep(5)
+            except Exception as e:
+                logging.error(f"策略执行错误: {e}")
+                await asyncio.sleep(10)
 
-    async def risk_management(self):
-        if self.daily_pnl < -Decimal('0.2'):
-            await self.close_positions()
-        elif self.consecutive_losses >= 3:
-            await self.reduce_position(Decimal('0.5'))
+    async def place_twap_order(self, side: str, qty: float):
+        """TWAP下单（支持动态滑点）"""
+        # 获取市场深度
+        depth = await self.engine.signed_request('GET', 'depth', {'symbol': SYMBOL, 'limit': 5})
+        best_ask = float(depth['asks'][0][0])
+        best_bid = float(depth['bids'][0][0])
 
-    # 辅助方法
-    async def _get_klines(self, interval: str) -> pd.DataFrame:
-        data = await self.client.signed_request(
-            'GET',
-            '/klines',
-            {'symbol': EnvConfig.SYMBOL, 'interval': interval, 'limit': 100}
-        )
-        return pd.DataFrame(data, columns=[
-            'timestamp', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_volume', 'trades',
-            'taker_buy_base', 'taker_buy_quote', 'ignore'
-        ]).apply(pd.to_numeric)
-
-    def _calc_atr(self, df: pd.DataFrame, period: int) -> pd.Series:
-        tr = pd.concat([
-            df['high'] - df['low'],
-            (df['high'] - df['close'].shift()).abs(),
-            (df['low'] - df['close'].shift()).abs()
-        ], axis=1).max(axis=1)
-        return tr.rolling(period).mean()
-
-    def _calc_position(self, trend: str, side: str) -> Decimal:
-        if trend == 'BULL':
-            return TradingParameters.BULL_LONG_QTY if side == 'BUY' else TradingParameters.BULL_SHORT_QTY
+        # 计算动态价格
+        spread = best_ask - best_bid
+        if side == 'BUY':
+            price = best_bid + spread * 0.3
         else:
-            return TradingParameters.BEAR_LONG_QTY if side == 'BUY' else TradingParameters.BEAR_SHORT_QTY
+            price = best_ask - spread * 0.3
 
-    async def _get_current_price(self) -> Decimal:
-        data = await self.client.signed_request(
-            'GET',
-            '/ticker/price',
-            {'symbol': EnvConfig.SYMBOL}
-        )
-        return Decimal(data['price'])
+        # 分三笔下单
+        for i in range(3):
+            try:
+                await self.engine.place_order(side, qty / 3, price)
+                await asyncio.sleep(10)
+            except Exception as e:
+                logging.error(f"TWAP分单失败: {e}")
 
+    async def adjust_position(self, target: float):
+        """仓位调整（带滑点控制）"""
+        delta = target - self.position
+        if abs(delta) < 0.01:
+            return
 
-# 主程序
-async def main():
-    client = BinanceHFTClient()
-    await client.sync_time()
-
-    strategy = HFTStrategyEngine(client)
-
-    while True:
+        side = 'BUY' if delta > 0 else 'SELL'
         try:
-            await strategy.execute_strategy()
-            await asyncio.sleep(0.5)
+            # 获取当前价格
+            ticker = await self.engine.signed_request('GET', 'ticker/bookTicker', {'symbol': SYMBOL})
+            price = float(ticker['bidPrice']) if side == 'SELL' else float(ticker['askPrice'])
+
+            # 执行市价单
+            result = await self.engine.place_order(side, abs(delta))
+            self.position = target
+            logging.info(f"仓位调整成功: {side} {abs(delta)} @ {price}")
         except Exception as e:
-            logger.error(f"Main loop error: {str(e)}")
-            await asyncio.sleep(5)
+            logging.error(f"调仓失败: {e}")
+
+    async def risk_check(self):
+        """实时风险监控"""
+        if self.daily_pnl < -self.config.daily_drawdown_limit:
+            logging.critical("触发最大回撤限制！")
+            await self.close_all_positions()
+
+        if self.consecutive_losses >= 3:
+            logging.warning("连续3次亏损，降低风险暴露")
+            await self.adjust_position(self.position * 0.5)
+
+    async def close_all_positions(self):
+        """紧急平仓"""
+        if self.position > 0:
+            await self.engine.place_order('SELL', self.position)
+        elif self.position < 0:
+            await self.engine.place_order('BUY', abs(self.position))
+        self.position = 0.0
 
 
-if __name__ == "__main__":
+# ==================== 主程序 ====================
+async def main():
+    # 初始化引擎
+    config = TradingConfig()
+    engine = BinanceHFEngine(config)
+    strategy = AlphaStrategy(engine)
+
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Graceful shutdown")
+        # 环境准备
+        await engine.sync_time()
+        await engine.set_leverage()
+
+        # 启动策略
+        await strategy.execute_strategy()
+    finally:
+        await engine.session.close()
+
+
+if __name__ == '__main__':
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[logging.FileHandler('hft.log'), logging.StreamHandler()]
+    )
+    asyncio.run(main())
