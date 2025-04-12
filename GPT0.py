@@ -458,18 +458,18 @@ class ETHUSDTStrategy:
         logger.info(f"[原策略] 3m %B: {percent_b:.3f}")
         if percent_b <= 0.0:
             return Signal(True, 'BUY', 0, 0, order_details={'trigger_price': latest_price, 'percent_b': percent_b}), [
-                {'offset': 0.0005, 'ratio': 0.30},
-                {'offset': 0.0010, 'ratio': 0.20},
-                {'offset': 0.0045, 'ratio': 0.10},
-                {'offset': 0.0065, 'ratio': 0.20},
+                {'offset': 0.0005, 'ratio': 0.20},
+                {'offset': 0.0015, 'ratio': 0.20},
+                {'offset': 0.0045, 'ratio': 0.20},
+                {'offset': 0.0075, 'ratio': 0.20},
                 {'offset': 0.0110, 'ratio': 0.20},
             ]
         elif percent_b >= 1.0:
             return Signal(True, 'SELL', 0, 0, order_details={'trigger_price': latest_price, 'percent_b': percent_b}), [
-                {'offset': 0.0005, 'ratio': 0.30},
-                {'offset': 0.0010, 'ratio': 0.20},
-                {'offset': 0.0045, 'ratio': 0.10},
-                {'offset': 0.0065, 'ratio': 0.20},
+                {'offset': 0.0005, 'ratio': 0.20},
+                {'offset': 0.0015, 'ratio': 0.20},
+                {'offset': 0.0045, 'ratio': 0.20},
+                {'offset': 0.0075, 'ratio': 0.20},
                 {'offset': 0.0110, 'ratio': 0.20},
             ]
         return Signal(False, 'NONE', 0, 0), []
