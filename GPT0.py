@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 ETH/USDT 高频交易引擎 v7.4（基于15m超趋势与3m级BB%B信号策略，REST API版）
-
 主要策略：
 1. 15分钟超级趋势策略：采用20周期均线、3×ATR结合MACD辅助判断趋势；
    趋势为多时目标仓位：多仓 0.1 ETH、空仓 0.05 ETH；
@@ -10,18 +9,16 @@ ETH/USDT 高频交易引擎 v7.4（基于15m超趋势与3m级BB%B信号策略，
    当 %B ≤ 0 或 ≥ 1 时，根据最新市场价格下挂多个档位固定限价单。
 3. 止盈止损策略：初始止损按买入价×0.98（多单）/×1.02（空单）设定，并结合3m级 Bollinger 带宽动态跟踪止损；
    止盈分阶段触发，部分市价平仓，剩余挂限价止盈单。
-4. 风险控制：当日亏损超过账户资金20%或连续亏损≥3次时，触发平仓保护。
-
 适配环境：Vultr high frequency (vhf-1c-1gb ubuntu22.04)
 要求：
   - 使用 REST API（URL为 https://fapi.binance.com）
   - 使用异步 aiohttp 与 uvloop 以获得较低延迟
   - 内置限频检测与重试策略
-
 本代码参考 Binance 官方更新文档中关于时间戳、错误码、限频以及 dualSidePosition 要求的说明。
 """
 
 import uvloop
+
 uvloop.install()
 
 import os, asyncio, time, hmac, hashlib, urllib.parse, logging
@@ -43,16 +40,16 @@ from prometheus_client import Gauge, start_http_server
 ENV_PATH = '/root/zhibai/.env'
 load_dotenv(ENV_PATH)
 
-API_KEY    = os.getenv('BINANCE_API_KEY', '').strip()
+API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
-SYMBOL     = 'ETHUSDT'
-LEVERAGE   = 50
+SYMBOL = 'ETHUSDT'
+LEVERAGE = 50
 
 # 目标仓位设置（单位：ETH）
-BULL_LONG_QTY  = 0.5    # 多头情况下多仓
-BULL_SHORT_QTY = 0.25   # 多头时对冲空仓
-BEAR_LONG_QTY  = 0.25   # 空头时对冲多仓
-BEAR_SHORT_QTY = 0.5    # 空头时空仓
+BULL_LONG_QTY = 0.6  # 多头情况下多仓
+BULL_SHORT_QTY = 0.3  # 多头时对冲空仓
+BEAR_LONG_QTY = 0.3  # 空头时对冲多仓
+BEAR_SHORT_QTY = 0.6  # 空头时空仓
 
 # 单笔基础订单数量（示例值，可根据实际持仓调整）
 QUANTITY = 0.1
@@ -68,10 +65,10 @@ RATE_LIMITS: Dict[str, Tuple[int, int]] = {
     'leverage': (30, 60)
 }
 
-# 为降低因网络延迟产生的时间戳偏差，将 recvWindow 调整为 10000 毫秒
+# 为降低因网络延迟带来的时间戳误差，设置较大 recvWindow（单位：毫秒）
 RECV_WINDOW = 10000
 
-# 最小订单名义价值（单位：USDT），参考 Binance 文档要求（错误码 -4164）
+# 最小订单名义价值（单位：USDT），避免出现 -4164 错误
 MIN_NOTIONAL = 20.0
 
 # ==================== Prometheus监控 ====================
@@ -96,19 +93,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger('ETH-USDT-HFT')
 
+
 @dataclass
 class TradingConfig:
     atr_window: int = 14
     ema_fast: int = 9
     ema_slow: int = 21
     vol_multiplier: float = 2.5
-    st_period: int = 20            # 超级趋势周期
-    st_multiplier: float = 3.0     # 超级趋势ATR倍数
+    st_period: int = 20  # 超级趋势周期
+    st_multiplier: float = 3.0  # 超级趋势ATR倍数
     macd_fast: int = 12
     macd_slow: int = 26
     macd_signal: int = 9
-    bb_period: int = 20            # Bollinger Bands周期（3m级）
-    bb_std: float = 2.0            # Bollinger Bands标准差倍数
+    bb_period: int = 20  # Bollinger Bands周期（3m级）
+    bb_std: float = 2.0  # Bollinger Bands标准差倍数
     max_retries: int = 7
     order_timeout: float = 2.0
     network_timeout: float = 5.0
@@ -119,12 +117,12 @@ class TradingConfig:
     dual_side_position: str = "true"
     order_adjust_interval: float = 180.0
     max_slippage_market: float = 0.0015  # 市价单允许最大滑点 0.15%
-    daily_drawdown_limit: float = 0.20
+    daily_drawdown_limit: float = 0.20  # 此处保留字段，但风险监控逻辑已移除
+
 
 class BinanceHFTClient:
     def __init__(self) -> None:
         self.config = TradingConfig()
-        # 连接参数优化：低延迟、高并发
         self.connector = TCPConnector(
             limit=512,
             resolver=AsyncResolver(),
@@ -134,7 +132,6 @@ class BinanceHFTClient:
         )
         self._init_session()
         self.recv_window = RECV_WINDOW
-        # 限频记录：按接口名称存储请求时间戳
         self.request_timestamps: Dict[str, deque] = defaultdict(lambda: deque(maxlen=RATE_LIMITS['klines'][0] + 200))
         self._time_diff = 0
         self.position = 0.0
@@ -263,6 +260,7 @@ class BinanceHFTClient:
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
 
+
 @dataclass
 class Signal:
     action: bool
@@ -271,14 +269,13 @@ class Signal:
     sl: float
     order_details: dict = None
 
+
 class ETHUSDTStrategy:
     def __init__(self, client: BinanceHFTClient) -> None:
         self.client = client
         self.config = TradingConfig()
         self._indicator_cache = defaultdict(lambda: None)
-        self.daily_pnl: float = 0.0
-        self.consecutive_losses: int = 0
-        self.last_trade_side: str = None   # 'LONG' 或 'SHORT'
+        self.last_trade_side: str = None  # 'LONG' 或 'SHORT'
         self.entry_price: float = None
         self.hard_stop: float = None
         self.trailing_stop: float = None
@@ -308,7 +305,7 @@ class ETHUSDTStrategy:
             return 'LONG'
         close = df['close'].values.astype(np.float64)
         high = df['high'].values.astype(np.float64)
-        low  = df['low'].values.astype(np.float64)
+        low = df['low'].values.astype(np.float64)
         atr = self._vectorized_atr(high, low, close, period=self.config.st_period)
         last_atr = atr[-1]
         hl2 = (df['high'] + df['low']) / 2
@@ -317,8 +314,10 @@ class ETHUSDTStrategy:
         final_upper = [basic_upper.iloc[0]]
         final_lower = [basic_lower.iloc[0]]
         for i in range(1, len(close)):
-            curr_upper = basic_upper.iloc[i] if (basic_upper.iloc[i] < final_upper[-1] or close[i-1] > final_upper[-1]) else final_upper[-1]
-            curr_lower = basic_lower.iloc[i] if (basic_lower.iloc[i] > final_lower[-1] or close[i-1] < final_lower[-1]) else final_lower[-1]
+            curr_upper = basic_upper.iloc[i] if (
+                        basic_upper.iloc[i] < final_upper[-1] or close[i - 1] > final_upper[-1]) else final_upper[-1]
+            curr_lower = basic_lower.iloc[i] if (
+                        basic_lower.iloc[i] > final_lower[-1] or close[i - 1] < final_lower[-1]) else final_lower[-1]
             final_upper.append(curr_upper)
             final_lower.append(curr_lower)
         final_upper = np.array(final_upper)
@@ -390,23 +389,24 @@ class ETHUSDTStrategy:
         logger.info(f"3m %B: {percent_b:.3f}")
         if percent_b <= 0.0:
             return Signal(True, 'BUY', 0, 0, order_details={'trigger_price': latest_price, 'percent_b': percent_b}), [
-                {'offset': 0.0005, 'ratio': 0.30},
+                {'offset': 0.0005, 'ratio': 0.20},
                 {'offset': 0.0010, 'ratio': 0.20},
-                {'offset': 0.0045, 'ratio': 0.10},
+                {'offset': 0.0045, 'ratio': 0.20},
                 {'offset': 0.0065, 'ratio': 0.20},
                 {'offset': 0.0110, 'ratio': 0.20},
             ]
         elif percent_b >= 1.0:
             return Signal(True, 'SELL', 0, 0, order_details={'trigger_price': latest_price, 'percent_b': percent_b}), [
-                {'offset': 0.0005, 'ratio': 0.30},
+                {'offset': 0.0005, 'ratio': 0.20},
                 {'offset': 0.0010, 'ratio': 0.20},
-                {'offset': 0.0045, 'ratio': 0.10},
+                {'offset': 0.0045, 'ratio': 0.20},
                 {'offset': 0.0065, 'ratio': 0.20},
                 {'offset': 0.0110, 'ratio': 0.20},
             ]
         return Signal(False, 'NONE', 0, 0), []
 
-    async def place_dynamic_limit_orders(self, side: str, order_list: List[Dict[str, Any]], trigger_price: float) -> None:
+    async def place_dynamic_limit_orders(self, side: str, order_list: List[Dict[str, Any]],
+                                         trigger_price: float) -> None:
         # 开仓订单根据 side 设置 positionSide
         pos_side = "LONG" if side == "BUY" else "SHORT"
         for order in order_list:
@@ -416,11 +416,11 @@ class ETHUSDTStrategy:
             if order_qty <= 0:
                 logger.error("无效订单数量，跳过当前档")
                 continue
-            limit_price = round(trigger_price * (1 - offset) if side == "BUY" else trigger_price * (1 + offset), self.config.price_precision)
+            limit_price = round(trigger_price * (1 - offset) if side == "BUY" else trigger_price * (1 + offset),
+                                self.config.price_precision)
             if limit_price <= 0:
                 logger.error("无效挂单价格，跳过当前档")
                 continue
-            # 检查订单名义价值是否符合最低要求
             notional = limit_price * order_qty
             if notional < MIN_NOTIONAL:
                 logger.error(f"订单名义价值 {notional} USDT 小于最低要求 {MIN_NOTIONAL} USDT，跳过当前档")
@@ -436,7 +436,8 @@ class ETHUSDTStrategy:
             }
             try:
                 data = await self.client._signed_request('POST', '/order', params)
-                logger.info(f"挂限价单成功: {side}@{limit_price}，数量: {order_qty}（偏移 {offset*100:.2f}%） 返回: {data}")
+                logger.info(
+                    f"挂限价单成功: {side}@{limit_price}，数量: {order_qty}（偏移 {offset * 100:.2f}%） 返回: {data}")
             except Exception as e:
                 logger.error(f"限价挂单失败: {e}")
 
@@ -479,13 +480,15 @@ class ETHUSDTStrategy:
             if self.hard_stop is None or new_stop > self.hard_stop:
                 self.hard_stop = new_stop
             self.trailing_stop = latest_price - dynamic_offset
-            logger.info(f"多单动态止损更新: 当前价={latest_price:.2f}, 带宽={bb_width:.4f}, 新止损={self.hard_stop:.2f}")
+            logger.info(
+                f"多单动态止损更新: 当前价={latest_price:.2f}, 带宽={bb_width:.4f}, 新止损={self.hard_stop:.2f}")
         elif self.last_trade_side == 'SHORT':
             new_stop = latest_price + dynamic_offset
             if self.hard_stop is None or new_stop < self.hard_stop:
                 self.hard_stop = new_stop
             self.trailing_stop = latest_price + dynamic_offset
-            logger.info(f"空单动态止损更新: 当前价={latest_price:.2f}, 带宽={bb_width:.4f}, 新止损={self.hard_stop:.2f}")
+            logger.info(
+                f"空单动态止损更新: 当前价={latest_price:.2f}, 带宽={bb_width:.4f}, 新止损={self.hard_stop:.2f}")
 
     async def manage_profit_targets(self) -> None:
         df = await self.client.fetch_klines(interval='3m', limit=50)
@@ -527,7 +530,6 @@ class ETHUSDTStrategy:
             await self.close_position(side='BUY', ratio=1.0)
 
     async def place_take_profit_orders(self, side: str, base_price: float) -> None:
-        # 止盈订单使用当前持仓方向作为 positionSide
         pos_side = self.last_trade_side
         tp_offsets = [0.0025, 0.0040, 0.0060, 0.0080, 0.0120]
         remaining_qty = QUANTITY
@@ -537,7 +539,6 @@ class ETHUSDTStrategy:
                 tp_price = round(base_price * (1 + offset), self.config.price_precision)
             else:
                 tp_price = round(base_price * (1 - offset), self.config.price_precision)
-            # 检查订单名义价值
             notional = tp_price * qty_each
             if notional < MIN_NOTIONAL:
                 logger.error(f"止盈订单名义价值 {notional} USDT 小于最低 {MIN_NOTIONAL} USDT，跳过该档")
@@ -553,7 +554,7 @@ class ETHUSDTStrategy:
             }
             try:
                 data = await self.client._signed_request('POST', '/order', params)
-                logger.info(f"止盈挂单成功: {side}@{tp_price}，数量: {qty_each}（偏移 {offset*100:.2f}%） 返回: {data}")
+                logger.info(f"止盈挂单成功: {side}@{tp_price}，数量: {qty_each}（偏移 {offset * 100:.2f}%） 返回: {data}")
             except Exception as e:
                 logger.error(f"止盈挂单失败: {e}")
 
@@ -562,11 +563,11 @@ class ETHUSDTStrategy:
         if df.empty:
             return
         current_price = df['close'].values[-1]
-        price_limit = current_price * (1 + self.config.max_slippage_market) if side == 'BUY' else current_price * (1 - self.config.max_slippage_market)
+        price_limit = current_price * (1 + self.config.max_slippage_market) if side == 'BUY' else current_price * (
+                    1 - self.config.max_slippage_market)
         logger.info(f"市价平仓请求：side={side}, ratio={ratio}, 价格限制={price_limit:.2f}")
         pos_side = self.last_trade_side
         order_qty = round(QUANTITY * ratio, self.config.quantity_precision)
-        # 对于市价单，同样检查名义价值
         if current_price * order_qty < MIN_NOTIONAL:
             logger.error(f"市价单名义价值 {current_price * order_qty} USDT 小于最低要求 {MIN_NOTIONAL} USDT，跳过平仓")
             return
@@ -583,55 +584,13 @@ class ETHUSDTStrategy:
         except Exception as e:
             logger.error(f"平仓请求失败: {e}")
 
-    async def risk_control_loop(self) -> None:
-        while True:
-            try:
-                await self.monitor_risk()
-            except Exception as e:
-                logger.error(f"风险监控异常: {e}")
-            await asyncio.sleep(10)
-
-    async def monitor_risk(self) -> None:
-        if self.daily_pnl < -self.config.daily_drawdown_limit:
-            logger.warning("日内亏损超过20%，触发全平仓")
-            if self.last_trade_side == 'LONG':
-                await self.close_position(side='SELL', ratio=1.0)
-            elif self.last_trade_side == 'SHORT':
-                await self.close_position(side='BUY', ratio=1.0)
-        if self.consecutive_losses >= 3:
-            logger.warning("连续亏损3次，建议降低仓位")
-
-    async def compute_atr_baseline(self) -> None:
-        if self.atr_baseline is None:
-            df_weekly = await self.client.fetch_weekly_data(limit=50)
-            if not df_weekly.empty:
-                atr = self._vectorized_atr(
-                    df_weekly['high'].values.astype(np.float64),
-                    df_weekly['low'].values.astype(np.float64),
-                    df_weekly['close'].values.astype(np.float64),
-                    period=self.config.atr_window
-                )
-                self.atr_baseline = atr[-1]
-                logger.info(f"重置周ATR基准: {self.atr_baseline:.4f}")
-
-    async def on_order(self, is_buy: bool, price: float) -> None:
-        self.entry_price = price
-        if is_buy:
-            self.hard_stop = price * 0.98
-            self.last_trade_side = 'LONG'
-        else:
-            self.hard_stop = price * 1.02
-            self.last_trade_side = 'SHORT'
-        self.tp_triggered_30 = False
-        self.tp_triggered_20 = False
-        logger.info(f"记录开仓: {price:.2f}, 初始止损: {self.hard_stop:.2f}")
-
     async def order_signal_loop(self) -> None:
         while True:
             try:
                 signal, order_list = await self.analyze_order_signals_3m()
                 if signal.action:
-                    await self.place_dynamic_limit_orders(signal.side, order_list, trigger_price=signal.order_details.get("trigger_price"))
+                    await self.place_dynamic_limit_orders(signal.side, order_list,
+                                                          trigger_price=signal.order_details.get("trigger_price"))
             except Exception as e:
                 logger.error(f"下单信号异常: {e}")
             await asyncio.sleep(self.config.order_adjust_interval)
@@ -648,12 +607,13 @@ class ETHUSDTStrategy:
     async def execute(self) -> None:
         await self.client.sync_server_time()
         await self.client.manage_leverage()
+        # 移除风险控制任务，其他任务保留
         await asyncio.gather(
             self.trend_monitoring_loop(),
             self.order_signal_loop(),
-            self.stop_loss_profit_management_loop(),
-            self.risk_control_loop()
+            self.stop_loss_profit_management_loop()
         )
+
 
 async def main() -> None:
     client = BinanceHFTClient()
@@ -665,6 +625,7 @@ async def main() -> None:
     finally:
         await client.session.close()
         logger.info("HTTP会话已关闭")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
