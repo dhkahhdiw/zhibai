@@ -6,9 +6,9 @@ ETH/USDT 高频交易引擎 v7.4（基于15m超趋势与3m级BB%B信号策略，
 1. 15分钟超级趋势策略：采用20周期均线、3×ATR结合MACD辅助判断趋势；
    趋势为多时目标仓位：多仓 0.1 ETH、空仓 0.05 ETH；
    趋势反转时，使用市价单平掉与新趋势不符部分（50%），后续分批再平衡至1:1。
-2. 3分钟级下单策略：基于Bollinger Bands %B（周期20、标准差2）判断下单信号，
+2. 3分钟级下单策略：基于 Bollinger Bands %B（周期20、标准差2）判断下单信号，
    当 %B ≤ 0 或 ≥ 1 时，根据最新市场价格下挂多个档位固定限价单。
-3. 止盈止损策略：初始止损按买入价×0.98（多单）/×1.02（空单）设定，并结合3m级Bollinger带宽动态跟踪止损；
+3. 止盈止损策略：初始止损按买入价×0.98（多单）/×1.02（空单）设定，并结合3m级 Bollinger 带宽动态跟踪止损；
    止盈分阶段触发，部分市价平仓，剩余挂限价止盈单。
 4. 风险控制：当日亏损超过账户资金20%或连续亏损≥3次时，触发平仓保护。
 
@@ -20,7 +20,7 @@ ETH/USDT 高频交易引擎 v7.4（基于15m超趋势与3m级BB%B信号策略，
 
 请将 BINANCE_API_KEY 与 BINANCE_SECRET_KEY 设置到环境变量（或直接在代码中填写测试用 API Key），确保您开通相应交易权限（USDT永续合约）。
 
-参考币安更新文档（包括接口错误码、速率限制调整及新接口说明）进行实现。
+本代码参考了 Binance 官方更新文档中关于时间戳、错误码及 dualSidePosition 要求的说明。
 """
 
 import uvloop
@@ -69,6 +69,9 @@ RATE_LIMITS: Dict[str, Tuple[int, int]] = {
     'orders': (300, 10),
     'leverage': (30, 60)
 }
+
+# 设置较大的 recvWindow，以减少因时间不同步造成的问题（单位：毫秒）
+RECV_WINDOW = 10000
 
 # ==================== Prometheus监控 ====================
 start_http_server(8001)
@@ -129,7 +132,7 @@ class BinanceHFTClient:
             ssl=True
         )
         self._init_session()
-        self.recv_window = 6000
+        self.recv_window = RECV_WINDOW  # 使用更大的 recvWindow
         # 限频记录：按接口名称存储请求时间戳
         self.request_timestamps: Dict[str, deque] = defaultdict(lambda: deque(maxlen=RATE_LIMITS['klines'][0] + 200))
         self._time_diff = 0
@@ -169,7 +172,7 @@ class BinanceHFTClient:
         self._time_diff = 0
 
     async def _signed_request(self, method: str, path: str, params: dict) -> dict:
-        # 所有请求均基于 fapi/v1 路径，保证与币安最新文档一致
+        # 所有请求均基于 fapi/v1 路径
         params.update({
             "timestamp": int(time.time() * 1000 + self._time_diff),
             "recvWindow": self.recv_window
@@ -196,7 +199,7 @@ class BinanceHFTClient:
                         text = await resp.text()
                         raise Exception(f"响应内容异常: {text}")
                     data = await resp.json()
-                    # 检查币安错误码（参考更新文档，如 -2039、-2038、-1034 等）
+                    # 检查 Binance 返回错误码（如 -1021 和 -4061）
                     if isinstance(data, dict) and data.get("code", 0) < 0:
                         raise Exception(f"接口错误，ErrorCode: {data.get('code')}, Msg: {data.get('msg')}")
                     return data
@@ -222,7 +225,11 @@ class BinanceHFTClient:
         METRICS['throughput'].inc()
 
     async def manage_leverage(self) -> dict:
-        params = {'symbol': SYMBOL, 'leverage': LEVERAGE, 'dualSidePosition': self.config.dual_side_position}
+        params = {
+            'symbol': SYMBOL,
+            'leverage': LEVERAGE,
+            'dualSidePosition': self.config.dual_side_position
+        }
         return await self._signed_request('POST', '/leverage', params)
 
     async def fetch_klines(self, interval: str, limit: int = 100) -> pd.DataFrame:
@@ -368,7 +375,7 @@ class ETHUSDTStrategy:
     async def rebalance_hedge(self) -> None:
         logger.info("执行仓位再平衡: 调整为1:1")
         # 此处加入查询仓位及下单逻辑
-        # 可参照币安订单查询与取消API行为进行实现
+        # 可根据实际业务调用 Binance 查询订单接口实现
 
     async def analyze_order_signals_3m(self) -> Tuple[Signal, List[Dict[str, Any]]]:
         df = await self.client.fetch_klines(interval='3m', limit=50)
@@ -402,6 +409,8 @@ class ETHUSDTStrategy:
         return Signal(False, 'NONE', 0, 0), []
 
     async def place_dynamic_limit_orders(self, side: str, order_list: List[Dict[str, Any]], trigger_price: float) -> None:
+        # 对于开仓信号，根据 side 设定 positionSide
+        pos_side = "LONG" if side == "BUY" else "SHORT"
         for order in order_list:
             offset = order['offset']
             ratio = order['ratio']
@@ -409,7 +418,7 @@ class ETHUSDTStrategy:
             if order_qty <= 0:
                 logger.error("无效订单数量，跳过当前档")
                 continue
-            limit_price = round(trigger_price * (1 - offset) if side == 'BUY' else trigger_price * (1 + offset), self.config.price_precision)
+            limit_price = round(trigger_price * (1 - offset) if side == "BUY" else trigger_price * (1 + offset), self.config.price_precision)
             if limit_price <= 0:
                 logger.error("无效挂单价格，跳过当前档")
                 continue
@@ -419,7 +428,8 @@ class ETHUSDTStrategy:
                 'type': 'LIMIT',
                 'price': limit_price,
                 'quantity': order_qty,
-                'timeInForce': 'GTC'
+                'timeInForce': 'GTC',
+                'positionSide': pos_side
             }
             try:
                 data = await self.client._signed_request('POST', '/order', params)
@@ -514,6 +524,8 @@ class ETHUSDTStrategy:
             await self.close_position(side='BUY', ratio=1.0)
 
     async def place_take_profit_orders(self, side: str, base_price: float) -> None:
+        # 下市价止盈单时，使用与当前持仓一致的 positionSide
+        pos_side = self.last_trade_side  # LONG 或 SHORT
         tp_offsets = [0.0025, 0.0040, 0.0060, 0.0080, 0.0120]
         remaining_qty = QUANTITY
         qty_each = round(remaining_qty / (len(tp_offsets) + 1), self.config.quantity_precision)
@@ -528,7 +540,8 @@ class ETHUSDTStrategy:
                 'type': 'LIMIT',
                 'price': tp_price,
                 'quantity': qty_each,
-                'timeInForce': 'GTC'
+                'timeInForce': 'GTC',
+                'positionSide': pos_side
             }
             try:
                 data = await self.client._signed_request('POST', '/order', params)
@@ -543,11 +556,14 @@ class ETHUSDTStrategy:
         current_price = df['close'].values[-1]
         price_limit = current_price * (1 + self.config.max_slippage_market) if side == 'BUY' else current_price * (1 - self.config.max_slippage_market)
         logger.info(f"市价平仓请求：side={side}, ratio={ratio}, 价格限制={price_limit:.2f}")
+        # 对于平仓订单，使用当前持仓方向作为 positionSide
+        pos_side = self.last_trade_side
         params = {
             'symbol': SYMBOL,
             'side': side,
             'type': 'MARKET',
-            'quantity': round(QUANTITY * ratio, self.config.quantity_precision)
+            'quantity': round(QUANTITY * ratio, self.config.quantity_precision),
+            'positionSide': pos_side
         }
         if params['quantity'] <= 0 or price_limit <= 0:
             logger.error("无效的订单数量或价格，跳过平仓")
