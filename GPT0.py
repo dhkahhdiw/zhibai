@@ -60,26 +60,26 @@ SYMBOL = 'ETHUSDT'
 LEVERAGE = 50
 
 # 目标仓位设置（单位：ETH）【常规目标】
-BULL_LONG_QTY = 0.1  # 趋势为多时，多仓目标
-BULL_SHORT_QTY = 0.0583  # 趋势为多时，空仓目标（1:0.5）
-BEAR_LONG_QTY = 0.0583  # 趋势为空时，多仓目标
-BEAR_SHORT_QTY = 0.1  # 趋势为空时，空仓目标
+BULL_LONG_QTY = 0.56  # 趋势为多时，多仓目标
+BULL_SHORT_QTY = 0.35  # 趋势为多时，空仓目标（1:0.5）
+BEAR_LONG_QTY = 0.35  # 趋势为空时，多仓目标
+BEAR_SHORT_QTY = 0.56  # 趋势为空时，空仓目标
 
 # 震荡市场下仓位目标调整为1:0.3
-BULL_LONG_QTY_SHAKE = 0.1
-BULL_SHORT_QTY_SHAKE = 0.3
-BEAR_LONG_QTY_SHAKE = 0.3
-BEAR_SHORT_QTY_SHAKE = 0.1
+BULL_LONG_QTY_SHAKE = 0.35
+BULL_SHORT_QTY_SHAKE = 0.21
+BEAR_LONG_QTY_SHAKE = 0.21
+BEAR_SHORT_QTY_SHAKE = 0.35
 
 # 仓位上限配置（根据主趋势决定）
 # 当主趋势为多时，多仓上限0.6，空仓上限0.3；趋势为空时反之
-MAX_POS_LONG_TREND_LONG = 0.6
+MAX_POS_LONG_TREND_LONG = 0.56
 MAX_POS_SHORT_TREND_LONG = 0.35
 MAX_POS_LONG_TREND_SHORT = 0.35
-MAX_POS_SHORT_TREND_SHORT = 0.6
+MAX_POS_SHORT_TREND_SHORT = 0.56
 
 # 单笔基础订单数量
-QUANTITY = 0.1
+QUANTITY = 0.07
 
 # REST API 基础URL
 REST_URL = 'https://fapi.binance.com'
@@ -315,8 +315,8 @@ class ETHUSDTStrategy:
         self.current_long: float = 0.0  # 当前持有多仓（ETH）
         self.current_short: float = 0.0  # 当前持有空仓（ETH）
         # 新增仓位上限，根据趋势不同设定
-        self.max_long: float = 0.6
-        self.max_short: float = 0.3
+        self.max_long: float = 0.56
+        self.max_short: float = 0.35
 
     def update_position(self, side: str, qty: float, is_entry: bool) -> None:
         if is_entry:
