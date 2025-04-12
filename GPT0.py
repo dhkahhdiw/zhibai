@@ -1,64 +1,75 @@
 #!/usr/bin/env python3
-# ETH/USDT 高频交易引擎 v8.1 (合规版)
+# ETH/USDT 高频交易引擎 v8.1 (完整修正版)
 import uvloop
 
 uvloop.install()
 
-import os, asyncio, time, hmac, hashlib, urllib.parse, logging, datetime
+import os
+import asyncio
+import time
+import hmac
+import hashlib
+import urllib.parse
+import logging
+import random
 from collections import deque, defaultdict
 from dataclasses import dataclass
 import numpy as np
 import pandas as pd
-from aiohttp import ClientTimeout, TCPConnector, ClientSession
+from aiohttp import ClientTimeout, TCPConnector
 from aiohttp_retry import RetryClient, ExponentialRetry
-import json
-import random
+from dotenv import load_dotenv  # 添加缺失的导入
 
 # ==================== 环境配置 ====================
 ENV_PATH = '/root/zhibai/.env'
-load_dotenv(ENV_PATH)
+load_dotenv(ENV_PATH)  # 现在这行应该能正常工作
 
 API_KEY = os.getenv('BINANCE_API_KEY', '').strip()
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
 SYMBOL = 'ETHUSDT'
-LEVERAGE = 50
+LEVERAGE = 10
 REST_URL = 'https://fapi.binance.com'
 
 
 # ==================== 交易参数 ====================
+@dataclass
 class TradingConfig:
     # 核心参数
-    atr_window = 14
-    ema_fast = 9
-    ema_slow = 21
-    st_period = 20
-    st_multiplier = 3.0
-    bb_period = 20
-    bb_std = 2.0
+    atr_window: int = 14
+    ema_fast: int = 9
+    ema_slow: int = 21
+    st_period: int = 20
+    st_multiplier: float = 3.0
+    bb_period: int = 20
+    bb_std: float = 2.0
 
     # 风险参数
-    max_retries = 5
-    order_timeout = 1.5
-    network_timeout = 3.0
-    price_precision = 2
-    quantity_precision = 3
-    max_slippage = 0.0015
-    daily_drawdown_limit = 0.20
+    max_retries: int = 5
+    order_timeout: float = 1.5
+    network_timeout: float = 3.0
+    price_precision: int = 2
+    quantity_precision: int = 3
+    max_slippage: float = 0.0015
+    daily_drawdown_limit: float = 0.20
 
     # 高频参数
-    rate_limits = {
-        'klines': (60, 5),
-        'order': (300, 10),
-        'openOrders': (60, 60)
-    }
+    rate_limits: dict = None  # 将在__post_init__中初始化
 
     # 网络优化
-    tcp_params = {
-        'limit': 1000,
-        'ttl_dns_cache': 300,
-        'force_close': True,
-        'use_dns_cache': True
-    }
+    tcp_params: dict = None
+
+    def __post_init__(self):
+        self.rate_limits = {
+            'klines': (60, 5),
+            'order': (300, 10),
+            'openOrders': (60, 60)
+        }
+        self.tcp_params = {
+            'limit': 1000,
+            'ttl_dns_cache': 300,
+            'force_close': True,
+            'use_dns_cache': True
+        }
 
 
 # ==================== 核心引擎 ====================
@@ -355,6 +366,16 @@ class AlphaStrategy:
 
 # ==================== 主程序 ====================
 async def main():
+    # 初始化日志
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[
+            logging.FileHandler('hft.log'),
+            logging.StreamHandler()
+        ]
+    )
+
     # 初始化引擎
     config = TradingConfig()
     engine = BinanceHFEngine(config)
@@ -367,14 +388,12 @@ async def main():
 
         # 启动策略
         await strategy.execute_strategy()
+    except KeyboardInterrupt:
+        logging.info("收到终止信号，正在优雅退出...")
     finally:
         await engine.session.close()
+        logging.info("引擎已关闭")
 
 
 if __name__ == '__main__':
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(message)s',
-        handlers=[logging.FileHandler('hft.log'), logging.StreamHandler()]
-    )
     asyncio.run(main())
