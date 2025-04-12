@@ -61,8 +61,8 @@ LEVERAGE = 50
 
 # 目标仓位设置（单位：ETH）【常规目标】
 BULL_LONG_QTY = 0.1  # 趋势为多时，多仓目标
-BULL_SHORT_QTY = 0.583  # 趋势为多时，空仓目标（1:0.5）
-BEAR_LONG_QTY = 0.583  # 趋势为空时，多仓目标
+BULL_SHORT_QTY = 0.0583  # 趋势为多时，空仓目标（1:0.5）
+BEAR_LONG_QTY = 0.0583  # 趋势为空时，多仓目标
 BEAR_SHORT_QTY = 0.1  # 趋势为空时，空仓目标
 
 # 震荡市场下仓位目标调整为1:0.3
