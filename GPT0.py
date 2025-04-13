@@ -13,13 +13,10 @@ ETH/USDT 高频交易引擎 v7.4
        • 下穿（由正转负）：若离轴值在 (-20, -11] 下单市价 BUY 订单 0.07 ETH；离轴值 ≤ -20 下单 0.14 ETH
    - 固定止损：多单止损 = 成交价×0.96，空单止损 = 成交价×1.04
 
-【下单信号轮流触发机制】
-   - 当原策略下单信号触发后，只允许触发单笔订单；若上次下单方向为 BUY，则连续相同方向的信号将被忽略，
-     必须等待方向改变后才能触发下单。
-
-【优化目标】
-   - 增强各信号响应频率和速度，特别是止盈和买入信号的响应；
-   - 下单信号检测间隔修改为1秒，以便更及时捕捉信号。
+【下单信号轮流触发机制优化】
+   - 当原策略下单信号触发时，只允许下单一次。若上次下单方向为 BUY，则后续连续同向信号（BUY）直接忽略，
+     只有当信号方向发生变化后（例如变为 SELL）才允许下单。
+   - 此外，增加订单冷却期（例如3秒）以避免同一信号反复触发。
 
 适配环境：Vultr high frequency (vhf-1c-1gb ubuntu22.04)
 要求：
@@ -58,7 +55,7 @@ SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
 SYMBOL     = 'ETHUSDT'
 LEVERAGE   = 50
 
-# 原策略仓位目标
+# 原策略仓位目标（单位ETH）
 BULL_LONG_QTY  = 0.56
 BULL_SHORT_QTY = 0.35
 BEAR_LONG_QTY  = 0.35
@@ -77,7 +74,7 @@ MAX_POS_SHORT_TREND_SHORT = 0.64
 # 单笔基础订单数量
 QUANTITY = 0.07
 
-# 新增MACD策略订单大小（固定值）
+# 新增MACD策略订单大小（固定）
 MACD_SMALL_ORDER = 0.07
 MACD_BIG_ORDER   = 0.14
 
@@ -135,10 +132,13 @@ class TradingConfig:
     max_position: float = 10.0
     slippage: float = 0.001
     dual_side_position: str = "true"
-    # 下单信号检测间隔设为1秒以增强响应
+    # 下单信号检测间隔设为1秒
     order_adjust_interval: float = 1.0
     max_slippage_market: float = 0.0015
     daily_drawdown_limit: float = 0.20
+
+# 定义订单冷却期（单位秒），保证同方向只触发一次
+COOLDOWN_SECONDS = 3
 
 class BinanceHFTClient:
     def __init__(self) -> None:
@@ -286,6 +286,7 @@ class ETHUSDTStrategy:
         self._indicator_cache = defaultdict(lambda: None)
         self.last_trade_side: str = None      # 原策略主趋势
         self.last_triggered_side: str = None    # 用于轮流触发，下单后记录方向
+        self.last_order_time: float = 0         # 新增：记录上次下单时间，用于冷却
         self.entry_price: float = None
         self.hard_stop: float = None
         self.trailing_stop: float = None
@@ -350,7 +351,7 @@ class ETHUSDTStrategy:
             return 'LONG'
         close = df['close'].values.astype(np.float64)
         high = df['high'].values.astype(np.float64)
-        low  = df['low'].values.astype(np.float64)
+        low = df['low'].values.astype(np.float64)
         atr = self._vectorized_atr(high, low, close, period=self.config.st_period)
         last_atr = atr[-1]
         hl2 = (df['high'] + df['low']) / 2
@@ -483,6 +484,10 @@ class ETHUSDTStrategy:
             if self.last_triggered_side is not None and self.last_triggered_side.upper() == side.upper():
                 logger.info("[原策略] 同方向信号连续触发，忽略此次下单")
                 return
+            # 增加订单冷却期检查
+            if time.time() - self.last_order_time < COOLDOWN_SECONDS:
+                logger.info(f"[原策略] 冷却期内（{COOLDOWN_SECONDS}s），忽略此次下单")
+                return
         for order in order_list:
             offset = order['offset']
             ratio = order['ratio']
@@ -513,6 +518,7 @@ class ETHUSDTStrategy:
                 self.update_position(side, order_qty, is_entry=True, strategy=strategy)
                 if strategy == "normal":
                     self.last_triggered_side = side.upper()
+                    self.last_order_time = time.time()
             except Exception as e:
                 logger.error(f"[{strategy.upper()}] 下单失败: {e}")
 
@@ -569,6 +575,7 @@ class ETHUSDTStrategy:
             return
         current_price = df['close'].values[-1]
         current_percentb = await self.get_current_percentb()
+        # 提前触发止盈信号以增强响应速度
         if self.last_trade_side == 'LONG':
             if current_percentb >= 0.80 and not self.tp_triggered_30:
                 logger.info("[原策略] 多单止盈信号：市价平30%")
@@ -670,29 +677,29 @@ class ETHUSDTStrategy:
             try:
                 signal, order_list = await self.analyze_order_signals_3m()
                 if signal.action:
-                    # 优化：若上次下单方向与本次信号相同则忽略此次下单
                     if self.last_triggered_side is not None and self.last_triggered_side.upper() == signal.side.upper():
-                        logger.info("[原策略] 信号方向同上次，忽略此次下单")
+                        logger.info("[原策略] 信号方向与上次相同，忽略此次下单")
                     else:
                         if signal.side.upper() == 'BUY':
                             if self.current_long < self.target_long and self.current_long < self.max_long:
                                 await self.place_dynamic_limit_orders(signal.side, order_list, trigger_price=signal.order_details.get("trigger_price"), strategy="normal")
                                 self.last_triggered_side = signal.side.upper()
                             else:
-                                logger.info("[原策略] 多仓已达到目标或上限，暂停买单")
+                                logger.info("[原策略] 多仓达到目标或上限，暂停买单")
                         elif signal.side.upper() == 'SELL':
                             if self.current_short < self.target_short and self.current_short < self.max_short:
                                 await self.place_dynamic_limit_orders(signal.side, order_list, trigger_price=signal.order_details.get("trigger_price"), strategy="normal")
                                 self.last_triggered_side = signal.side.upper()
                             else:
-                                logger.info("[原策略] 空仓已达到目标或上限，暂停卖单")
+                                logger.info("[原策略] 空仓达到目标或上限，暂停卖单")
+                        # 更新订单触发时间
+                        self.last_order_time = time.time()
                 else:
-                    # 无信号时清空记录，保证轮换条件持续
-                    self.last_triggered_side = None
+                    # 保持上一次触发记录不变，直到方向变化
+                    pass
             except Exception as e:
                 logger.error(f"[原策略] 下单信号异常: {e}")
-            # 提高检测频率为1秒
-            await asyncio.sleep(1)
+            await asyncio.sleep(self.config.order_adjust_interval)
 
     async def stop_loss_profit_management_loop(self) -> None:
         while True:
@@ -703,7 +710,7 @@ class ETHUSDTStrategy:
                 logger.error(f"[原策略] 止盈止损异常: {e}")
             await asyncio.sleep(0.5)
 
-    # 新增MACD离轴策略，独立运行，不采用信号轮换
+    # 新增MACD离轴策略（独立运行，不采用信号轮换机制）
     async def macd_strategy_loop(self) -> None:
         while True:
             try:
@@ -717,7 +724,7 @@ class ETHUSDTStrategy:
                 curr_off = 2 * (ema12[-1] - ema26[-1])
                 logger.info(f"[MACD] 当前离轴值: {curr_off:.2f}")
                 if self.prev_macd_off is not None:
-                    if self.prev_macd_off <= 0 and curr_off > 0:
+                    if self.prev_macd_off <= 0 and curr_off > 0:  # 上穿触发空单
                         trigger = curr_off
                         logger.info(f"[MACD] 上穿触发，条件: {trigger:.2f}")
                         if trigger >= 11 and trigger < 20:
@@ -729,11 +736,11 @@ class ETHUSDTStrategy:
                         if order_size > 0:
                             entry_price = close_prices[-1]
                             stop_loss = entry_price * 1.04
-                            logger.info(f"[MACD] 触发空单，下单 {order_size} ETH，止损 {stop_loss:.2f}")
+                            logger.info(f"[MACD] 空单触发，下单 {order_size} ETH，止损 {stop_loss:.2f}")
                             await self.close_position(side='SELL', ratio=order_size / QUANTITY, strategy="macd")
                         else:
                             logger.info("[MACD] 信号条件不足，不下空单")
-                    elif self.prev_macd_off >= 0 and curr_off < 0:
+                    elif self.prev_macd_off >= 0 and curr_off < 0:  # 下穿触发多单
                         trigger = curr_off
                         logger.info(f"[MACD] 下穿触发，条件: {trigger:.2f}")
                         if trigger <= -11 and trigger > -20:
@@ -745,14 +752,14 @@ class ETHUSDTStrategy:
                         if order_size > 0:
                             entry_price = close_prices[-1]
                             stop_loss = entry_price * 0.96
-                            logger.info(f"[MACD] 触发多单，下单 {order_size} ETH，止损 {stop_loss:.2f}")
+                            logger.info(f"[MACD] 多单触发，下单 {order_size} ETH，止损 {stop_loss:.2f}")
                             await self.close_position(side='BUY', ratio=order_size / QUANTITY, strategy="macd")
                         else:
                             logger.info("[MACD] 信号条件不足，不下多单")
                 self.prev_macd_off = curr_off
             except Exception as e:
                 logger.error(f"[MACD] 策略异常: {e}")
-            await asyncio.sleep(60*15)
+            await asyncio.sleep(60 * 15)
 
     async def execute(self) -> None:
         await self.client.sync_server_time()
