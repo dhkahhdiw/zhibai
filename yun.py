@@ -19,7 +19,7 @@ ETH/USDC 高频交易引擎 v7.4（优化版）
 【四】信号轮换：连续同向信号忽略，下单后冷却3秒，首次强信号允许触发。
 【五】保留15m MACD策略：当15m MACD由正转负或负转正时，实时市价平仓（依据实时仓位）。
 【六】仓位控制：
-  - 依赖实时 /fapi/v2/positionRisk 接口同步仓位数据，作为止盈、止损及仓位封控依据；
+  - 依赖实时 /dapi/v1/positionRisk 接口同步仓位数据，作为止盈、止损及仓位封控依据；
   - 趋势为上升时，多仓上限为0.49 ETH，空仓上限为0.35 ETH；趋势为下降时，多仓上限为0.35 ETH，空仓上限为0.49 ETH；超出部分触发平仓。
 """
 
@@ -61,7 +61,6 @@ STRONG_SIZE_DIFF  = 0.07
 WEAK_SIZE_SAME    = 0.03
 WEAK_SIZE_DIFF    = 0.015
 
-# 挂单方案（价格偏移及比例）
 def get_entry_order_list(strong: bool) -> List[Dict[str, Any]]:
     if strong:
         return [{'offset': 0.0025, 'ratio': 0.20},
@@ -122,12 +121,14 @@ class TradingConfig:
     price_precision: int = 2
     quantity_precision: int = 3
     order_adjust_interval: float = 1.0  # 每秒检测下单信号
-    dual_side_position: str = "true"    # 新增：默认开启双边持仓
+    dual_side_position: str = "true"
 
 # ------------------- Binance API 客户端 -------------------
 class BinanceHFTClient:
     def __init__(self) -> None:
         self.config = TradingConfig()
+        # 针对币本位（USDC）合约使用 dapi 地址
+        self.base_url = "https://dapi.binance.com"
         self.connector = TCPConnector(limit=512, resolver=AsyncResolver(), ttl_dns_cache=300, force_close=True, ssl=True)
         self._init_session()
         self.recv_window = RECV_WINDOW
@@ -146,7 +147,7 @@ class BinanceHFTClient:
                                     timeout=ClientTimeout(total=self.config.network_timeout, sock_connect=self.config.order_timeout))
 
     async def sync_server_time(self) -> None:
-        url = "https://fapi.binance.com/fapi/v1/time"
+        url = f"{self.base_url}/dapi/v1/time"
         for retry in range(5):
             try:
                 async with self.session.get(url, headers={"Accept": "application/json"}) as resp:
@@ -171,7 +172,8 @@ class BinanceHFTClient:
         sorted_params = sorted(params.items())
         query = urllib.parse.urlencode(sorted_params, doseq=True)
         signature = hmac.new(SECRET_KEY.encode('utf-8'), query.encode('utf-8'), hashlib.sha256).hexdigest()
-        url = f"https://fapi.binance.com/fapi/v1{path}?{query}&signature={signature}"
+        # 拼接为币本位接口地址：例如 /dapi/v1/klines, /dapi/v1/leverage, /dapi/v1/positionRisk 等
+        url = f"{self.base_url}/dapi/v1{path}?{query}&signature={signature}"
         headers = {"X-MBX-APIKEY": API_KEY, "Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"}
         logger.debug(f"请求: {url.split('?')[0]} 参数: {sorted_params}")
         for attempt in range(self.config.max_retries + 1):
@@ -180,7 +182,9 @@ class BinanceHFTClient:
                 await self._rate_limit_check(endpoint)
                 async with self.session.request(method, url, headers=headers) as resp:
                     if resp.status != 200:
-                        raise Exception(f"HTTP {resp.status} 返回: {await resp.text()}")
+                        err_text = await resp.text()
+                        logger.error(f"[请求失败] URL: {url}")
+                        raise Exception(f"HTTP {resp.status} 返回: {err_text}")
                     if "application/json" not in resp.headers.get("Content-Type", ""):
                         raise Exception(f"响应异常: {await resp.text()}")
                     data = await resp.json()
