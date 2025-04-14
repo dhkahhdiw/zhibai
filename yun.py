@@ -61,7 +61,7 @@ STRONG_SIZE_DIFF  = 0.07
 WEAK_SIZE_SAME    = 0.03
 WEAK_SIZE_DIFF    = 0.015
 
-# 下单挂单方案
+# 下单挂单方案：返回挂单偏移及比例
 def get_entry_order_list(strong: bool) -> List[Dict[str, Any]]:
     if strong:
         return [
@@ -133,6 +133,7 @@ class TradingConfig:
     price_precision: int = 2
     quantity_precision: int = 3
     order_adjust_interval: float = 1.0  # 每秒检测下单信号
+    dual_side_position: bool = False    # 添加此属性，根据需求可修改为 True
 
 # ------------------- Binance API 客户端 -------------------
 class BinanceHFTClient:
@@ -276,15 +277,14 @@ class ETHUSDCStrategy:
         close = df['close'].astype(float)
         high = df['high'].astype(float)
         low = df['low'].astype(float)
-        # 计算 ATR
         tr = np.maximum.reduce([
             high.diff().abs(),
             (high - close.shift()).abs(),
             (low - close.shift()).abs()
         ])
+        # 将计算得到的 ATR 转换成 pd.Series 再取最后一个值
         atr = pd.Series(tr).rolling(window=self.config.st_period).mean().iloc[-1]
         hl2 = (high + low) / 2
-        # 使用最后一个值作为参考
         last_hl2 = hl2.iloc[-1]
         basic_upper_val = last_hl2 + self.config.st_multiplier * atr
         basic_lower_val = last_hl2 - self.config.st_multiplier * atr
@@ -457,7 +457,7 @@ class ETHUSDCStrategy:
                 sma = df['close'].astype(float).rolling(window=self.config.bb_period).mean().iloc[-1]
                 std = df['close'].astype(float).rolling(window=self.config.bb_period).std().iloc[-1]
                 band_width = (sma + self.config.bb_std * std) - (sma - self.config.bb_std * std)
-                dynamic_stop = (latest - band_width * 0.5) if self.last_trade_side=='LONG' else (latest + band_width * 0.5)
+                dynamic_stop = (latest - band_width * 0.5) if self.last_trade_side == 'LONG' else (latest + band_width * 0.5)
                 logger.info(f"[止盈止损] 当前价={latest:.2f}, 动态止损={dynamic_stop:.2f}")
                 if self.last_trade_side == 'LONG' and latest < dynamic_stop:
                     logger.info("[止损] 多单止损触发")
