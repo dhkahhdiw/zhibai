@@ -19,8 +19,8 @@ ETH/USDC 高频交易引擎 v7.4（优化版）
 【四】信号轮换：连续同向信号忽略，下单后冷却3秒，特殊情况下首次强信号允许下单。
 【五】保留15m MACD策略，用于在趋势反转时市价平仓。
 【六】仓位控制：
-  - 增强实时仓位同步，通过/fapi/v2/positionRisk获得仓位数据，用于指导平仓和仓位控制；
-  - 趋势上升时多仓上限0.49 ETH、空仓上限0.35 ETH；趋势下降时多仓0.35 ETH、空仓0.49 ETH；超出部分及时平仓。
+  - 增强实时仓位同步，通过 /fapi/v2/positionRisk 获取仓位数据，用于指导平仓和仓位控制；
+  - 趋势上升时多仓上限 0.49 ETH、空仓上限 0.35 ETH；趋势下降时多仓 0.35 ETH、空仓 0.49 ETH；超出部分及时平仓。
 """
 
 import uvloop
@@ -49,19 +49,19 @@ SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
 SYMBOL     = 'ETHUSDC'
 LEVERAGE   = 50
 
-# 仓位控制目标（后续趋势中更新）
+# 仓位控制目标
 BULL_LONG_LIMIT  = 0.49
 BULL_SHORT_LIMIT = 0.35
 BEAR_LONG_LIMIT  = 0.35
 BEAR_SHORT_LIMIT = 0.49
 
-# 订单基础规模（根据信号与趋势方向决定）
+# 订单基础规模
 STRONG_SIZE_SAME  = 0.12
 STRONG_SIZE_DIFF  = 0.07
 WEAK_SIZE_SAME    = 0.03
 WEAK_SIZE_DIFF    = 0.015
 
-# 下单挂单方案：返回挂单偏移及比例
+# 下单挂单方案
 def get_entry_order_list(strong: bool) -> List[Dict[str, Any]]:
     if strong:
         return [
@@ -92,7 +92,7 @@ def get_tp_order_list(strong: bool) -> List[Dict[str, Any]]:
             {'offset': 0.0110, 'ratio': 0.50},
         ]
 
-# 交易及限频相关配置
+# 交易及限频配置
 RECV_WINDOW = 10000
 MIN_NOTIONAL = 20.0
 COOLDOWN_SECONDS = 3
@@ -237,7 +237,6 @@ class BinanceHFTClient:
         return df
 
     async def fetch_position(self) -> Dict[str, float]:
-        """通过 /fapi/v2/positionRisk 获取实时仓位数据；返回{'long': 数量, 'short': 数量}"""
         params = {'symbol': SYMBOL}
         data = await self._signed_request('GET', '/positionRisk', params)
         for pos in data:
@@ -257,17 +256,14 @@ class ETHUSDCStrategy:
     def __init__(self, client: BinanceHFTClient) -> None:
         self.client = client
         self.config = TradingConfig()
-        self.last_trade_side: str = None    # 当前趋势方向，'LONG'或'SHORT'
-        self.last_triggered_side: str = None  # 上次下单方向，用于冷却判断
-        self.last_order_time: float = 0       # 下单时间，用于冷却判断
-        self.entry_price: float = None        # 上次入场价格
-        # 实时仓位（由实时更新同步）
+        self.last_trade_side: str = None
+        self.last_triggered_side: str = None
+        self.last_order_time: float = 0
+        self.entry_price: float = None
         self.current_long: float = 0.0
         self.current_short: float = 0.0
-        # 趋势下单控制上限
         self.max_long: float = 0.0
         self.max_short: float = 0.0
-        # 用于15m MACD策略平仓：保留原3m仓位数据
         self.macd_long: float = 0.0
         self.macd_short: float = 0.0
         self.prev_macd_off: float = None
@@ -280,7 +276,7 @@ class ETHUSDCStrategy:
         close = df['close'].astype(float)
         high = df['high'].astype(float)
         low = df['low'].astype(float)
-        # 计算ATR：将 numpy 数组转换为 pd.Series 才能使用 rolling
+        # 计算 ATR
         tr = np.maximum.reduce([
             high.diff().abs(),
             (high - close.shift()).abs(),
@@ -288,13 +284,15 @@ class ETHUSDCStrategy:
         ])
         atr = pd.Series(tr).rolling(window=self.config.st_period).mean().iloc[-1]
         hl2 = (high + low) / 2
-        basic_upper = hl2 + self.config.st_multiplier * atr
-        basic_lower = hl2 - self.config.st_multiplier * atr
+        # 使用最后一个值作为参考
+        last_hl2 = hl2.iloc[-1]
+        basic_upper_val = last_hl2 + self.config.st_multiplier * atr
+        basic_lower_val = last_hl2 - self.config.st_multiplier * atr
 
         latest = close.iloc[-1]
-        if latest > basic_upper:
+        if latest > basic_upper_val:
             return 'LONG'
-        elif latest < basic_lower:
+        elif latest < basic_lower_val:
             return 'SHORT'
         else:
             ema_fast = close.ewm(span=self.config.macd_fast, adjust=False).mean()
@@ -304,12 +302,6 @@ class ETHUSDCStrategy:
 
     # ------------------ 信号强弱判断 ------------------
     async def get_hourly_strength(self, side: str) -> bool:
-        """
-        利用1h布林带%B(20,2)判断信号强弱：
-         - 对于BUY信号，若%B < 0.2则为强信号；
-         - 对于SELL信号，若%B > 0.8则为强信号；
-         返回True表示强信号，否则为弱信号。
-        """
         df = await self.client.fetch_klines(interval='1h', limit=50)
         if df.empty:
             return False
@@ -318,7 +310,7 @@ class ETHUSDCStrategy:
         std = close.rolling(window=self.config.bb_period).std()
         upper = sma + self.config.bb_std * std
         lower = sma - self.config.bb_std * std
-        percent_b = (close.iloc[-1] - lower.iloc[-1]) / (upper.iloc[-1] - lower.iloc[-1]) if (upper.iloc[-1]-lower.iloc[-1])>0 else 0.5
+        percent_b = (close.iloc[-1] - lower.iloc[-1]) / (upper.iloc[-1] - lower.iloc[-1]) if (upper.iloc[-1]-lower.iloc[-1]) > 0 else 0.5
         logger.info(f"[1h%B] {side.upper()}信号: {percent_b:.3f}")
         if side.upper() == 'BUY':
             return percent_b < 0.2
@@ -336,7 +328,7 @@ class ETHUSDCStrategy:
         std = close.rolling(window=self.config.bb_period).std()
         upper = sma + self.config.bb_std * std
         lower = sma - self.config.bb_std * std
-        percent_b = (close.iloc[-1] - lower.iloc[-1]) / (upper.iloc[-1]-lower.iloc[-1]) if (upper.iloc[-1]-lower.iloc[-1])>0 else 0.5
+        percent_b = (close.iloc[-1] - lower.iloc[-1]) / (upper.iloc[-1] - lower.iloc[-1]) if (upper.iloc[-1]-lower.iloc[-1]) > 0 else 0.5
         logger.info(f"[3m%B] 当前 %B: {percent_b:.3f}")
         if percent_b <= 0:
             return Signal(True, 'BUY', {'trigger_price': close.iloc[-1]}), {}
