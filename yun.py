@@ -293,9 +293,9 @@ class ETHUSDCStrategy:
 
         # 以简单逻辑：若最新价高于basic_upper，则趋势LONG；低于basic_lower，则趋势SHORT；否则借MACD判断
         latest = close.iloc[-1]
-        if latest > basic_upper:
+        if latest > basic_upper.iloc[-1]:
             return 'LONG'
-        elif latest < basic_lower:
+        elif latest < basic_lower.iloc[-1]:
             return 'SHORT'
         else:
             ema_fast = close.ewm(span=self.config.macd_fast, adjust=False).mean()
