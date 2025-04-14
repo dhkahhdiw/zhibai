@@ -133,8 +133,6 @@ class TradingConfig:
     price_precision: int = 2
     quantity_precision: int = 3
     order_adjust_interval: float = 1.0  # 每秒检测下单信号
-    # 新增 dual_side_position 字段，默认为 True
-    dual_side_position: bool = True
 
 # ------------------- Binance API 客户端 -------------------
 class BinanceHFTClient:
@@ -282,12 +280,12 @@ class ETHUSDCStrategy:
         close = df['close'].astype(float)
         high = df['high'].astype(float)
         low = df['low'].astype(float)
-        # 计算ATR：拼接多组数据，按行取最大值返回Series，便于后续调用rolling()
-        tr = pd.concat([
+        # 计算ATR
+        tr = np.maximum.reduce([
             high.diff().abs(),
             (high - close.shift()).abs(),
             (low - close.shift()).abs()
-        ], axis=1).max(axis=1)
+        ])
         atr = tr.rolling(window=self.config.st_period).mean().iloc[-1]
         hl2 = (high + low) / 2
         basic_upper = hl2 + self.config.st_multiplier * atr
@@ -295,9 +293,9 @@ class ETHUSDCStrategy:
 
         # 以简单逻辑：若最新价高于basic_upper，则趋势LONG；低于basic_lower，则趋势SHORT；否则借MACD判断
         latest = close.iloc[-1]
-        if latest > basic_upper.iloc[-1]:
+        if latest > basic_upper:
             return 'LONG'
-        elif latest < basic_lower.iloc[-1]:
+        elif latest < basic_lower:
             return 'SHORT'
         else:
             ema_fast = close.ewm(span=self.config.macd_fast, adjust=False).mean()
