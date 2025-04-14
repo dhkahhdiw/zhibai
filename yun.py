@@ -133,6 +133,8 @@ class TradingConfig:
     price_precision: int = 2
     quantity_precision: int = 3
     order_adjust_interval: float = 1.0  # 每秒检测下单信号
+    # 新增 dual_side_position 字段，默认为 True
+    dual_side_position: bool = True
 
 # ------------------- Binance API 客户端 -------------------
 class BinanceHFTClient:
