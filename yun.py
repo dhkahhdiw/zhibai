@@ -133,7 +133,7 @@ class TradingConfig:
     price_precision: int = 2
     quantity_precision: int = 3
     order_adjust_interval: float = 1.0  # 每秒检测下单信号
-    dual_side_position: bool = False    # 添加此属性，根据需求可修改为 True
+    dual_side_position: bool = False    # 针对 USDC 合约不支持双向持仓参数
 
 # ------------------- Binance API 客户端 -------------------
 class BinanceHFTClient:
@@ -220,7 +220,8 @@ class BinanceHFTClient:
         METRICS['throughput'].inc()
 
     async def manage_leverage(self) -> dict:
-        params = {'symbol': SYMBOL, 'leverage': LEVERAGE, 'dualSidePosition': self.config.dual_side_position}
+        # 对于 USDC-margined 合约，移除 dualSidePosition 参数
+        params = {'symbol': SYMBOL, 'leverage': LEVERAGE}
         return await self._signed_request('POST', '/leverage', params)
 
     async def fetch_klines(self, interval: str, limit: int = 100) -> pd.DataFrame:
@@ -282,7 +283,6 @@ class ETHUSDCStrategy:
             (high - close.shift()).abs(),
             (low - close.shift()).abs()
         ])
-        # 将计算得到的 ATR 转换成 pd.Series 再取最后一个值
         atr = pd.Series(tr).rolling(window=self.config.st_period).mean().iloc[-1]
         hl2 = (high + low) / 2
         last_hl2 = hl2.iloc[-1]
