@@ -280,12 +280,12 @@ class ETHUSDCStrategy:
         close = df['close'].astype(float)
         high = df['high'].astype(float)
         low = df['low'].astype(float)
-        # 计算ATR
-        tr = np.maximum.reduce([
+        # 计算ATR：拼接多组数据，按行取最大值返回Series，便于后续调用rolling()
+        tr = pd.concat([
             high.diff().abs(),
             (high - close.shift()).abs(),
             (low - close.shift()).abs()
-        ])
+        ], axis=1).max(axis=1)
         atr = tr.rolling(window=self.config.st_period).mean().iloc[-1]
         hl2 = (high + low) / 2
         basic_upper = hl2 + self.config.st_multiplier * atr
