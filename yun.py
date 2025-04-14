@@ -120,14 +120,14 @@ class TradingConfig:
     network_timeout: float = 5.0
     price_precision: int = 2
     quantity_precision: int = 3
-    order_adjust_interval: float = 1.0  # 每秒检测下单信号
+    order_adjust_interval: float = 1.0
     dual_side_position: str = "true"
 
 # ------------------- Binance API 客户端 -------------------
 class BinanceHFTClient:
     def __init__(self) -> None:
         self.config = TradingConfig()
-        # 针对币本位（USDC）合约使用 dapi 地址
+        # USDC币本位合约使用 dapi 地址
         self.base_url = "https://dapi.binance.com"
         self.connector = TCPConnector(limit=512, resolver=AsyncResolver(), ttl_dns_cache=300, force_close=True, ssl=True)
         self._init_session()
@@ -167,12 +167,10 @@ class BinanceHFTClient:
 
     async def _signed_request(self, method: str, path: str, params: dict) -> dict:
         params.update({"timestamp": int(time.time() * 1000 + self._time_diff), "recvWindow": self.recv_window})
-        if params.get("symbol", "") == SYMBOL:
-            params["marginCoin"] = "USDC"
+        # 对于币本位USDC接口，不需要额外添加marginCoin参数
         sorted_params = sorted(params.items())
         query = urllib.parse.urlencode(sorted_params, doseq=True)
         signature = hmac.new(SECRET_KEY.encode('utf-8'), query.encode('utf-8'), hashlib.sha256).hexdigest()
-        # 拼接为币本位接口地址：例如 /dapi/v1/klines, /dapi/v1/leverage, /dapi/v1/positionRisk 等
         url = f"{self.base_url}/dapi/v1{path}?{query}&signature={signature}"
         headers = {"X-MBX-APIKEY": API_KEY, "Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"}
         logger.debug(f"请求: {url.split('?')[0]} 参数: {sorted_params}")
@@ -243,14 +241,14 @@ class BinanceHFTClient:
 @dataclass
 class Signal:
     action: bool
-    side: str  # 'BUY' 或 'SELL'
+    side: str
     order_details: dict = None
 
 class ETHUSDCStrategy:
     def __init__(self, client: BinanceHFTClient) -> None:
         self.client = client
         self.config = TradingConfig()
-        self.last_trade_side: str = None  # 'LONG' 或 'SHORT'
+        self.last_trade_side: str = None
         self.last_triggered_side: str = None
         self.last_order_time: float = 0
         self.entry_price: float = None
