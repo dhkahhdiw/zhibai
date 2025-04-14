@@ -19,8 +19,8 @@ ETH/USDC 高频交易引擎 v7.4（优化版）
 【四】信号轮换：连续同向信号忽略，下单后冷却3秒，特殊情况下首次强信号允许下单。
 【五】保留15m MACD策略，用于在趋势反转时市价平仓。
 【六】仓位控制：
-  - 增强实时仓位同步，通过 /fapi/v2/positionRisk 获取仓位数据，用于指导平仓和仓位控制；
-  - 趋势上升时多仓上限 0.49 ETH、空仓上限 0.35 ETH；趋势下降时多仓 0.35 ETH、空仓 0.49 ETH；超出部分及时平仓。
+  - 增强本地仓位记录，通过买入卖出时在程序中累计仓位，以此作为15m MACD策略平仓仓位控制及动态感知仓位变化的依据。
+  - 策略中需要平仓的数量来源均采用本地记录，不再从币安获取实时仓位数据。
 """
 
 import uvloop
@@ -49,7 +49,7 @@ SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
 SYMBOL     = 'ETHUSDC'
 LEVERAGE   = 50
 
-# 仓位控制目标
+# 仓位控制目标（未使用，目前仅参考，本地记录为准）
 BULL_LONG_LIMIT  = 0.49
 BULL_SHORT_LIMIT = 0.35
 BEAR_LONG_LIMIT  = 0.35
@@ -61,7 +61,7 @@ STRONG_SIZE_DIFF  = 0.07
 WEAK_SIZE_SAME    = 0.03
 WEAK_SIZE_DIFF    = 0.015
 
-# 下单挂单方案：返回挂单偏移及比例
+# 下单挂单方案
 def get_entry_order_list(strong: bool) -> List[Dict[str, Any]]:
     if strong:
         return [
@@ -133,7 +133,7 @@ class TradingConfig:
     price_precision: int = 2
     quantity_precision: int = 3
     order_adjust_interval: float = 1.0  # 每秒检测下单信号
-    dual_side_position: bool = False    # 针对 USDC 合约不支持双向持仓参数
+    dual_side_position: bool = False    # 针对 USDC 合约参数，实际不传此参数
 
 # ------------------- Binance API 客户端 -------------------
 class BinanceHFTClient:
@@ -220,7 +220,7 @@ class BinanceHFTClient:
         METRICS['throughput'].inc()
 
     async def manage_leverage(self) -> dict:
-        # 对于 USDC-margined 合约，移除 dualSidePosition 参数
+        # 对于 USDC 合约，移除 dualSidePosition 参数
         params = {'symbol': SYMBOL, 'leverage': LEVERAGE}
         return await self._signed_request('POST', '/leverage', params)
 
@@ -238,15 +238,6 @@ class BinanceHFTClient:
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
 
-    async def fetch_position(self) -> Dict[str, float]:
-        params = {'symbol': SYMBOL}
-        data = await self._signed_request('GET', '/positionRisk', params)
-        for pos in data:
-            if pos.get("symbol") == SYMBOL:
-                pos_amt = float(pos.get("positionAmt", "0"))
-                return {'long': pos_amt if pos_amt > 0 else 0, 'short': -pos_amt if pos_amt < 0 else 0}
-        return {'long': 0, 'short': 0}
-
 # ------------------- 策略模块 -------------------
 @dataclass
 class Signal:
@@ -258,17 +249,33 @@ class ETHUSDCStrategy:
     def __init__(self, client: BinanceHFTClient) -> None:
         self.client = client
         self.config = TradingConfig()
-        self.last_trade_side: str = None
-        self.last_triggered_side: str = None
-        self.last_order_time: float = 0
-        self.entry_price: float = None
+        self.last_trade_side: str = None     # 当前趋势方向： 'LONG' 或 'SHORT'
+        self.last_triggered_side: str = None   # 上次下单方向，用于冷却判断
+        self.last_order_time: float = 0        # 上次下单时间，用于冷却判断
+        self.entry_price: float = None         # 上次入场价格
+        # 本地仓位记录：以入场订单更新（单位：ETH）
         self.current_long: float = 0.0
         self.current_short: float = 0.0
-        self.max_long: float = 0.0
-        self.max_short: float = 0.0
-        self.macd_long: float = 0.0
-        self.macd_short: float = 0.0
         self.prev_macd_off: float = None
+
+    def update_local_position(self, side: str, quantity: float, closing: bool = False) -> None:
+        """
+        更新本地仓位记录
+        :param side: 'BUY' 表示增加多仓或平空；'SELL' 表示增加空仓或平多
+        :param quantity: 下单数量
+        :param closing: 是否为平仓订单
+        """
+        if closing:
+            if side.upper() == 'BUY':  # 平空仓
+                self.current_short = max(0, self.current_short - quantity)
+            elif side.upper() == 'SELL':  # 平多仓
+                self.current_long = max(0, self.current_long - quantity)
+        else:
+            if side.upper() == 'BUY':
+                self.current_long += quantity
+            elif side.upper() == 'SELL':
+                self.current_short += quantity
+        logger.info(f"[本地仓位更新] 多仓: {self.current_long:.4f} ETH，空仓: {self.current_short:.4f} ETH")
 
     # ------------------ 趋势判断 ------------------
     async def analyze_trend_15m(self) -> str:
@@ -336,21 +343,6 @@ class ETHUSDCStrategy:
             return Signal(True, 'SELL', {'trigger_price': close.iloc[-1]}), {}
         return Signal(False, 'NONE'), {}
 
-    # ------------------ 实时仓位同步 ------------------
-    async def update_positions_from_exchange(self) -> None:
-        try:
-            pos = await self.client.fetch_position()
-            self.current_long = pos.get('long', 0)
-            self.current_short = pos.get('short', 0)
-            logger.info(f"[仓位同步] 多仓：{self.current_long:.4f} ETH，空仓：{self.current_short:.4f} ETH")
-        except Exception as e:
-            logger.error(f"[仓位同步] 获取异常：{e}")
-
-    async def position_update_loop(self) -> None:
-        while True:
-            await self.update_positions_from_exchange()
-            await asyncio.sleep(10)
-
     # ------------------ 挂单下单及止盈止损 ------------------
     async def place_dynamic_limit_orders(self, side: str, order_list: List[Dict[str, Any]], trigger_price: float, order_size: float) -> None:
         pos_side = "LONG" if side == "BUY" else "SHORT"
@@ -375,6 +367,8 @@ class ETHUSDCStrategy:
             try:
                 data = await self.client._signed_request('POST', '/order', params)
                 logger.info(f"[下单] {side} @ {limit_price}，数量: {qty}，偏移: {offset*100:.2f}% 成功，返回: {data}")
+                # 假设入场订单成功后立即按全量成交，更新本地仓位
+                self.update_local_position(side, qty, closing=False)
             except Exception as e:
                 logger.error(f"[下单] {side}挂单失败：{e}")
 
@@ -397,8 +391,24 @@ class ETHUSDCStrategy:
         try:
             data = await self.client._signed_request('POST', '/order', params)
             logger.info(f"[平仓] 市价平仓 {side}，数量: {order_qty}，返回: {data}")
+            # 平仓成功后更新本地仓位（closing=True 表示平仓操作）
+            self.update_local_position(side, order_qty, closing=True)
         except Exception as e:
             logger.error(f"[平仓] 失败: {e}")
+
+    # ------------------ 本地仓位记录更新 ------------------
+    def update_local_position(self, side: str, quantity: float, closing: bool = False) -> None:
+        if closing:
+            if side.upper() == 'BUY':  # 平空仓
+                self.current_short = max(0, self.current_short - quantity)
+            elif side.upper() == 'SELL':  # 平多仓
+                self.current_long = max(0, self.current_long - quantity)
+        else:
+            if side.upper() == 'BUY':
+                self.current_long += quantity
+            elif side.upper() == 'SELL':
+                self.current_short += quantity
+        logger.info(f"[本地仓位更新] 多仓: {self.current_long:.4f} ETH，空仓: {self.current_short:.4f} ETH")
 
     # ------------------ 趋势封控 ------------------
     async def trend_control_loop(self) -> None:
@@ -440,6 +450,8 @@ class ETHUSDCStrategy:
                     await self.place_dynamic_limit_orders(signal.side, orders, trigger_price=self.entry_price, order_size=order_size)
                     self.last_triggered_side = signal.side.upper()
                     self.last_order_time = time.time()
+                    # 更新当前交易趋势
+                    self.last_trade_side = 'LONG' if signal.side.upper() == 'BUY' else 'SHORT'
                 await asyncio.sleep(self.config.order_adjust_interval)
             except Exception as e:
                 logger.error(f"[信号下单] 异常: {e}")
@@ -503,8 +515,7 @@ class ETHUSDCStrategy:
             self.order_signal_loop(),
             self.stop_loss_profit_management_loop(),
             self.macd_strategy_loop(),
-            self.trend_control_loop(),
-            self.position_update_loop()
+            self.trend_control_loop()
         )
 
 # ------------------- 主函数 -------------------
