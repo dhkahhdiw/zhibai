@@ -1,37 +1,46 @@
 #!/usr/bin/env python3
 """
-ETH/USDC 高频交易引擎 v7.4（REST实时指标版）— 最新更新版
+ETH/USDC 高频交易引擎 v7.4（REST实时指标版）— 更新轮流触发策略
 
 【一】多时间框架趋势判断与强弱信号：
-  1. 趋势判定：以15分钟超级趋势指标（20周期MA+3×ATR）作为主趋势依据：
-     - 当价格高于超级趋势上轨（视作绿色）则判定为上升趋势；
-     - 当价格低于下轨（红色）则判定为下降趋势；
-     - 介于两者之间时，辅以15m MACD（12,26,9）的零轴（DIF-DEA）辅助判断。
-  2. 强弱信号：基于1小时布林带%B (20,2)判断空单（>0.8强，≤0.8弱）和多单（<0.2强，≥0.2弱）。
-  3. 另外，采用3分钟布林带%B (20,2)（%B = (最新价-下轨)/(上轨-下轨)）作为触发下单信号（≤0买入、≥1卖出）。
+  1. 趋势判定：以15分钟超级趋势指标（20周期MA+3×ATR）作为主趋势依据，
+     当价格高于超级趋势上轨（视作绿色）则判定为上升趋势，
+     当价格低于超级趋势下轨（红色）则判定为下降趋势，
+     若处于边界，则辅以15m MACD（12,26,9）辅助判断。
+  2. 强弱信号：采用1小时布林带%B (20,2)判断：
+     - 空单：若%B > 0.8为强信号，否则为弱信号；
+     - 多单：若%B < 0.2为强信号，否则为弱信号；
+  3. 同时，利用3分钟布林带%B (20,2)作为下单触发条件，
+     当% B ≤ 0触发BUY信号，≥ 1触发SELL信号。
 
 【二】挂单与止盈止损：
-  – 入场挂单：若信号与趋势一致则采用强信号仓位（多单0.12ETH、反向0.07ETH），否则采用弱信号（多单0.03ETH、反向0.015ETH）；挂单价格以触发时最新价为基准，分多档设置（例如：±0.25%、0.4%、0.6%、0.8%、1.6%，各20%）。
-  – 止盈订单：以入场价格为基准提前挂单（强信号采用挂单偏移分别为1.02%、1.23%、1.5%、1.8%、2.2%，各20%；弱信号采用另一组），
-  – 止损：初始设定为买入价×0.98（多单）、卖出价×1.02（空单），并结合3m布林带带宽动态调整。
+  – 入场挂单：根据信号与趋势一致性确定单笔仓位：
+       强信号同趋势：0.12ETH，反向：0.07ETH；
+       弱信号同趋势：0.03ETH，反向：0.015ETH。
+  – 挂单价格以下单信号触发时的价格为基准，分档布置（例如：±0.25%、0.4%、0.6%、0.8%、1.6%，各20%）。
+  – 止盈挂单：以入场价格为基准提前挂单，强信号采用一组预设偏移（如 ±1.02%、±1.23%、±1.5%、±1.8%、±2.2%，各20%），弱信号则使用另一组。
+  – 初始止损按买入价×0.98（多单）／卖出价×1.02（空单）设定，再结合3m布林带带宽动态调整。
 
 【三】15m MADC策略（平仓辅助）：
-  – 采用15m数据计算MACD（EMA12, EMA26，DEA=EMA9），离轴值 = 2×(DIF-DEA)；
-  – 当离轴值达到指定区间时触发平仓（例如，空单：离轴值在 [11,20) 平仓0.1ETH，≥20平仓0.15ETH；多单类似）。
+  – 计算15m MACD（EMA12, EMA26, DEA=EMA9），离轴值 = 2×(DIF-DEA)；
+  – 当离轴值满足条件时触发平仓，例如空单：若离轴值在 [11,20)平仓0.1ETH，≥20平仓0.15ETH，多单类似；
   – 固定止损设为0.97/1.03。
 
 【四】超级趋势策略（并行执行）：
-  – 采用三个不同参数的15m超级趋势指标（长度分别为10、11、12，因子均3），当三者一致向上时触发市价多单0.15ETH，
-     否则若一致向下则市价空单0.15ETH，同时触发对应平仓。
+  – 采用三个不同参数的15m超级趋势指标（例如长度10、11、12，因子均3），当三者一致向上时触发市价多单0.15ETH，
+     一致向下时触发市价空单0.15ETH，同时触发对应止盈平仓操作。
 
-【五】信号轮换与冷却：
-  – 信号仅允许单笔触发，如果与上次下单同向则需冷却3秒，特例允许每轮首个强信号强制下单。
+【五】信号轮换：
+  – 强/弱下单信号在同一轮中只能触发一个。即如果上次触发的是上升趋势下的做多（BUY）信号，
+     则当前轮必须等待反向的做空（SELL）信号触发；同趋势连续信号将被忽略。
 
-【六】仓位控制（本地记录）：
-  – 所有下单成功后调用 update_local_position() 更新本地仓位（不再从币安读取）；
-  – 同时根据趋势设定仓位上限（趋势上升时多仓0.49ETH、空仓0.35ETH；下降时多仓0.35ETH、空仓0.49ETH），超出上限则暂停对应下单。
+【六】仓位控制：
+  – 所有入场和平仓订单成功后调用 update_local_position() 更新本地仓位（current_long、current_short），
+     作为15m MADC策略平仓和动态仓位判断的依据；
+  – 根据当前趋势设定仓位上限（例如：上升时多仓上限0.49ETH、空仓0.35ETH；下降时多仓0.35ETH、空仓0.49ETH），
+     超出上限时暂停对应方向下单。
 
-本代码通过REST API获取实时K线与价格，各策略模块采用 asyncio 并行执行。
+所有数据通过REST API实时获取，各模块采用 asyncio 并行执行。
 """
 
 import uvloop
@@ -60,19 +69,19 @@ SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
 SYMBOL     = 'ETHUSDC'
 LEVERAGE   = 50
 
-# 仓位上限（仅为控制参考，本地仓位记录更新）
+# 仓位上限（用于下单控制参考）
 BULL_LONG_LIMIT  = 0.49
 BULL_SHORT_LIMIT = 0.35
 BEAR_LONG_LIMIT  = 0.35
 BEAR_SHORT_LIMIT = 0.49
 
-# 订单基础规模（单位：ETH）
+# 订单基础规模（单位ETH）
 STRONG_SIZE_SAME  = 0.12
 STRONG_SIZE_DIFF  = 0.07
 WEAK_SIZE_SAME    = 0.03
 WEAK_SIZE_DIFF    = 0.015
 
-# 入场挂单方案，基于入场价格按预设偏移挂单
+# 入场挂单方案（基于下单时价格偏移比例）
 def get_entry_order_list(strong: bool) -> List[Dict[str, Any]]:
     if strong:
         return [
@@ -88,7 +97,7 @@ def get_entry_order_list(strong: bool) -> List[Dict[str, Any]]:
             {'offset': 0.0160, 'ratio': 0.50},
         ]
 
-# 止盈挂单方案（以入场价格为基准提前挂单）
+# 止盈挂单方案（以入场价为基准的提前挂单）
 def get_take_profit_orders_strong() -> List[Dict[str, Any]]:
     return [
         {'offset': 0.0102, 'ratio': 0.20},
@@ -104,10 +113,10 @@ def get_take_profit_orders_weak() -> List[Dict[str, Any]]:
         {'offset': 0.0180, 'ratio': 0.50},
     ]
 
-# 交易与限频配置
+# 交易和限频配置
 RECV_WINDOW = 10000
 MIN_NOTIONAL = 20.0
-COOLDOWN_SECONDS = 3
+# 冷却期已被删除（根据要求不设置冷却）
 RATE_LIMITS: Dict[str, Tuple[int, int]] = {
     'klines': (60, 5),
     'orders': (300, 10),
@@ -143,7 +152,7 @@ class TradingConfig:
     price_precision: int = 2
     quantity_precision: int = 3
     order_adjust_interval: float = 1.0
-    dual_side_position: bool = False   # USDC合约默认不使用双向持仓
+    dual_side_position: bool = False
 
 # ------------------- REST API 客户端 -------------------
 class BinanceRestClient:
@@ -204,9 +213,11 @@ class BinanceRestClient:
                              query.encode('utf-8'),
                              hashlib.sha256).hexdigest()
         url = f"https://fapi.binance.com/fapi/v1{path}?{query}&signature={signature}"
-        headers = {"X-MBX-APIKEY": API_KEY,
-                   "Accept": "application/json",
-                   "Content-Type": "application/x-www-form-urlencoded"}
+        headers = {
+            "X-MBX-APIKEY": API_KEY,
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
         logger.debug(f"请求: {url.split('?')[0]} 参数: {sorted_params}")
         for attempt in range(self.config.max_retries + 1):
             try:
@@ -273,11 +284,12 @@ class ETHUSDCStrategy:
     def __init__(self, client: BinanceRestClient) -> None:
         self.client = client
         self.config = TradingConfig()
-        self.last_trade_side: str = None  # 当前趋势：'LONG' 或 'SHORT'
-        self.last_triggered_side: str = None
+        self.last_trade_side: str = None      # 当前趋势：'LONG'或'SHORT'
+        # 更新后的轮换逻辑：每轮只允许触发一次，并要求上次信号与当前相反
+        self.last_triggered_side: str = None   # 上一次触发的信号方向（'BUY'或'SELL'）
         self.last_order_time: float = 0
         self.entry_price: float = None
-        # 本地仓位记录，所有下单/平仓后调用 update_local_position 更新（单位ETH）
+        # 本地仓位记录（单位ETH）
         self.current_long: float = 0.0
         self.current_short: float = 0.0
         self.prev_macd_off: float = None
@@ -296,7 +308,6 @@ class ETHUSDCStrategy:
         logger.info(f"[本地仓位更新] 多仓: {self.current_long:.4f} ETH，空仓: {self.current_short:.4f} ETH")
 
     def build_order_params(self, base: Dict[str, Any], pos_side: str = None) -> Dict[str, Any]:
-        # 如果不使用双向持仓模式，则不传递 positionSide 参数
         if self.config.dual_side_position and pos_side is not None:
             base['positionSide'] = pos_side
         return base
@@ -340,7 +351,7 @@ class ETHUSDCStrategy:
         std = close.rolling(window=self.config.bb_period).std()
         upper = sma + self.config.bb_std * std
         lower = sma - self.config.bb_std * std
-        percent_b = (close.iloc[-1] - lower.iloc[-1]) / (upper.iloc[-1] - lower.iloc[-1]) if (upper.iloc[-1]-lower.iloc[-1]) > 0 else 0.5
+        percent_b = (close.iloc[-1] - lower.iloc[-1]) / (upper.iloc[-1]-lower.iloc[-1]) if (upper.iloc[-1]-lower.iloc[-1])>0 else 0.5
         logger.info(f"[1h%B] {side.upper()}信号: {percent_b:.3f}")
         if side.upper() == 'BUY':
             return percent_b < 0.2
@@ -358,7 +369,7 @@ class ETHUSDCStrategy:
         std = close.rolling(window=self.config.bb_period).std()
         upper = sma + self.config.bb_std * std
         lower = sma - self.config.bb_std * std
-        percent_b = (close.iloc[-1] - lower.iloc[-1]) / (upper.iloc[-1] - lower.iloc[-1]) if (upper.iloc[-1]-lower.iloc[-1])>0 else 0.5
+        percent_b = (close.iloc[-1] - lower.iloc[-1]) / (upper.iloc[-1]-lower.iloc[-1]) if (upper.iloc[-1]-lower.iloc[-1])>0 else 0.5
         logger.info(f"[3m%B] 当前 %B: {percent_b:.3f}")
         if percent_b <= 0:
             return Signal(True, 'BUY', {'trigger_price': close.iloc[-1]}), {}
@@ -368,7 +379,6 @@ class ETHUSDCStrategy:
 
     # ------------------ 挂单与止盈止损：入场 ------------------
     async def place_dynamic_limit_orders(self, side: str, order_list: List[Dict[str, Any]], trigger_price: float, order_size: float) -> None:
-        # pos_side仅在双向持仓模式下传递
         pos_side = "LONG" if side == "BUY" else "SHORT"
         for order in order_list:
             offset = order['offset']
@@ -387,7 +397,6 @@ class ETHUSDCStrategy:
                 'quantity': qty,
                 'timeInForce': 'GTC'
             }
-            # 如果使用双向持仓，则添加 positionSide 参数
             params = self.build_order_params(params, pos_side)
             try:
                 data = await self.client._signed_request('POST', '/order', params)
@@ -397,8 +406,7 @@ class ETHUSDCStrategy:
                 logger.error(f"[下单] {side}挂单失败：{e}")
 
     async def place_take_profit_orders(self, side: str, tp_orders: List[Dict[str, Any]], entry_price: float) -> None:
-        # 为止盈订单，订单方向通常与入场单相反
-        pos_side = None  # 如果未使用双向持仓则不传
+        pos_side = None  # 默认不传 positionSide
         for order in tp_orders:
             offset = order['offset']
             tp_price = round(entry_price * (1 + offset) if side.upper() == 'BUY' else entry_price * (1 - offset), self.config.price_precision)
@@ -407,7 +415,7 @@ class ETHUSDCStrategy:
                 'side': side,
                 'type': 'LIMIT',
                 'price': tp_price,
-                'quantity': 0,  # 此处数量待实际平仓时确定，或作为止盈参考
+                'quantity': 0,  # 仅作为挂单参考，实际数量由平仓逻辑决定
                 'timeInForce': 'GTC'
             }
             params = self.build_order_params(params, pos_side)
@@ -416,11 +424,6 @@ class ETHUSDCStrategy:
                 logger.info(f"[止盈] {side} TP订单 @ {tp_price}，返回: {data}")
             except Exception as e:
                 logger.error(f"[止盈] {side} TP订单挂单失败：{e}")
-
-    def build_order_params(self, base: Dict[str, Any], pos_side: str = None) -> Dict[str, Any]:
-        if self.config.dual_side_position and pos_side is not None:
-            base['positionSide'] = pos_side
-        return base
 
     # ------------------ 市价平仓 ------------------
     async def close_position(self, side: str, quantity: float, strategy: str = "normal") -> None:
@@ -455,14 +458,12 @@ class ETHUSDCStrategy:
                 divergence = 2 * (dif - dea)
                 trigger_val = divergence.iloc[-1]
                 logger.info(f"[MADC] 离轴值: {trigger_val:.2f}")
-                # 空单平仓条件
                 if trigger_val >= 11 and trigger_val < 20:
                     logger.info("[MADC] 空单触发弱信号，平多仓0.1ETH")
                     await self.close_position('SELL', 0.1, strategy="madc")
                 elif trigger_val >= 20:
                     logger.info("[MADC] 空单触发强信号，平多仓0.15ETH")
                     await self.close_position('SELL', 0.15, strategy="madc")
-                # 多单平仓条件
                 if trigger_val <= -11 and trigger_val > -20:
                     logger.info("[MADC] 多单触发弱信号，平空仓0.1ETH")
                     await self.close_position('BUY', 0.1, strategy="madc")
@@ -505,47 +506,46 @@ class ETHUSDCStrategy:
                 trend3 = supertrend(12, 3)
                 logger.info(f"[超级趋势] 指标趋势: {trend1}, {trend2}, {trend3}")
                 if trend1 == trend2 == trend3 == 'UP':
-                    logger.info("[超级趋势] 所有指标上升，触发市价多单0.15ETH")
+                    logger.info("[超级趋势] 指标均上升，触发市价多单0.15ETH")
                     self.update_local_position('BUY', 0.15, closing=False)
                 elif trend1 == trend2 == trend3 == 'DOWN':
-                    logger.info("[超级趋势] 所有指标下降，触发市价空单0.15ETH")
+                    logger.info("[超级趋势] 指标均下降，触发市价空单0.15ETH")
                     self.update_local_position('SELL', 0.15, closing=False)
             except Exception as e:
                 logger.error(f"[超级趋势] 异常: {e}")
             await asyncio.sleep(60 * 15)
 
-    # ------------------ 信号下单逻辑 ------------------
+    # ------------------ 信号下单逻辑（入场）------------------
     async def order_signal_loop(self) -> None:
         while True:
             try:
                 signal, _ = await self.analyze_order_signals_3m()
                 if signal.action:
-                    strong = await self.get_hourly_strength(signal.side)
-                    if self.last_trade_side:
-                        if signal.side.upper() == self.last_trade_side.upper():
-                            order_size = STRONG_SIZE_SAME if strong else WEAK_SIZE_SAME
-                        else:
-                            order_size = STRONG_SIZE_DIFF if strong else WEAK_SIZE_DIFF
+                    # 轮流触发：如果上次触发信号存在，则当前信号必须与其相反才允许下单
+                    if self.last_triggered_side is not None and signal.side.upper() == self.last_triggered_side.upper():
+                        logger.info("[信号下单] 同一趋势信号重复，忽略本次下单")
                     else:
-                        order_size = STRONG_SIZE_SAME if strong else WEAK_SIZE_SAME
-                    if self.last_triggered_side and self.last_triggered_side.upper() == signal.side.upper():
-                        if time.time() - self.last_order_time < COOLDOWN_SECONDS:
-                            logger.info("[信号下单] 冷却期内，忽略同向信号")
-                            await asyncio.sleep(self.config.order_adjust_interval)
-                            continue
-                    orders = get_entry_order_list(strong)
-                    self.entry_price = signal.order_details.get("trigger_price")
-                    await self.place_dynamic_limit_orders(signal.side, orders, trigger_price=self.entry_price, order_size=order_size)
-                    self.last_triggered_side = signal.side.upper()
-                    self.last_order_time = time.time()
-                    self.last_trade_side = 'LONG' if signal.side.upper() == 'BUY' else 'SHORT'
-                    # 同时挂止盈订单（以入场价为基准，方向与入场单相反）
-                    tp_side = 'SELL' if signal.side.upper() == 'BUY' else 'BUY'
-                    tp_orders = get_take_profit_orders_strong() if strong else get_take_profit_orders_weak()
-                    await self.place_take_profit_orders(tp_side, tp_orders, self.entry_price)
+                        strong = await self.get_hourly_strength(signal.side)
+                        if self.last_trade_side:
+                            if signal.side.upper() == self.last_trade_side.upper():
+                                order_size = STRONG_SIZE_SAME if strong else WEAK_SIZE_SAME
+                            else:
+                                order_size = STRONG_SIZE_DIFF if strong else WEAK_SIZE_DIFF
+                        else:
+                            order_size = STRONG_SIZE_SAME if strong else WEAK_SIZE_SAME
+                        orders = get_entry_order_list(strong)
+                        self.entry_price = signal.order_details.get("trigger_price")
+                        await self.place_dynamic_limit_orders(signal.side, orders, trigger_price=self.entry_price, order_size=order_size)
+                        self.last_triggered_side = signal.side.upper()
+                        self.last_order_time = time.time()
+                        # 更新当前趋势：下单方向作为趋势参考
+                        self.last_trade_side = 'LONG' if signal.side.upper() == 'BUY' else 'SHORT'
+                        # 挂止盈订单，方向与入场单相反
+                        tp_side = 'SELL' if signal.side.upper()=='BUY' else 'BUY'
+                        tp_orders = get_take_profit_orders_strong() if strong else get_take_profit_orders_weak()
+                        await self.place_take_profit_orders(tp_side, tp_orders, self.entry_price)
             except Exception as e:
                 logger.error(f"[信号下单] 异常: {e}")
-                await asyncio.sleep(self.config.order_adjust_interval)
             await asyncio.sleep(self.config.order_adjust_interval)
 
     # ------------------ 止盈止损管理（动态止损） ------------------
