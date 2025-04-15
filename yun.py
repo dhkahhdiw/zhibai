@@ -1,46 +1,50 @@
 #!/usr/bin/env python3
 """
-ETH/USDC 高频交易引擎 v7.4（REST实时指标版）— 更新策略逻辑
+ETH/USDC 高频交易引擎 v7.4（REST实时指标版）— 更新后的策略逻辑
 
 【数据与预处理】
-  - 实时通过REST API获取15m、1h、3m K线数据；
-  - 使用ffill填充缺失数据，保证数据连续性；
-  - 各周期数据用于计算不同指标，后续下单前尽量使用最新数据。
+  - 通过REST API实时获取15m、1h、3m K线数据；
+  - 使用 ffilling (df.ffill()) 处理缺失数据；
+  - 各周期数据将用于计算不同指标，确保下单时使用最新数据。
 
 【趋势判断与信号确认】
-  1. 主趋势判断：15m超级趋势指标（20周期MA+3×ATR），若最新价 > 上轨则趋势为LONG，< 下轨则趋势为SHORT，
-     否则辅以15m MACD（12,26,9）辅助判断。
-  2. 强弱信号：基于1h布林带%B (20,2)判断，多单若%B < 0.2为强信号，空单若%B > 0.8为强信号，否则为弱信号。
-  3. 触发条件：3m布林带%B (20,2) 计算 %B = (最新价-下轨)/(上轨-下轨)，当 %B ≤ 0 触发 BUY信号，≥ 1触发 SELL信号。
-  4. 信号融合：要求15m与1h指标方向一致，3m信号作为具体触发依据。
+  1. 主趋势判断：采用15m超级趋势指标（20周期MA+3×ATR），
+     - 当最新价高于上轨（绿色）则判定为上升趋势 (LONG)；
+     - 当最新价低于下轨（红色）则判定为下降趋势 (SHORT)；
+     - 介于两者之间时辅以15m MACD（12,26,9）的判断。
+  2. 强弱信号：基于1h布林带%B (20,2)判断，
+     - 对于多单：若%B < 0.2为强信号，否则为弱信号；
+     - 对于空单：若%B > 0.8为强信号，否则为弱信号。
+  3. 触发条件：采用3m布林带%B (20,2)计算，
+     - 公式：%B = (最新价 - 下轨) / (上轨 - 下轨)；
+     - 当 %B ≤ 0 触发 BUY 信号，当 %B ≥ 1 触发 SELL 信号。
+  4. 信号融合：要求15m与1h指标支持同一方向，3m信号作为具体触发依据。
 
 【订单生成与挂单】
-  - 入场挂单：根据信号与趋势一致性决定单笔仓位；
-      同趋势下，强信号下单仓位0.12 ETH，弱信号0.03 ETH；反之（信号与趋势冲突），强信号0.07 ETH，弱信号0.015 ETH。
-  - 挂单价格以触发时最新价为基准，采用预设档位下单（例如±0.25%、0.40%、0.60%、0.80%、1.60%，各20%）。
-  - 止盈挂单：以入场价为基准，强信号采用挂单偏移分别为±1.02%、±1.23%、±1.50%、±1.80%、±2.20%（各20%）；弱信号组另选。
-  - 止损：初始设为买入价×0.98（多单）、卖出价×1.02（空单），结合3m布林带宽度动态调整。
+  - 入场挂单：根据信号与趋势一致性确定单笔仓位；
+      • 同趋势下：强信号下单仓位 0.12 ETH，弱信号 0.03 ETH；
+      • 趋势反向下：强信号 0.07 ETH，弱信号 0.015 ETH；
+  - 挂单价格以触发时最新价为基准，采用预设偏移档位（例如：±0.25%、0.40%、±0.60%、±0.80%、±1.60%，各20%）；
+  - 止盈挂单：以入场价为基准提前挂单（强信号偏移依次为 ±1.02%、±1.23%、±1.50%、±1.80%、±2.20%，各20%；弱信号采用另一组）；
+  - 止损：初始按买入价×0.98（多单）／卖出价×1.02（空单）设定，并结合3m布林带带宽动态调整。
 
 【信号轮换】
-  - 在同一轮内，仅允许触发一次订单。若上次触发为 BUY 信号，则本轮内再次收到 BUY 信号将被忽略，
-    只有当收到 SELL 信号时才允许下单；反之亦然。
-  - 通过变量 last_triggered_side 记录本轮已触发订单方向，下单时检查并只交替触发。
+  - 同一轮内仅允许触发一次订单。若上一次触发为 BUY 信号，则本轮内若再次收到 BUY 信号则忽略，
+    只有当收到 SELL 信号时才触发下单；反之亦然。
+  - 通过变量 last_triggered_side 保存本轮已触发订单方向。
 
 【并行子策略】
-  - 15m MACD策略：计算MACD（EMA12,EMA26,DEA=EMA9），离轴值 = 2×(DIF-DEA)，若达到设定区间触发平仓（例如空单：离轴值在 [11,20)下平0.1 ETH；≥20下平0.15 ETH；多单类似）。
-  - 超级趋势策略：采用三个不同参数的15m超级趋势指标（长度10、11、12，因子均3），若三者均为UP则市价买0.15 ETH，若均为DOWN则市价卖0.15 ETH。
+  - 15m MACD 策略：基于15m数据计算 MACD（EMA12, EMA26, DEA=EMA9），离轴值 = 2×(DIF - DEA)，
+      根据设定条件触发平仓（例如：空单：离轴值在 [11,20) 下平 0.1 ETH，≥20 下平 0.15 ETH；多单类似）。
+  - 超级趋势策略：采用三个不同参数的15m超级趋势指标（长度10、11、12，因子均为3），
+      当三者一致上升则市价多单 0.15 ETH，否则当三者一致下降则市价空单 0.15 ETH，同时触发平仓操作。
 
 【仓位控制与资金管理】
-  - 通过每笔下单和平仓更新本地仓位记录（current_long, current_short），作为后续平仓判断依据；
-  - 根据趋势设定仓位上限：例如，趋势上升时，多仓允许100%，空仓不超过75%；趋势下降时，多仓不超过75%，空仓允许100%；
-  - 超出上限时暂停对应方向下单（示例中仅输出仓位信息，可扩展）。
+  - 每次下单或平仓后通过 update_local_position() 更新本地仓位（current_long、current_short）；
+  - 根据当前趋势设定仓位上限（例如：趋势上升时，多仓允许100%，空仓不超过75%；趋势下降时，多仓不超过75%，空仓允许100%）；
+  - 超出上限时暂停对应方向下单（本示例仅输出仓位信息，可进一步扩展）。
 
-所有API均采用币安合约REST API (fapi/v1)：
- - 时间接口：/fapi/v1/time
- - K线接口：/fapi/v1/klines
- - 下单与平仓：/fapi/v1/order
- - 杠杆：/fapi/v1/leverage
-使用 USDC 合约时自动附加 marginCoin=USDC 参数。
+所有API调用均采用币安合约 REST API (fapi/v1)，USDC合约时附加参数 marginCoin=USDC。
 
 """
 
@@ -70,11 +74,11 @@ SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
 SYMBOL     = 'ETHUSDC'
 LEVERAGE   = 50
 
-# 仓位上限（本地记录及下单参考）
-BULL_LONG_LIMIT  = 0.00
-BULL_SHORT_LIMIT = 0.00
-BEAR_LONG_LIMIT  = 0.00
-BEAR_SHORT_LIMIT = 0.00
+# 仓位上限（本地仓位记录及下单控制参考）
+BULL_LONG_LIMIT  = 0.49
+BULL_SHORT_LIMIT = 0.35
+BEAR_LONG_LIMIT  = 0.35
+BEAR_SHORT_LIMIT = 0.49
 
 # 订单基础规模（单位：ETH）
 STRONG_SIZE_SAME  = 0.12
@@ -98,7 +102,7 @@ def get_entry_order_list(strong: bool) -> List[Dict[str, Any]]:
             {'offset': 0.0160, 'ratio': 0.50},
         ]
 
-# 止盈挂单方案（以入场价为基准挂单）
+# 止盈挂单方案
 def get_take_profit_orders_strong() -> List[Dict[str, Any]]:
     return [
         {'offset': 0.0102, 'ratio': 0.20},
@@ -117,7 +121,7 @@ def get_take_profit_orders_weak() -> List[Dict[str, Any]]:
 # 交易与限频配置
 RECV_WINDOW = 10000
 MIN_NOTIONAL = 20.0
-# 本示例不设置固定冷却时间（采用严格轮换判断）
+# 采用严格轮换逻辑，不使用固定冷却期
 RATE_LIMITS: Dict[str, Tuple[int, int]] = {
     'klines': (60, 5),
     'orders': (300, 10),
@@ -157,7 +161,11 @@ class TradingConfig:
 class BinanceRestClient:
     def __init__(self) -> None:
         self.config = TradingConfig()
-        self.connector = TCPConnector(limit=512, resolver=AsyncResolver(), ttl_dns_cache=300, force_close=True, ssl=True)
+        self.connector = TCPConnector(limit=512,
+                                      resolver=AsyncResolver(),
+                                      ttl_dns_cache=300,
+                                      force_close=True,
+                                      ssl=True)
         self._init_session()
         self.recv_window = RECV_WINDOW
         self.request_timestamps = defaultdict(lambda: deque(maxlen=RATE_LIMITS['klines'][0] + 200))
@@ -261,10 +269,11 @@ class BinanceRestClient:
             'close_time', 'quote_asset_volume', 'trades',
             'taker_buy_base', 'taker_buy_quote', 'ignore'
         ])
-        for col in ['open','high','low','close','volume']:
+        for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df = df.fillna(method='ffill')
+        # 使用 ffilling 替代 fillna(method='ffill')
+        df = df.ffill()
         return df
 
 # ------------------- 策略模块 -------------------
@@ -278,11 +287,12 @@ class ETHUSDCStrategy:
     def __init__(self, client: BinanceRestClient) -> None:
         self.client = client
         self.config = TradingConfig()
-        self.last_trade_side: str = None  # 当前趋势：'LONG' 或 'SHORT'
-        # 轮换触发机制：同一轮只允许一个订单，下单信号必须与上次（本轮）触发方向相反
+        # 当前趋势：'LONG' 或 'SHORT'
+        self.last_trade_side: str = None
+        # 轮换触发机制：本轮内仅允许触发一个订单，下单信号必须与上一次触发相反
         self.last_triggered_side: str = None
         self.entry_price: float = None
-        # 本地仓位记录（单位 ETH）
+        # 本地仓位记录（单位：ETH）
         self.current_long: float = 0.0
         self.current_short: float = 0.0
         self.prev_macd_off: float = None
@@ -344,11 +354,11 @@ class ETHUSDCStrategy:
         std = close.rolling(window=self.config.bb_period).std()
         upper = sma + self.config.bb_std * std
         lower = sma - self.config.bb_std * std
-        percent_b = (close.iloc[-1]-lower.iloc[-1])/(upper.iloc[-1]-lower.iloc[-1]) if (upper.iloc[-1]-lower.iloc[-1])>0 else 0.5
+        percent_b = (close.iloc[-1] - lower.iloc[-1]) / (upper.iloc[-1] - lower.iloc[-1]) if (upper.iloc[-1]-lower.iloc[-1]) > 0 else 0.5
         logger.info(f"[1h%B] {side.upper()}信号: {percent_b:.3f}")
-        if side.upper()=='BUY':
+        if side.upper() == 'BUY':
             return percent_b < 0.2
-        elif side.upper()=='SELL':
+        elif side.upper() == 'SELL':
             return percent_b > 0.8
         return False
 
@@ -362,7 +372,7 @@ class ETHUSDCStrategy:
         std = close.rolling(window=self.config.bb_period).std()
         upper = sma + self.config.bb_std * std
         lower = sma - self.config.bb_std * std
-        percent_b = (close.iloc[-1]-lower.iloc[-1])/(upper.iloc[-1]-lower.iloc[-1]) if (upper.iloc[-1]-lower.iloc[-1])>0 else 0.5
+        percent_b = (close.iloc[-1] - lower.iloc[-1]) / (upper.iloc[-1] - lower.iloc[-1]) if (upper.iloc[-1]-lower.iloc[-1]) > 0 else 0.5
         logger.info(f"[3m%B] 当前 %B: {percent_b:.3f}")
         if percent_b <= 0:
             return Signal(True, 'BUY', {'trigger_price': close.iloc[-1]}), {}
@@ -372,14 +382,14 @@ class ETHUSDCStrategy:
 
     # ------------------ 挂单与止盈止损：入场 ------------------
     async def place_dynamic_limit_orders(self, side: str, order_list: List[Dict[str, Any]], trigger_price: float, order_size: float) -> None:
-        pos_side = "LONG" if side=="BUY" else "SHORT"
+        pos_side = "LONG" if side == "BUY" else "SHORT"
         for order in order_list:
             offset = order['offset']
             ratio = order['ratio']
             qty = round(order_size * ratio, self.config.quantity_precision)
             if qty <= 0:
                 continue
-            limit_price = round(trigger_price * (1 - offset) if side=="BUY" else trigger_price * (1 + offset), self.config.price_precision)
+            limit_price = round(trigger_price * (1 - offset) if side == "BUY" else trigger_price * (1 + offset), self.config.price_precision)
             if limit_price <= 0:
                 continue
             params = {
@@ -402,13 +412,13 @@ class ETHUSDCStrategy:
         pos_side = None
         for order in tp_orders:
             offset = order['offset']
-            tp_price = round(entry_price * (1 + offset) if side.upper()=='BUY' else entry_price * (1 - offset), self.config.price_precision)
+            tp_price = round(entry_price * (1 + offset) if side.upper() == 'BUY' else entry_price * (1 - offset), self.config.price_precision)
             params = {
                 'symbol': SYMBOL,
                 'side': side,
                 'type': 'LIMIT',
                 'price': tp_price,
-                'quantity': 0,  # 数量待平仓时确定
+                'quantity': 0,
                 'timeInForce': 'GTC'
             }
             params = self.build_order_params(params, pos_side)
@@ -435,7 +445,7 @@ class ETHUSDCStrategy:
         except Exception as e:
             logger.error(f"[平仓] 失败: {e}")
 
-    # ------------------ 15m MACD策略（MADC）平仓 ------------------
+    # ------------------ 15m MACD策略平仓 ------------------
     async def madc_strategy_loop(self) -> None:
         while True:
             try:
@@ -443,7 +453,7 @@ class ETHUSDCStrategy:
                 if df.empty:
                     await asyncio.sleep(60)
                     continue
-                df = df.fillna(method='ffill')
+                df = df.ffill()
                 close = df['close'].astype(float)
                 ema12 = close.ewm(span=12, adjust=False).mean()
                 ema26 = close.ewm(span=26, adjust=False).mean()
@@ -452,14 +462,14 @@ class ETHUSDCStrategy:
                 divergence = 2 * (dif - dea)
                 trigger_val = divergence.iloc[-1]
                 logger.info(f"[MADC] 离轴值: {trigger_val:.2f}")
-                # 空单平仓条件：当离轴值在[11,20)时平0.1 ETH，>=20时平0.15 ETH
+                # 空单平仓条件：离轴值在 [11,20) 平0.1 ETH，≥20平0.15 ETH
                 if trigger_val >= 11 and trigger_val < 20:
                     logger.info("[MADC] 空单触发弱信号，平多仓0.1ETH")
                     await self.close_position('SELL', 0.1, strategy="madc")
                 elif trigger_val >= 20:
                     logger.info("[MADC] 空单触发强信号，平多仓0.15ETH")
                     await self.close_position('SELL', 0.15, strategy="madc")
-                # 多单平仓条件：当离轴值在(-20,-11]时平0.1 ETH，<=-20时平0.15 ETH
+                # 多单平仓条件：离轴值在 (-20, -11] 平0.1 ETH，≤ -20 平0.15 ETH
                 if trigger_val <= -11 and trigger_val > -20:
                     logger.info("[MADC] 多单触发弱信号，平空仓0.1ETH")
                     await self.close_position('BUY', 0.1, strategy="madc")
@@ -478,7 +488,7 @@ class ETHUSDCStrategy:
                 if df.empty:
                     await asyncio.sleep(60)
                     continue
-                df = df.fillna(method='ffill')
+                df = df.ffill()
                 high = df['high'].astype(float)
                 low = df['low'].astype(float)
                 close = df['close'].astype(float)
@@ -488,7 +498,7 @@ class ETHUSDCStrategy:
                         (high - close.shift()).abs(),
                         (low - close.shift()).abs()
                     ])).rolling(window=length).mean().iloc[-1]
-                    hl2 = ((high+low)/2).iloc[-1]
+                    hl2 = ((high + low) / 2).iloc[-1]
                     basic_upper = hl2 + factor * atr_val
                     basic_lower = hl2 - factor * atr_val
                     latest = close.iloc[-1]
@@ -516,18 +526,17 @@ class ETHUSDCStrategy:
     async def order_signal_loop(self) -> None:
         while True:
             try:
-                # 获取3m布林带%B信号
                 signal, _ = await self.analyze_order_signals_3m()
                 if signal.action:
-                    # 轮换触发：若本轮已触发订单，则必须收到相反方向信号才能下单
+                    # 轮换触发：如果本轮内已有订单触发，则仅当当前信号与上次触发方向相反时才允许下单
                     if self.last_triggered_side is not None:
                         if signal.side.upper() == self.last_triggered_side:
-                            logger.info("[信号下单] 本轮内已触发同方向信号，忽略")
+                            logger.info("[信号下单] 本轮内同方向信号已触发，忽略本次下单")
                             await asyncio.sleep(self.config.order_adjust_interval)
                             continue
                     # 获取1h布林带强弱信号
                     strong = await self.get_hourly_strength(signal.side)
-                    # 根据上一次下单方向（last_trade_side）决定下单仓位
+                    # 根据 last_trade_side 决定下单仓位
                     if self.last_trade_side:
                         if signal.side.upper() == self.last_trade_side.upper():
                             order_size = STRONG_SIZE_SAME if strong else WEAK_SIZE_SAME
@@ -538,9 +547,9 @@ class ETHUSDCStrategy:
                     orders = get_entry_order_list(strong)
                     self.entry_price = signal.order_details.get("trigger_price")
                     await self.place_dynamic_limit_orders(signal.side, orders, self.entry_price, order_size)
-                    # 更新轮换：记录本轮已触发信号方向
+                    # 更新轮换状态：本轮内记录已触发信号方向
                     self.last_triggered_side = signal.side.upper()
-                    # 更新当前趋势：下单方向作为当前轮的最后触发方向
+                    # 更新当前趋势，下单方向作为本轮最后触发方向
                     self.last_trade_side = 'LONG' if signal.side.upper()=='BUY' else 'SHORT'
                     logger.info(f"[信号下单] 触发订单: {signal.side.upper()}，本轮结束")
                 await asyncio.sleep(self.config.order_adjust_interval)
@@ -556,7 +565,7 @@ class ETHUSDCStrategy:
                 if df.empty or not self.entry_price:
                     await asyncio.sleep(0.5)
                     continue
-                df = df.fillna(method='ffill')
+                df = df.ffill()
                 latest = float(df['close'].iloc[-1])
                 sma = df['close'].astype(float).rolling(window=self.config.bb_period).mean().iloc[-1]
                 std = df['close'].astype(float).rolling(window=self.config.bb_period).std().iloc[-1]
