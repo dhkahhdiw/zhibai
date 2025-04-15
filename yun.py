@@ -135,8 +135,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[logging.StreamHandler(),
-              logging.FileHandler("/var/log/eth_usdc_hft.log", encoding="utf-8", mode='a')]
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("/var/log/eth_usdc_hft.log", encoding="utf-8", mode='a')
+    ]
 )
 logger = logging.getLogger('ETH-USDC-REST')
 
@@ -372,7 +374,7 @@ class ETHUSDCStrategy:
         std = close.rolling(window=self.config.bb_period).std()
         upper = sma + self.config.bb_std * std
         lower = sma - self.config.bb_std * std
-        percent_b = (close.iloc[-1] - lower.iloc[-1]) / (upper.iloc[-1] - lower.iloc[-1]) if (upper.iloc[-1]-lower.iloc[-1]) > 0 else 0.5
+        percent_b = (close.iloc[-1] - lower.iloc[-1]) / (upper.iloc[-1] - lower.iloc[-1]) if (upper.iloc[-1]-lower.iloc[-1])>0 else 0.5
         logger.info(f"[3m%B] 当前 %B: {percent_b:.3f}")
         if percent_b <= 0:
             return Signal(True, 'BUY', {'trigger_price': close.iloc[-1]}), {}
@@ -389,7 +391,7 @@ class ETHUSDCStrategy:
             qty = round(order_size * ratio, self.config.quantity_precision)
             if qty <= 0:
                 continue
-            limit_price = round(trigger_price * (1 - offset) if side == "BUY" else trigger_price * (1 + offset), self.config.price_precision)
+            limit_price = round(trigger_price * (1 - offset) if side=="BUY" else trigger_price * (1 + offset), self.config.price_precision)
             if limit_price <= 0:
                 continue
             params = {
@@ -409,7 +411,8 @@ class ETHUSDCStrategy:
                 logger.error(f"[下单] {side}挂单失败：{e}")
 
     async def place_take_profit_orders(self, side: str, tp_orders: List[Dict[str, Any]], entry_price: float) -> None:
-        pos_side = None
+        # 为止盈订单，订单方向通常与入场单相反
+        pos_side = None  # 如果未使用双向持仓则不传
         for order in tp_orders:
             offset = order['offset']
             tp_price = round(entry_price * (1 + offset) if side.upper() == 'BUY' else entry_price * (1 - offset), self.config.price_precision)
@@ -427,6 +430,11 @@ class ETHUSDCStrategy:
                 logger.info(f"[止盈] {side} TP订单 @ {tp_price}，返回: {data}")
             except Exception as e:
                 logger.error(f"[止盈] {side} TP订单挂单失败：{e}")
+
+    def build_order_params(self, base: Dict[str, Any], pos_side: str = None) -> Dict[str, Any]:
+        if self.config.dual_side_position and pos_side is not None:
+            base['positionSide'] = pos_side
+        return base
 
     # ------------------ 市价平仓 ------------------
     async def close_position(self, side: str, quantity: float, strategy: str = "normal") -> None:
@@ -556,6 +564,7 @@ class ETHUSDCStrategy:
             except Exception as e:
                 logger.error(f"[信号下单] 异常: {e}")
                 await asyncio.sleep(self.config.order_adjust_interval)
+            await asyncio.sleep(self.config.order_adjust_interval)
 
     # ------------------ 止盈止损管理（动态止损） ------------------
     async def stop_loss_profit_management_loop(self) -> None:
@@ -572,10 +581,10 @@ class ETHUSDCStrategy:
                 band_width = (sma + self.config.bb_std * std) - (sma - self.config.bb_std * std)
                 dynamic_stop = (latest - band_width * 0.5) if self.last_trade_side=='LONG' else (latest + band_width * 0.5)
                 logger.info(f"[止盈止损] 当前价={latest:.2f}, 动态止损={dynamic_stop:.2f}")
-                if self.last_trade_side=='LONG' and latest < dynamic_stop:
+                if self.last_trade_side == 'LONG' and latest < dynamic_stop:
                     logger.info("[止损] 多单止损触发")
                     await self.close_position('SELL', self.current_long, strategy="normal")
-                elif self.last_trade_side=='SHORT' and latest > dynamic_stop:
+                elif self.last_trade_side == 'SHORT' and latest > dynamic_stop:
                     logger.info("[止损] 空单止损触发")
                     await self.close_position('BUY', self.current_short, strategy="normal")
             except Exception as e:
