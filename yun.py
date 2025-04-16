@@ -7,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from dotenv import load_dotenv
-from ta.trend import MACD
 from ta.volatility import BollingerBands, AverageTrueRange
 
 # --------------------
@@ -28,7 +27,7 @@ executor = ThreadPoolExecutor(max_workers=4)
 # --------------------
 order_lock = asyncio.Lock()    # 防重入锁
 position_tracker = {'long': 0.0, 'short': 0.0}
-last_order_side = None  # 上一次下单方向（'long'或'short'）
+last_order_side = None  # 记录上一次下单方向：'long' 或 'short'
 last_main_trend = 1     # 默认主趋势为上升
 
 # --------------------
@@ -64,7 +63,10 @@ async def async_get_klines(symbol, interval, lookback_minutes):
 # --------------------
 # 指标计算函数
 # --------------------
-def compute_supertrend(df, period=20, multiplier=3):
+def compute_supertrend(df, period=10, multiplier=3):
+    """
+    使用15分钟超级趋势指标判断主趋势，参数：长度10，因子3
+    """
     df = df.copy()
     atr = AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=period)
     df['ATR'] = atr.average_true_range()
@@ -75,17 +77,17 @@ def compute_supertrend(df, period=20, multiplier=3):
     trend = [0] * len(df)
     for i in range(period, len(df)):
         if i == period:
-            if df.loc[df.index[i-1],'close'] > df.loc[df.index[i-1],'ma']:
+            if df.loc[df.index[i-1], 'close'] > df.loc[df.index[i-1], 'ma']:
                 trend[i-1] = 1
-                supertrend[i-1] = df.loc[df.index[i-1],'lower_band']
+                supertrend[i-1] = df.loc[df.index[i-1], 'lower_band']
             else:
                 trend[i-1] = -1
-                supertrend[i-1] = df.loc[df.index[i-1],'upper_band']
-        curr_close = df.loc[df.index[i],'close']
+                supertrend[i-1] = df.loc[df.index[i-1], 'upper_band']
+        curr_close = df.loc[df.index[i], 'close']
         prev_supertrend = supertrend[i-1]
         prev_trend = trend[i-1]
-        curr_lower = df.loc[df.index[i],'lower_band']
-        curr_upper = df.loc[df.index[i],'upper_band']
+        curr_lower = df.loc[df.index[i], 'lower_band']
+        curr_upper = df.loc[df.index[i], 'upper_band']
         if prev_trend == 1:
             curr_lower = max(curr_lower, prev_supertrend)
         elif prev_trend == -1:
@@ -103,13 +105,6 @@ def compute_supertrend(df, period=20, multiplier=3):
     df['trend'] = trend
     return df
 
-def compute_macd(df, fast=12, slow=26, signal=9):
-    macd = MACD(close=df['close'], window_fast=fast, window_slow=slow, window_sign=signal)
-    df['macd'] = macd.macd()
-    df['macd_signal'] = macd.macd_signal()
-    df['macd_diff'] = macd.macd_diff()
-    return df
-
 def compute_bollinger_percent_b(df, window=20, std_multiplier=2):
     bb = BollingerBands(close=df['close'], window=window, window_dev=std_multiplier)
     df['bb_upper'] = bb.bollinger_hband()
@@ -122,17 +117,12 @@ def compute_bollinger_percent_b(df, window=20, std_multiplier=2):
 # 信号生成函数
 # --------------------
 def generate_main_trend_signal(df_15m):
-    df = compute_supertrend(df_15m, period=20, multiplier=3)
-    df = compute_macd(df, fast=12, slow=26, signal=9)
+    # 使用15分钟超级趋势指标计算主趋势（长度=10，因子=3）
+    df = compute_supertrend(df_15m, period=10, multiplier=3)
     latest = df.iloc[-1]
-    if latest['trend'] == 1 and latest['macd_diff'] > 0:
-        result = 1
-    elif latest['trend'] == -1 and latest['macd_diff'] < 0:
-        result = -1
-    else:
-        result = 0
+    result = latest['trend']  # 直接采用超级趋势结果：1 表示上升，-1 表示下降
     global last_main_trend
-    if result == 0:
+    if result == 0 or result is None:
         result = last_main_trend if last_main_trend is not None else 1
     last_main_trend = result
     return result
@@ -164,7 +154,7 @@ def generate_3m_trade_orders(df_3m, current_price, trend, strength, side):
     return {'orders': orders}
 
 # --------------------
-# 下单与仓位管理（异步封装，不再执行余额检查）
+# 下单与仓位管理（异步封装，不执行余额检查）
 # --------------------
 async def async_place_order(order_side, order_type, quantity, price=None):
     async with order_lock:
@@ -174,7 +164,7 @@ async def async_place_order(order_side, order_type, quantity, price=None):
             if res is None:
                 logging.error("下单返回空结果")
             else:
-                logging.info(f"下单成功：orderId={res.get('orderId','N/A')}")
+                logging.info(f"下单成功：orderId={res.get('orderId', 'N/A')}")
             return res
         except Exception as e:
             logging.exception(f"async_place_order异常: {e}")
@@ -259,12 +249,8 @@ def trailing_stop_update(current_price, bb_width):
 # --------------------
 async def macd_strategy(df_15m):
     try:
-        df_macd = compute_macd(df_15m.copy(), fast=12, slow=26, signal=9)
-        macd_diff = df_macd.iloc[-1]['macd_diff']
-        if 11 <= abs(macd_diff) < 20:
-            logging.info("15m MACD策略：离轴11～20信号，触发约0.1ETH订单")
-        elif abs(macd_diff) >= 20:
-            logging.info("15m MACD策略：离轴≥20信号，触发约0.15ETH订单")
+        # 本子策略仅做信号提示，已删除MACD辅助下单部分
+        logging.info("15m MACD子策略执行中（信号提示）")
     except Exception as e:
         logging.exception(f"MACD子策略异常: {e}")
 
