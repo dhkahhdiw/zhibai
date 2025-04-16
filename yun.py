@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+!/usr/bin/env python3
 import os, time, asyncio, logging
 from datetime import datetime
 import pandas as pd
@@ -26,10 +26,10 @@ executor = ThreadPoolExecutor(max_workers=4)
 # --------------------
 # 全局控制变量
 # --------------------
-order_lock = asyncio.Lock()    # 防重入下单锁
-position_tracker = {'long': 0.0, 'short': 0.0}  # 本地仓位记录
-last_order_side = None  # 主策略中上一次下单方向（'long' 或 'short'）
-last_main_trend = 1     # 主策略默认主趋势为上升
+order_lock = asyncio.Lock()               # 防重入下单锁
+position_tracker = {'long': 0.0, 'short': 0.0}  # 本地持仓记录（仓位上限已取消，仅记录下单操作）
+last_order_side = None                     # 主策略中上一次下单方向：'long' 或 'short'
+last_main_trend = 1                        # 默认主趋势为上升
 
 # 用于并行子策略，每轮只触发一次
 macd_triggered = False
@@ -119,10 +119,9 @@ def compute_bollinger_percent_b(df, window=20, std_multiplier=2):
 # 信号生成函数
 # --------------------
 def generate_main_trend_signal(df_15m):
-    # 仅依靠15分钟超级趋势指标（长度=10, 因子=3）判定主趋势
     df = compute_supertrend(df_15m, period=10, multiplier=3)
     latest = df.iloc[-1]
-    result = latest['trend']   # 1 表示上升，-1 表示下降
+    result = latest['trend']   # 1：上升；-1：下降
     global last_main_trend
     if result == 0 or result is None:
         result = last_main_trend if last_main_trend is not None else 1
@@ -255,21 +254,20 @@ def trailing_stop_update(current_price, bb_width):
 async def macd_strategy(df_15m):
     global macd_triggered
     try:
-        # 计算15分钟 MACD
         macd_instance = MACD(close=df_15m['close'], window_fast=12, window_slow=26, window_sign=9)
         df_macd = macd_instance.df
         macd_diff = df_macd.iloc[-1]['MACD_diff']
         if not macd_triggered:
-            if macd_diff >= 11:  # 银叉信号
-                qty = 0.1 if macd_diff < 20 else 0.15
-                logging.info(f"MACD子策略触发：银叉信号，做空 {qty} ETH")
+            if macd_diff >= 11:
+                qty = 0.15
+                logging.info(f"MACD子策略触发（银叉）：做空 {qty} ETH")
                 res = await async_place_order('SELL', 'MARKET', qty)
                 if res:
                     update_position('short', qty, action='open')
                     macd_triggered = True
-            elif macd_diff <= -11:  # 金叉信号
+            elif macd_diff <= -11:
                 qty = 0.15
-                logging.info(f"MACD子策略触发：金叉信号，做多 {qty} ETH")
+                logging.info(f"MACD子策略触发（金叉）：做多 {qty} ETH")
                 res = await async_place_order('BUY', 'MARKET', qty)
                 if res:
                     update_position('long', qty, action='open')
@@ -291,13 +289,13 @@ async def supertrend_strategy(df_15m):
         t3 = df_factor3.iloc[-1]['trend']
         if not supertrend_triggered:
             if t1 == t2 == t3 == 1:
-                logging.info("超级趋势子策略触发：三指标均转绿，做多0.15ETH")
+                logging.info("超级趋势子策略触发：三指标均转绿，做多 0.15 ETH")
                 res = await async_place_order('BUY', 'MARKET', 0.15)
                 if res:
                     update_position('long', 0.15, action='open')
                     supertrend_triggered = True
             elif t1 == t2 == t3 == -1:
-                logging.info("超级趋势子策略触发：三指标均转红，做空0.15ETH")
+                logging.info("超级趋势子策略触发：三指标均转红，做空 0.15 ETH")
                 res = await async_place_order('SELL', 'MARKET', 0.15)
                 if res:
                     update_position('short', 0.15, action='open')
@@ -306,7 +304,7 @@ async def supertrend_strategy(df_15m):
         logging.exception(f"超级趋势子策略异常: {e}")
 
 # --------------------
-# 主策略循环（异步调度，刷新频率60秒）
+# 主策略循环（异步调度，刷新频率1秒）
 # --------------------
 async def main_strategy_loop():
     global last_order_side, macd_triggered, supertrend_triggered
@@ -320,10 +318,10 @@ async def main_strategy_loop():
             )
             if df_15m is None or df_1h is None or df_3m is None:
                 logging.warning("数据获取失败，等待重试")
-                await asyncio.sleep(30)
+                await asyncio.sleep(1)
                 continue
 
-            # 检查新的15分钟K线出现时，重置子策略触发标志和轮流下单记录
+            # 检查新一根15分钟K线，重置子策略触发标志和轮流下单记录
             latest_15m_close = df_15m.iloc[-1]['close']
             if prev_15m_close is None or latest_15m_close != prev_15m_close:
                 macd_triggered = False
@@ -352,63 +350,33 @@ async def main_strategy_loop():
 
             if order_side:
                 if last_order_side == order_side:
-                    logging.info("本轮已触发相同方向下单，跳过")
+                    logging.info("主策略本轮已触发相同方向下单，跳过")
                 else:
                     if order_side == 'long':
                         signal_strength = strength_info['long_strength']
-                        qty = 0.12 if main_trend==1 and signal_strength=='strong' else 0.03
+                        qty = 0.12 if main_trend == 1 and signal_strength == 'strong' else 0.03
                     else:
                         signal_strength = strength_info['short_strength']
-                        qty = 0.07 if main_trend==-1 and signal_strength=='strong' else 0.015
+                        qty = 0.07 if main_trend == -1 and signal_strength == 'strong' else 0.015
 
                     orders_dict = generate_3m_trade_orders(df_3m, current_price, trend=main_trend,
                                                            strength=signal_strength, side=order_side)
                     logging.info(f"生成挂单信号: {orders_dict}")
                     best_order = orders_dict['orders'][0]
-                    side_str = 'BUY' if order_side=='long' else 'SELL'
+                    side_str = 'BUY' if order_side == 'long' else 'SELL'
+                    order_res = await async_place_order(side_str, 'LIMIT', qty, best_order['order_price'])
+                    if order_res:
+                        update_position(order_side, qty, action='open')
+                        last_order_side = order_side
+                        entry_price = best_order['order_price']
+                        sl_price = calculate_stop_loss(entry_price, order_side)
+                        logging.info(f"主策略入场价: {entry_price}, 初始止损价: {sl_price}")
+                        await async_place_take_profit_orders(entry_price, order_side, signal_strength, qty)
 
-                    if main_trend == 1:
-                        if order_side=='long' and position_tracker['long'] >= 1.0:
-                            logging.warning("多仓超限，暂停下单")
-                        elif order_side=='short' and position_tracker['short'] >= 0.75:
-                            logging.warning("空仓超限，暂停下单")
-                        else:
-                            order_res = await async_place_order(side_str, 'LIMIT', qty, best_order['order_price'])
-                            if order_res:
-                                update_position(order_side, qty, action='open')
-                                last_order_side = order_side
-                                entry_price = best_order['order_price']
-                                sl_price = calculate_stop_loss(entry_price, order_side)
-                                logging.info(f"入场价: {entry_price}, 初始止损价: {sl_price}")
-                                await async_place_take_profit_orders(entry_price, order_side, signal_strength, qty)
-                    else:
-                        if order_side=='long' and position_tracker['long'] >= 0.75:
-                            logging.warning("多仓超限，暂停下单")
-                        elif order_side=='short' and position_tracker['short'] >= 1.0:
-                            logging.warning("空仓超限，暂停下单")
-                        else:
-                            order_res = await async_place_order(side_str, 'LIMIT', qty, best_order['order_price'])
-                            if order_res:
-                                update_position(order_side, qty, action='open')
-                                last_order_side = order_side
-                                entry_price = best_order['order_price']
-                                sl_price = calculate_stop_loss(entry_price, order_side)
-                                logging.info(f"入场价: {entry_price}, 初始止损价: {sl_price}")
-                                await async_place_take_profit_orders(entry_price, order_side, signal_strength, qty)
-            # 并行调度子策略，每轮触发一次
+            # 并行调度子策略：每轮只触发一次
             asyncio.create_task(macd_strategy(df_15m))
             asyncio.create_task(supertrend_strategy(df_15m))
 
-            if main_trend == 1:
-                if position_tracker['long'] > 1.0:
-                    logging.warning("多仓超出上限")
-                if position_tracker['short'] > 0.75:
-                    logging.warning("空仓不足，请及时调仓")
-            else:
-                if position_tracker['long'] > 0.75:
-                    logging.warning("多仓不足，请及时调仓")
-                if position_tracker['short'] > 1.0:
-                    logging.warning("空仓超出上限")
             bb_width = df_3m_bb.iloc[-1]['bb_upper'] - df_3m_bb.iloc[-1]['bb_lower']
             trailing_sl = trailing_stop_update(current_price, bb_width)
             logging.info(f"动态跟踪止损价更新为: {trailing_sl}")
