@@ -8,6 +8,7 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from dotenv import load_dotenv
 from ta.volatility import BollingerBands, AverageTrueRange
+from ta.trend import MACD
 
 # --------------------
 # 环境加载与基本配置
@@ -25,17 +26,17 @@ executor = ThreadPoolExecutor(max_workers=4)
 # --------------------
 # 全局控制变量
 # --------------------
-order_lock = asyncio.Lock()           # 防重入下单锁
-position_tracker = {'long': 0.0, 'short': 0.0}  # 本地持仓记录（仓位上限取消，仅记录下单操作）
-last_order_side = None                 # 全局记录上一次下单方向 ("long" 或 "short")
-last_main_trend = 1                    # 默认主趋势为上升
+order_lock = asyncio.Lock()          # 下单防重入锁
+position_tracker = {'long': 0.0, 'short': 0.0}  # 记录下单操作（不限制仓位上限）
+last_order_side = None                # 记录上一次下单方向，确保同一轮内仅触发一次
+last_main_trend = 1                   # 默认主趋势为上升
 
 # --------------------
 # 数据获取函数（同步与异步封装）
 # --------------------
 def get_klines(symbol, interval, lookback_minutes):
-    end_time = int(time.time()*1000)
-    start_time = end_time - lookback_minutes*60*1000
+    end_time = int(time.time() * 1000)
+    start_time = end_time - lookback_minutes * 60 * 1000
     try:
         klines = client.futures_klines(symbol=symbol, interval=interval, startTime=start_time, endTime=end_time)
     except BinanceAPIException as e:
@@ -116,7 +117,7 @@ def compute_bollinger_percent_b(df, window=20, std_multiplier=2):
 def generate_main_trend_signal(df_15m):
     df = compute_supertrend(df_15m, period=10, multiplier=3)
     latest = df.iloc[-1]
-    result = latest['trend']  # 1：上升；-1：下降
+    result = latest['trend']   # 1: 上升, -1: 下降
     global last_main_trend
     if result == 0 or result is None:
         result = last_main_trend if last_main_trend is not None else 1
@@ -124,10 +125,10 @@ def generate_main_trend_signal(df_15m):
     return result
 
 def generate_strength_signal(df_1h):
-    df = compute_bollinger_percent_b(df_1h, window=20, std_multiplier=2)
+    df = compute_bollinger_percent_b(df_1h, window=10, std_multiplier=3)
     pb = df.iloc[-1]['percent_b']
     logging.info(f"1小时Bollinger %B: {pb}")
-    # 设置阈值：当 %B < 0.3 时视为多单强；当 %B > 0.7 时视为空单强；否则为弱信号
+    # 设定阈值：%B < 0.3 为多单强；%B > 0.7 为空单强；否则为弱信号
     return {'long_strength': 'strong' if pb < 0.16 else 'weak',
             'short_strength': 'strong' if pb > 0.84 else 'weak'}
 
@@ -152,7 +153,7 @@ def generate_3m_trade_orders(df_3m, current_price, trend, strength, side):
     return {'orders': orders}
 
 # --------------------
-# 下单与仓位管理（异步封装，增加 positionSide 参数）
+# 下单与仓位管理（异步封装，传入 positionSide 参数）
 # --------------------
 async def async_place_order(order_side, order_type, quantity, price=None):
     async with order_lock:
@@ -263,7 +264,7 @@ async def main_strategy_loop():
                 await asyncio.sleep(1)
                 continue
 
-            # 检查新一根15分钟K线出现时，重置轮次（重置子策略和轮流下单记录）
+            # 检查新15分钟K线出现时，重置轮次（同时重置子策略和 last_order_side）
             latest_15m_close = df_15m.iloc[-1]['close']
             if prev_15m_close is None or latest_15m_close != prev_15m_close:
                 macd_triggered = False
@@ -282,7 +283,7 @@ async def main_strategy_loop():
             latest_percent_b = df_3m_bb.iloc[-1]['percent_b']
             logging.info(f"最新价格: {current_price}, 3m %B: {latest_percent_b}")
 
-            # 主策略下单信号：3m %B <= 0 触发多单；>= 1 触发空单
+            # 主策略下单条件：当3m %B<=0触发多单；>=1触发空单
             order_side = None
             if latest_percent_b <= 0:
                 order_side = 'long'
@@ -292,22 +293,22 @@ async def main_strategy_loop():
                 logging.info("3m信号不满足下单条件")
 
             if order_side:
-                # 严格轮流触发：如果本轮已下单同方向，则忽略新信号
+                # 严格轮流触发，下单方向必须与上一次不同，否则忽略
                 if last_order_side == order_side:
                     logging.info("主策略本轮已触发相同方向下单，跳过")
                 else:
                     if order_side == 'long':
                         signal_strength = strength_info['long_strength']
-                        qty = 0.12 if main_trend == 1 and signal_strength == 'strong' else 0.03
+                        qty = 0.12 if main_trend==1 and signal_strength=='strong' else 0.03
                     else:
                         signal_strength = strength_info['short_strength']
-                        qty = 0.07 if main_trend == -1 and signal_strength == 'strong' else 0.015
+                        qty = 0.07 if main_trend==-1 and signal_strength=='strong' else 0.015
 
                     orders_dict = generate_3m_trade_orders(df_3m, current_price, trend=main_trend,
                                                            strength=signal_strength, side=order_side)
                     logging.info(f"生成挂单信号: {orders_dict}")
                     best_order = orders_dict['orders'][0]
-                    side_str = 'BUY' if order_side == 'long' else 'SELL'
+                    side_str = 'BUY' if order_side=='long' else 'SELL'
                     if last_order_side is None or last_order_side != order_side:
                         order_res = await async_place_order(side_str, 'LIMIT', qty, best_order['order_price'])
                         if order_res:
