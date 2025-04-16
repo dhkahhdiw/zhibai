@@ -26,10 +26,10 @@ executor = ThreadPoolExecutor(max_workers=4)
 # --------------------
 # 全局控制变量
 # --------------------
-order_lock = asyncio.Lock()          # 下单防重入锁
-position_tracker = {'long': 0.0, 'short': 0.0}  # 记录下单操作（不限制仓位上限）
-last_order_side = None                # 记录上一次下单方向，确保同一轮内仅触发一次
-last_main_trend = 1                   # 默认主趋势为上升
+order_lock = asyncio.Lock()           # 防重入下单锁
+position_tracker = {'long': 0.0, 'short': 0.0}  # 本地持仓记录（取消仓位上限检测，仅记录下单操作）
+last_order_side = None                 # 全局记录上一次下单方向 ("long" 或 "short")
+last_main_trend = 1                    # 默认主趋势为上升
 
 # --------------------
 # 数据获取函数（同步与异步封装）
@@ -103,7 +103,7 @@ def compute_supertrend(df, period=10, multiplier=3):
     df['trend'] = trend
     return df
 
-def compute_bollinger_percent_b(df, window=20, std_multiplier=2):
+def compute_bollinger_percent_b(df, window=10, std_multiplier=3):
     bb = BollingerBands(close=df['close'], window=window, window_dev=std_multiplier)
     df['bb_upper'] = bb.bollinger_hband()
     df['bb_lower'] = bb.bollinger_lband()
@@ -117,7 +117,7 @@ def compute_bollinger_percent_b(df, window=20, std_multiplier=2):
 def generate_main_trend_signal(df_15m):
     df = compute_supertrend(df_15m, period=10, multiplier=3)
     latest = df.iloc[-1]
-    result = latest['trend']   # 1: 上升, -1: 下降
+    result = latest['trend']   # 1表示上升；-1表示下降
     global last_main_trend
     if result == 0 or result is None:
         result = last_main_trend if last_main_trend is not None else 1
@@ -125,10 +125,10 @@ def generate_main_trend_signal(df_15m):
     return result
 
 def generate_strength_signal(df_1h):
-    df = compute_bollinger_percent_b(df_1h, window=10, std_multiplier=3)
+    df = compute_bollinger_percent_b(df_1h, window=20, std_multiplier=2)
     pb = df.iloc[-1]['percent_b']
     logging.info(f"1小时Bollinger %B: {pb}")
-    # 设定阈值：%B < 0.3 为多单强；%B > 0.7 为空单强；否则为弱信号
+    # 设定阈值：当 %B < 0.3 视为多单强；当 %B > 0.7 视为空单强；否则为弱信号
     return {'long_strength': 'strong' if pb < 0.16 else 'weak',
             'short_strength': 'strong' if pb > 0.84 else 'weak'}
 
@@ -153,7 +153,7 @@ def generate_3m_trade_orders(df_3m, current_price, trend, strength, side):
     return {'orders': orders}
 
 # --------------------
-# 下单与仓位管理（异步封装，传入 positionSide 参数）
+# 下单与仓位管理（异步封装，增加 positionSide 参数）
 # --------------------
 async def async_place_order(order_side, order_type, quantity, price=None):
     async with order_lock:
@@ -250,7 +250,8 @@ def trailing_stop_update(current_price, bb_width):
 # 主策略循环（异步调度，刷新频率1秒）
 # --------------------
 async def main_strategy_loop():
-    global last_order_side, macd_triggered, supertrend_triggered
+    global last_order_side
+    # 使用一个变量保存上一次15m收盘价，但不重置 last_order_side
     prev_15m_close = None
     while True:
         try:
@@ -264,13 +265,8 @@ async def main_strategy_loop():
                 await asyncio.sleep(1)
                 continue
 
-            # 检查新15分钟K线出现时，重置轮次（同时重置子策略和 last_order_side）
-            latest_15m_close = df_15m.iloc[-1]['close']
-            if prev_15m_close is None or latest_15m_close != prev_15m_close:
-                macd_triggered = False
-                supertrend_triggered = False
-                last_order_side = None
-                prev_15m_close = latest_15m_close
+            # 记录15分钟收盘价（该值用于监控数据更新，但不用于重置轮次）
+            prev_15m_close = df_15m.iloc[-1]['close']
 
             main_trend = generate_main_trend_signal(df_15m)
             logging.info(f"主趋势：{'上升' if main_trend==1 else '下降'}")
@@ -283,7 +279,7 @@ async def main_strategy_loop():
             latest_percent_b = df_3m_bb.iloc[-1]['percent_b']
             logging.info(f"最新价格: {current_price}, 3m %B: {latest_percent_b}")
 
-            # 主策略下单条件：当3m %B<=0触发多单；>=1触发空单
+            # 主策略下单条件：当3m %B <= 0 触发多单；>= 1 触发空单
             order_side = None
             if latest_percent_b <= 0:
                 order_side = 'long'
@@ -293,22 +289,23 @@ async def main_strategy_loop():
                 logging.info("3m信号不满足下单条件")
 
             if order_side:
-                # 严格轮流触发，下单方向必须与上一次不同，否则忽略
+                # 严格轮流：如果上一次下单方向与当前信号相同则忽略
                 if last_order_side == order_side:
                     logging.info("主策略本轮已触发相同方向下单，跳过")
                 else:
                     if order_side == 'long':
                         signal_strength = strength_info['long_strength']
-                        qty = 0.12 if main_trend==1 and signal_strength=='strong' else 0.03
+                        qty = 0.12 if main_trend == 1 and signal_strength == 'strong' else 0.03
                     else:
                         signal_strength = strength_info['short_strength']
-                        qty = 0.07 if main_trend==-1 and signal_strength=='strong' else 0.015
+                        qty = 0.07 if main_trend == -1 and signal_strength == 'strong' else 0.015
 
                     orders_dict = generate_3m_trade_orders(df_3m, current_price, trend=main_trend,
                                                            strength=signal_strength, side=order_side)
                     logging.info(f"生成挂单信号: {orders_dict}")
                     best_order = orders_dict['orders'][0]
                     side_str = 'BUY' if order_side=='long' else 'SELL'
+                    # 仅允许下单一次（轮流触发）
                     if last_order_side is None or last_order_side != order_side:
                         order_res = await async_place_order(side_str, 'LIMIT', qty, best_order['order_price'])
                         if order_res:
