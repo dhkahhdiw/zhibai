@@ -128,8 +128,8 @@ def generate_strength_signal(df_1h):
     pb = df.iloc[-1]['percent_b']
     logging.info(f"1小时Bollinger %B: {pb}")
     # 设置阈值：当 %B < 0.3 时视为多单强；当 %B > 0.7 时视为空单强；否则为弱信号
-    return {'long_strength': 'strong' if pb < 0.3 else 'weak',
-            'short_strength': 'strong' if pb > 0.7 else 'weak'}
+    return {'long_strength': 'strong' if pb < 0.16 else 'weak',
+            'short_strength': 'strong' if pb > 0.84 else 'weak'}
 
 def generate_3m_trade_orders(df_3m, current_price, trend, strength, side):
     orders = []
