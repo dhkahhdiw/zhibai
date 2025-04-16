@@ -21,7 +21,6 @@ SYMBOL     = 'ETHUSDC'  # 合约交易对
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 client = Client(API_KEY, SECRET_KEY)
-# 使用 futures 模块接口时，python-binance 的 Client 已支持 futures_create_order 等方法
 executor = ThreadPoolExecutor(max_workers=4)
 
 # --------------------
@@ -29,48 +28,11 @@ executor = ThreadPoolExecutor(max_workers=4)
 # --------------------
 order_lock = asyncio.Lock()    # 防重入锁
 position_tracker = {'long': 0.0, 'short': 0.0}
-last_order_side = None  # 记录上一次下单方向（'long'或'short'）
+last_order_side = None  # 上一次下单方向（'long'或'short'）
 last_main_trend = 1     # 默认主趋势为上升
 
 # --------------------
-# 余额检查（使用合约账户余额查询）
-# --------------------
-def get_future_balance(asset='USDC'):
-    try:
-        bal_list = client.futures_account_balance()
-        for b in bal_list:
-            if b['asset'] == asset:
-                return float(b['balance'])
-        return 0.0
-    except Exception as e:
-        logging.error(f"获取合约{asset}余额异常: {e}")
-        return 0.0
-
-def sufficient_balance(order_side, quantity, price):
-    """
-    对于 BUY（多单），检查 USDC 余额是否足够支付成本（quantity × price）；
-    对于 SELL（空单），检查 ETH 持仓（未平仓）是否足够。
-    这里只做简单检查，实际合约中需结合仓位和杠杆管理。
-    """
-    if order_side.upper() == 'BUY':
-        usdc = get_future_balance('USDC')
-        cost = quantity * price
-        if usdc >= cost:
-            return True
-        else:
-            logging.error(f"USDC余额不足: {usdc}, 需要成本: {cost}")
-            return False
-    elif order_side.upper() == 'SELL':
-        # futures持仓查询，此处简单取本地记录
-        if position_tracker['long'] >= quantity:
-            return True
-        else:
-            logging.error(f"持仓不足（多单平仓时）：当前多仓 {position_tracker['long']}, 需要: {quantity}")
-            return False
-    return False
-
-# --------------------
-# 数据获取函数
+# 数据获取函数（同步与异步封装）
 # --------------------
 def get_klines(symbol, interval, lookback_minutes):
     end_time = int(time.time() * 1000)
@@ -202,21 +164,12 @@ def generate_3m_trade_orders(df_3m, current_price, trend, strength, side):
     return {'orders': orders}
 
 # --------------------
-# 下单与仓位管理（异步封装，采用 futures 接口和余额检查）
+# 下单与仓位管理（异步封装，不再执行余额检查）
 # --------------------
 async def async_place_order(order_side, order_type, quantity, price=None):
     async with order_lock:
         loop = asyncio.get_running_loop()
         try:
-            # 使用余额检查避免触发余额不足错误
-            if order_side.upper() == 'BUY':
-                if not sufficient_balance('BUY', quantity, price):
-                    logging.error("买单余额不足，跳过下单")
-                    return None
-            elif order_side.upper() == 'SELL':
-                if not sufficient_balance('SELL', quantity, price):
-                    logging.error("卖单（平仓）余额不足，跳过下单")
-                    return None
             res = await loop.run_in_executor(executor, place_order, order_side, order_type, quantity, price)
             if res is None:
                 logging.error("下单返回空结果")
@@ -229,7 +182,6 @@ async def async_place_order(order_side, order_type, quantity, price=None):
 
 def place_order(order_side, order_type, quantity, price=None):
     try:
-        # 对于合约交易，调用 futures_create_order
         if order_type == 'LIMIT' and price is not None:
             order = client.futures_create_order(
                 symbol=SYMBOL,
@@ -265,7 +217,7 @@ def update_position(side, quantity, action='open'):
     logging.info(f"当前仓位: {position_tracker}")
 
 # --------------------
-# 止盈挂单函数（必须提前量挂单）
+# 止盈挂单函数（提前量挂单）
 # --------------------
 async def async_place_take_profit_orders(entry_price, side, signal_strength, base_quantity):
     loop = asyncio.get_running_loop()
@@ -278,10 +230,10 @@ async def async_place_take_profit_orders(entry_price, side, signal_strength, bas
         order_prop = 0.50
     for offset in offsets:
         if side == 'long':
-            tp_price = entry_price * (1 + offset/100.0)
+            tp_price = entry_price * (1 + offset / 100.0)
             tp_side = 'SELL'
         else:
-            tp_price = entry_price * (1 - offset/100.0)
+            tp_price = entry_price * (1 - offset / 100.0)
             tp_side = 'BUY'
         qty = base_quantity * order_prop
         orders.append({'order_side': tp_side, 'price': tp_price, 'quantity': qty, 'offset': offset})
@@ -294,7 +246,7 @@ async def async_place_take_profit_orders(entry_price, side, signal_strength, bas
     return orders
 
 # --------------------
-# 止损及动态跟踪函数
+# 止损及跟踪函数
 # --------------------
 def calculate_stop_loss(entry_price, side):
     return entry_price * (0.98 if side == 'long' else 1.02)
@@ -336,7 +288,7 @@ async def supertrend_strategy(df_15m):
         logging.exception(f"超级趋势子策略异常: {e}")
 
 # --------------------
-# 主策略循环（异步调度，60秒刷新）
+# 主策略循环（异步调度，刷新频率60秒）
 # --------------------
 async def main_strategy_loop():
     global last_order_side
@@ -352,21 +304,17 @@ async def main_strategy_loop():
                 await asyncio.sleep(30)
                 continue
 
-            # 主趋势判断：15m超级趋势+MACD（强制返回1或-1）
             main_trend = generate_main_trend_signal(df_15m)
             logging.info(f"主趋势：{'上升' if main_trend==1 else '下降'}")
 
-            # 强弱信号：1h Bollinger %B
             strength_info = generate_strength_signal(df_1h)
             logging.info(f"1小时信号: {strength_info}")
 
-            # 最新3m数据：价格及 Bollinger %B
             current_price = df_3m.iloc[-1]['close']
             df_3m_bb = compute_bollinger_percent_b(df_3m.copy(), window=20, std_multiplier=2)
             latest_percent_b = df_3m_bb.iloc[-1]['percent_b']
             logging.info(f"最新价格: {current_price}, 3m %B: {latest_percent_b}")
 
-            # 下单信号：当3m %B <= 0则触发多单，下单价格基于挂单网格计算；当 %B >= 1 触发空单
             order_side = None
             if latest_percent_b <= 0:
                 order_side = 'long'
@@ -392,7 +340,6 @@ async def main_strategy_loop():
                     best_order = orders_dict['orders'][0]
                     side_str = 'BUY' if order_side=='long' else 'SELL'
 
-                    # 仓位控制：对于上升趋势，多仓上限1.0，空仓上限0.75；下降趋势反之
                     if main_trend == 1:
                         if order_side=='long' and position_tracker['long'] >= 1.0:
                             logging.warning("多仓超限，暂停下单")
@@ -421,15 +368,12 @@ async def main_strategy_loop():
                                 sl_price = calculate_stop_loss(entry_price, order_side)
                                 logging.info(f"入场价: {entry_price}, 初始止损价: {sl_price}")
                                 await async_place_take_profit_orders(entry_price, order_side, signal_strength, qty)
-            # 当15m趋势变化时重置轮流记录
             if len(df_15m) >= 2 and df_15m.iloc[-2]['close'] != df_15m.iloc[-1]['close']:
                 last_order_side = None
 
-            # 并行调度子策略任务
             asyncio.create_task(macd_strategy(df_15m))
             asyncio.create_task(supertrend_strategy(df_15m))
 
-            # 仓位控制提醒
             if main_trend == 1:
                 if position_tracker['long'] > 1.0:
                     logging.warning("多仓超出上限")
@@ -440,7 +384,6 @@ async def main_strategy_loop():
                     logging.warning("多仓不足，请及时调仓")
                 if position_tracker['short'] > 1.0:
                     logging.warning("空仓超出上限")
-            # 止损动态跟踪（示意）：基于3m Bollinger带宽更新
             bb_width = df_3m_bb.iloc[-1]['bb_upper'] - df_3m_bb.iloc[-1]['bb_lower']
             trailing_sl = trailing_stop_update(current_price, bb_width)
             logging.info(f"动态跟踪止损价更新为: {trailing_sl}")
