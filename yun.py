@@ -376,7 +376,7 @@ async def main_strategy_loop():
 
         except Exception as e:
             logging.exception(f"主策略异常: {e}")
-        await asyncio.sleep(60)
+        await asyncio.sleep(1)
 
 # --------------------
 # 主入口与调度
