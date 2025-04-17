@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 from ta.volatility import BollingerBands
-from ta.trend import MACD, SuperTrend
+from ta.trend import MACD, super_trend
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from dotenv import load_dotenv
