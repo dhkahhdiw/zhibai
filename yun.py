@@ -12,12 +12,10 @@ from binance.exceptions import BinanceAPIException
 from ta.volatility import BollingerBands, AverageTrueRange
 
 # ─── 配置 ─────────────────────────────────────────────────────────────
-ENV_PATH = '/root/zhibai/.env'
-load_dotenv(ENV_PATH)
-API_KEY    = os.getenv('BINANCE_API_KEY', '').strip()
-SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
-SYMBOL     = 'ETHUSDC'
-LEVERAGE   = 50
+load_dotenv(os.path.expanduser('~/.env'))
+API_KEY = os.getenv('BINANCE_API_KEY')
+API_SEC = os.getenv('BINANCE_SECRET_KEY')
+
 SYMBOL       = 'ETHUSDC'
 INTERVAL_3M  = Client.KLINE_INTERVAL_3MINUTE
 INTERVAL_1H  = Client.KLINE_INTERVAL_1HOUR
