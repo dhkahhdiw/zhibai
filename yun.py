@@ -21,11 +21,12 @@ from binance.exceptions import BinanceAPIException
 from dotenv import load_dotenv
 
 # ─── 配置 ──────────────────────────────────────────────────────────────
-load_dotenv(os.path.expanduser('~/.env'))
-API_KEY = os.getenv('BINANCE_API_KEY')
-API_SEC = os.getenv('BINANCE_SECRET_KEY')
-
-SYMBOL      = 'ETHUSDC'
+ENV_PATH = '/root/zhibai/.env'
+load_dotenv(ENV_PATH)
+API_KEY    = os.getenv('BINANCE_API_KEY', '').strip()
+SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
+SYMBOL     = 'ETHUSDC'
+LEVERAGE   = 50
 INTERVAL_3M = Client.KLINE_INTERVAL_3MINUTE
 INTERVAL_1H = Client.KLINE_INTERVAL_1HOUR
 INTERVAL_15M= Client.KLINE_INTERVAL_15MINUTE
