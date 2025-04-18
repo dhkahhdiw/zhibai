@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-yun.py — 一次性 OTOCO 挂单版（修正 SuperTrend 导入）
+yun.py — 一次性 OTOCO 挂单版（修正 Client 初始化）
   • 主策略、MACD、三因子 SuperTrend 均改为 OTOCO
-  • SuperTrend 由 pandas_ta 计算，兼容 ta 0.11.0
   • 确保多空交替，单向每轮只进一次
-  • 适配 Binance Futures REST OTOCO 接口
+  • 使用 python-binance 客户端直接调用 futures_* 接口
 """
 
 import os, time, asyncio, logging
@@ -20,15 +19,15 @@ from binance.exceptions import BinanceAPIException
 from dotenv import load_dotenv
 
 # ─── 配置 ──────────────────────────────────────────────────────────────
-load_dotenv('/root/zhibai/.env')  # 强制指定.env路径
+load_dotenv('/root/zhibai/.env')  # 强制指定 .env 路径
 API_KEY, API_SEC = os.getenv('BINANCE_API_KEY'), os.getenv('BINANCE_SECRET_KEY')
 SYMBOL       = 'ETHUSDC'
 INTERVAL_3M  = Client.KLINE_INTERVAL_3MINUTE
 INTERVAL_1H  = Client.KLINE_INTERVAL_1HOUR
 INTERVAL_15M = Client.KLINE_INTERVAL_15MINUTE
 
-# futures 客户端
-client = Client(API_KEY, API_SEC, futures=True)
+# 直接初始化，不带 futures=True（python‑binance 客户端即支持 futures_* 方法） binanec api.txt](file-service://file-MvNSPEe6fLdwTVsVL3zaoQ)
+client = Client(API_KEY, API_SEC)
 
 executor = ThreadPoolExecutor(4)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -69,7 +68,7 @@ async def place_otoco(side, qty, entry, sl_off, tp_off):
         'newOrderRespType':'RESULT',
     }
     try:
-        res = client.futures_post('/fapi/v1/orderList/otoco', params)
+        res = client.futures_order_otoco(**params)
         logging.info(f"OTOCO 下单[{side}]: entry={entry}@{qty}, SL@{sl_price}, TP@{tp_price}")
         return res
     except BinanceAPIException as e:
@@ -78,20 +77,14 @@ async def place_otoco(side, qty, entry, sl_off, tp_off):
 
 # ─── 策略信号 ───────────────────────────────────────────────────────────
 def main_signal(df3m, df1h, df15):
-    # 15m SuperTrend 趋势 via pandas_ta
-    st15 = pta.supertrend(
-        high=df15['high'], low=df15['low'], close=df15['close'],
-        length=10, multiplier=3.0
-    )
-    st_val = st15[f"SUPERT_10_3.0"].iat[-1]
+    st15 = pta.supertrend(df15['high'], df15['low'], df15['close'], length=10, multiplier=3.0)
+    st_val = st15["SUPERT_10_3.0"].iat[-1]
     trend = 1 if df15['close'].iat[-1] > st_val else -1
 
-    # 1h %B 强弱
     bb1h = BollingerBands(df1h['close'], window=20, window_dev=2)
     up1, lo1 = bb1h.bollinger_hband().iat[-1], bb1h.bollinger_lband().iat[-1]
     p1 = (df1h['close'].iat[-1]-lo1)/(up1-lo1) if up1>lo1 else 0.5
 
-    # 3m %B 入场
     bb3 = BollingerBands(df3m['close'], window=20, window_dev=2)
     up3, lo3 = bb3.bollinger_hband().iat[-1], bb3.bollinger_lband().iat[-1]
     p3 = (df3m['close'].iat[-1]-lo3)/(up3-lo3) if up3>lo3 else 0.5
@@ -114,9 +107,9 @@ def macd_signal(df15):
     return None, None
 
 def st3_signal(df15):
-    s1 = df15['close'].iat[-1] > pta.supertrend(df15['high'], df15['low'], df15['close'], length=10, multiplier=1.0)[f"SUPERT_10_1.0"].iat[-1]
-    s2 = df15['close'].iat[-1] > pta.supertrend(df15['high'], df15['low'], df15['close'], length=11, multiplier=2.0)[f"SUPERT_11_2.0"].iat[-1]
-    s3 = df15['close'].iat[-1] > pta.supertrend(df15['high'], df15['low'], df15['close'], length=12, multiplier=3.0)[f"SUPERT_12_3.0"].iat[-1]
+    s1 = df15['close'].iat[-1] > pta.supertrend(df15['high'], df15['low'], df15['close'], length=10, multiplier=1.0)["SUPERT_10_1.0"].iat[-1]
+    s2 = df15['close'].iat[-1] > pta.supertrend(df15['high'], df15['low'], df15['close'], length=11, multiplier=2.0)["SUPERT_11_2.0"].iat[-1]
+    s3 = df15['close'].iat[-1] > pta.supertrend(df15['high'], df15['low'], df15['close'], length=12, multiplier=3.0)["SUPERT_12_3.0"].iat[-1]
     if s1 and s2 and s3: return 'long',  0.15
     if not s1 and not s2 and not s3: return 'short', 0.15
     return None, None
@@ -137,7 +130,6 @@ async def main_loop():
             get_klines(SYMBOL, INTERVAL_15M, 50),
         )
 
-        # 主策略
         side, strength, qty = main_signal(df3, df1h, df15)
         if side and side != last_main:
             entry = df3['close'].iat[-1]
@@ -147,7 +139,6 @@ async def main_loop():
             if await place_otoco(side, qty, entry, off_sl, off_tp):
                 last_main = side
 
-        # MACD 子策略
         m_side, m_qty = macd_signal(df15)
         if m_side and m_side != last_macd:
             entry = df15['close'].iat[-1]
@@ -157,7 +148,6 @@ async def main_loop():
             if await place_otoco(m_side, m_qty, entry, off_sl, off_tp):
                 last_macd = m_side
 
-        # 三因子 SuperTrend 子策略
         st_side, st_qty = st3_signal(df15)
         if st_side and st_side != last_st3:
             entry = df15['close'].iat[-1]
