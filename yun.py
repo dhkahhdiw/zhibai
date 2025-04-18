@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-yun.py — ETHUSDC 合约策略（REST 轮询 + 一次性 OTOCO）
-  • 每 3 秒轮询一次最新指标 & 价格
+yun.py — ETHUSDC 合约策略（REST 轮询 + 一次性 OTOCO 修正）
+  • 修复 OTOCO 下单须将参数放在 POST 表单体中
   • 主策略：3m %B + 15m SuperTrend + 1h %B
   • 子策略：15m MACD + 三因子 SuperTrend
-  • 一次性提交入场限价 + 止盈 / 止损 条件单（OCO）
+  • 一次性提交限价入场 + 止盈 / 止损 条件单（OCO）
   • 严格轮流触发，防止同方向重复下单
 """
 
@@ -43,6 +43,9 @@ def sign(params: dict) -> str:
     return urllib.parse.quote_plus(sig)
 
 async def api_request(session, method, path, params=None, private=True):
+    """
+    对于 GET 请求使用 query string；对于 POST 请求使用 application/x-www-form-urlencoded body。
+    """
     base = next(FAPI_DOMAINS)
     url  = base + path
     headers = {'X-MBX-TIME-UNIT': TIME_UNIT}
@@ -52,11 +55,19 @@ async def api_request(session, method, path, params=None, private=True):
         p.update({'timestamp':ts,'recvWindow':RECV_WINDOW})
         p['signature'] = sign(p)
         headers['X-MBX-APIKEY'] = API_KEY
-    async with session.request(method, url, params=p, headers=headers) as resp:
-        text = await resp.text()
-        if resp.status >= 400:
-            raise Exception(f"{resp.status}, {text}")
-        return await resp.json()
+
+    if method.upper() == 'GET':
+        async with session.get(url, params=p, headers=headers) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise Exception(f"{resp.status}, {text}")
+            return await resp.json()
+    else:  # POST
+        async with session.post(url, data=p, headers=headers) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise Exception(f"{resp.status}, {text}")
+            return await resp.json()
 
 # ========== 市场数据 & 指标 ==========
 class MarketData:
@@ -64,11 +75,11 @@ class MarketData:
         self.cache = {}
 
     async def fetch_klines(self, session, interval, limit=100):
-        resp = await session.get(
+        async with session.get(
             next(FAPI_DOMAINS) + '/fapi/v1/klines',
             params={'symbol':SYMBOL,'interval':interval,'limit':limit}
-        )
-        data = await resp.json()
+        ) as resp:
+            data = await resp.json()
         df = pd.DataFrame(data, columns=range(12))
         df = df.rename(columns={2:'high',3:'low',4:'close'})
         df[['high','low','close']] = df[['high','low','close']].astype(float)
@@ -84,7 +95,7 @@ class MarketData:
         st = ta.supertrend(df['high'], df['low'], df['close'],
                            length=length, multiplier=mult)
         col = f"SUPERTd_{length}_{mult}"
-        return st[col].iloc[-1]  # +1 up, -1 down
+        return st[col].iloc[-1]
 
     def bbp(self, df, period, dev):
         mb = df['close'].rolling(period).mean()
@@ -118,37 +129,34 @@ class Strategy:
             'newOrderRespType': 'RESULT'
         }
         logging.info(f"下 OTOCO: side={side} qty={qty}@{price}, SL={sl_price}, TP={tp_price}")
-        return await api_request(session, 'POST', '/fapi/v1/orderList/otoco', params)
+        # 正确路径：/fapi/v1/orderList/otoco wait api_request(session, 'POST', '/fapi/v1/orderList/otoco', params)
 
     async def tick(self, session):
         await self.md.update(session)
-        df3  = self.md.cache['3m']
-        df15 = self.md.cache['15m']
-        df1h = self.md.cache['1h']
+        df3, df15, df1h = self.md.cache['3m'], self.md.cache['15m'], self.md.cache['1h']
 
-        # 主策略
+        # — 主策略 —
         st15   = self.md.supertrend(df15, SUPER_LEN, SUPER_FAC)
         bb1h   = self.md.bbp(df1h, BB_H_P, BB_H_S)
         bb3    = self.md.bbp(df3,  BB_3_P, BB_3_S)
-        trend  = 1 if st15>0 else -1
-        main_side = None; qty=0
+        main_side, qty = None, 0
         if bb3 <= 0:
             main_side = 'BUY'
-            qty = 0.12 if (bb1h<0.2 and trend==1) else 0.03
+            qty = 0.12 if (bb1h < 0.2 and st15>0) else 0.03
         elif bb3 >= 1:
             main_side = 'SELL'
-            qty = 0.12 if (bb1h>0.8 and trend==-1) else 0.03
+            qty = 0.12 if (bb1h > 0.8 and st15<0) else 0.03
 
         if main_side and main_side != self.last_main:
-            price  = round(df3['close'].iloc[-1], 2)
-            slp    = round(price*(0.98 if main_side=='BUY' else 1.02),2)
-            tpp    = round(price*(1.02 if main_side=='BUY' else 0.98),2)
+            price = round(df3['close'].iloc[-1],2)
+            slp   = round(price*(0.98 if main_side=='BUY' else 1.02),2)
+            tpp   = round(price*(1.02 if main_side=='BUY' else 0.98),2)
             await self.place_otoco(session, main_side, qty, price, slp, tpp)
             self.last_main = main_side
 
-        # MACD
-        hist    = self.md.macd_hist(df15)
-        cur,prv = hist.iloc[-1], hist.iloc[-2]
+        # — MACD 子策略 —
+        hist = self.md.macd_hist(df15)
+        cur, prv = hist.iloc[-1], hist.iloc[-2]
         macd_side = 'BUY' if (prv<0<cur) else 'SELL' if (prv>0>cur) else None
         if macd_side and macd_side != self.last_macd:
             price = round(df15['close'].iloc[-1],2)
@@ -157,7 +165,7 @@ class Strategy:
             await self.place_otoco(session, macd_side, 0.15, price, slp, tpp)
             self.last_macd = macd_side
 
-        # 三因子 SuperTrend
+        # — 三因子 SuperTrend 子策略 —
         s1 = self.md.supertrend(df15,10,1.0)>0
         s2 = self.md.supertrend(df15,11,2.0)>0
         s3 = self.md.supertrend(df15,12,3.0)>0
@@ -177,9 +185,10 @@ class Strategy:
                     await self.tick(session)
                 except Exception as e:
                     logging.error("策略异常：%s", e)
-                await asyncio.sleep(1)
+                await asyncio.sleep(3)
+
 if __name__ == '__main__':
     try:
         asyncio.run(Strategy().run())
     except KeyboardInterrupt:
-        logging.info("策略已收到停止信号，退出。")
+        logging.info("策略已终止")
