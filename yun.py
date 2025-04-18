@@ -18,18 +18,17 @@ from binance.exceptions import BinanceAPIException
 from dotenv import load_dotenv
 
 # ─── 配置 ──────────────────────────────────────────────────────────────
-ENV_PATH = '/root/zhibai/.env'
-load_dotenv(ENV_PATH)
-API_KEY    = os.getenv('BINANCE_API_KEY', '').strip()
-SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '').strip()
-SYMBOL     = 'ETHUSDC'
-LEVERAGE   = 50
+# 强制指定 .env 路径
+load_dotenv('/root/zhibai/.env')
+API_KEY, API_SEC = os.getenv('BINANCE_API_KEY'), os.getenv('BINANCE_SECRET_KEY')
+
+SYMBOL      = 'ETHUSDC'
 INTERVAL_3M = Client.KLINE_INTERVAL_3MINUTE
 INTERVAL_1H = Client.KLINE_INTERVAL_1HOUR
 INTERVAL_15M= Client.KLINE_INTERVAL_15MINUTE
 
 # futures 客户端
-client = Client(API_KEY,SECRET_KEY, futures=True)
+client = Client(API_KEY, API_SEC, futures=True)
 
 executor = ThreadPoolExecutor(4)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -75,15 +74,14 @@ async def place_otoco(side, qty, entry, sl_off, tp_off):
         'takeProfitPrice':     str(tp_price),
         'takeProfitLimitPrice':str(tp_limit),
         'takeProfitTimeInForce':'GTC',
-        # futures 支持 OTOCO 与 selfTradePreventionMode
         'newOrderRespType':'RESULT',
     }
     try:
         res = client.futures_post('/fapi/v1/orderList/otoco', params)
-        logging.info(f"OTOC0 下单[{side}]: entry={entry}@{qty}, SL@{sl_price}, TP@{tp_price}")
+        logging.info(f"OTOCO 下单[{side}]: entry={entry}@{qty}, SL@{sl_price}, TP@{tp_price}")
         return res
     except BinanceAPIException as e:
-        logging.error(f"OTOC0 下单失败: {e.code} {e.message}")
+        logging.error(f"OTOCO 下单失败: {e.code} {e.message}")
         return None
 
 # ─── 策略信号 ───────────────────────────────────────────────────────────
@@ -128,7 +126,7 @@ def st3_signal(df15):
     if not s1 and not s2 and not s3: return 'short', 0.15
     return None, None
 
-# ─── 状态：保证轮流触发 ─────────────────────────────────────────────────
+# ─── 状态管理：轮流触发 ─────────────────────────────────────────────────
 last_main = None
 last_macd = None
 last_st3  = None
@@ -144,7 +142,7 @@ async def main_loop():
             get_klines(SYMBOL, INTERVAL_15M,50),
         )
 
-        # 1) 主策略
+        # 主策略
         side, strength, qty = main_signal(df3, df1h, df15)
         if side and side!=last_main:
             entry_price = df3['close'].iat[-1]
@@ -154,7 +152,7 @@ async def main_loop():
             if await place_otoco(side, qty, entry_price, off_sl, off_tp):
                 last_main = side
 
-        # 2) MACD 子策略
+        # MACD 子策略
         m_side, m_qty = macd_signal(df15)
         if m_side and m_side!=last_macd:
             entry_price = df15['close'].iat[-1]
@@ -164,7 +162,7 @@ async def main_loop():
             if await place_otoco(m_side, m_qty, entry_price, off_sl, off_tp):
                 last_macd = m_side
 
-        # 3) 三因子 SuperTrend
+        # 三因子 SuperTrend 子策略
         st_side, st_qty = st3_signal(df15)
         if st_side and st_side!=last_st3:
             entry_price = df15['close'].iat[-1]
