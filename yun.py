@@ -1,225 +1,171 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-yun.py — 带心跳 & 日志环缓存（1000条）ETHUSDC 合约策略
-  • 每次 tick 开始/结束打印 DEBUG 心跳
-  • 自定义 RingBufferHandler 仅保留最近 1000 条日志
-  • 主策略：3m %B + 15m SuperTrend + 1h %B
-  • 子策略：15m MACD + 3因子 SuperTrend
-  • OTOCO 一次性限价入场 + 止盈/止损
-"""
+# yun.py — 主策略：3m%B + 15m超级趋势 + 1h%B 强弱信号 + 止盈预挂
 
-import os, time, asyncio, hmac, hashlib, urllib.parse
-from itertools import cycle
-from collections import deque
-
-import aiohttp
-import pandas as pd
-import pandas_ta as ta
-from dotenv import load_dotenv
+import os
+import time
+import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
-# ========== 环境 & 参数 ==========
-load_dotenv('/root/zhibai/.env')
-API_KEY = os.getenv('BINANCE_API_KEY', '')
-API_SECRET = os.getenv('BINANCE_SECRET_KEY', '')
-SYMBOL = 'ETHUSDC'
+import pandas as pd
+from ta.volatility import BollingerBands
+from ta.trend import SuperTrend
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
+from dotenv import load_dotenv
 
-FAPI_DOMAINS = cycle(['https://fapi.binance.com'])
-RECV_WINDOW = 5000
-TIME_UNIT = 'MILLISECOND'
+# ─── 配置 ──────────────────────────────────────────────────────────────
+load_dotenv(os.path.expanduser('~/.env'))
+API_KEY = os.getenv('BINANCE_API_KEY')
+API_SEC = os.getenv('BINANCE_SECRET_KEY')
+SYMBOL  = 'ETHUSDC'
+INTERVAL_3M  = Client.KLINE_INTERVAL_3MINUTE
+INTERVAL_1H  = Client.KLINE_INTERVAL_1HOUR
+INTERVAL_15M = Client.KLINE_INTERVAL_15MINUTE
 
-# 策略参数
-SUPER_LEN, SUPER_FAC = 10, 3.0
-BB_H_P, BB_H_S = 20, 2
-BB_3_P, BB_3_S = 20, 2
-MACD_F, MACD_S, MACD_SIG = 12, 26, 9
+# 多线程包装同步接口
+executor = ThreadPoolExecutor(max_workers=4)
+client   = Client(API_KEY, API_SEC, futures=True)
 
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s'
+)
 
-# ========== 自定义 RingBufferHandler ==========
-class RingBufferHandler(logging.Handler):
-    """仅保留最近 maxlen 条日志消息。"""
+# ─── 工具函数 ────────────────────────────────────────────────────────────
+def fetch_klines(symbol: str, interval: str, lookback: int) -> pd.DataFrame:
+    """
+    同步拉取 K 线，lookback 单位：条数
+    """
+    data = client.futures_klines(symbol=symbol, interval=interval, limit=lookback)
+    df = pd.DataFrame(data, columns=[
+        'open_time','open','high','low','close','volume',
+        'close_time','qav','trades','tbav','tqav','ignore'
+    ])
+    df['close'] = df['close'].astype(float)
+    return df
 
-    def __init__(self, inner_handler, maxlen=1000):
-        super().__init__()
-        self.buffer = deque(maxlen=maxlen)
-        self.inner = inner_handler
-
-    def emit(self, record):
-        msg = self.format(record)
-        # 存入环形缓冲区
-        self.buffer.append(msg)
-        # 同时交给内置 handler（通常为控制台或文件）输出
-        self.inner.emit(record)
-
-
-# ========== 日志配置 ==========
-# 1) 控制台输出所有 INFO+
-console_handler = logging.StreamHandler()
-console_fmt = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
-console_handler.setFormatter(console_fmt)
-console_handler.setLevel(logging.INFO)
-
-# 2) 环缓存 handler，DEBUG 起作用
-ring_inner = logging.StreamHandler()  # 也输出到控制台
-ring_inner.setFormatter(console_fmt)
-ring_inner.setLevel(logging.DEBUG)
-ring_handler = RingBufferHandler(ring_inner, maxlen=1000)
-ring_handler.setLevel(logging.DEBUG)
-
-logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)
-logger.addHandler(console_handler)
-logger.addHandler(ring_handler)
-
-
-# ========== 签名 & HTTP ==========
-def sign(params: dict) -> str:
-    qs = '&'.join(f"{k}={params[k]}" for k in sorted(params))
-    return urllib.parse.quote_plus(
-        hmac.new(API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
+async def get_klines(symbol: str, interval: str, lookback: int) -> pd.DataFrame:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        executor, fetch_klines, symbol, interval, lookback
     )
 
+def compute_main_signal(df3m: pd.DataFrame, trend: int, pb1h: float):
+    """
+    3m %B 主策略信号：
+    返回 (side, strength, qty) 或 (None, None, None)
+      side in {'long','short'}
+      strength in {'strong','weak'}
+      qty: ETH 数量
+    """
+    bb3 = BollingerBands(df3m['close'], window=20, window_dev=2)
+    close = df3m['close'].iat[-1]
+    upper = bb3.bollinger_hband().iat[-1]
+    lower = bb3.bollinger_lband().iat[-1]
+    pct_b = (close - lower) / (upper - lower) if upper>lower else 0.5
 
-async def api_request(session, method, path, params=None, private=True):
-    base = next(FAPI_DOMAINS)
-    url = base + path
-    headers = {'X-MBX-TIME-UNIT': TIME_UNIT}
-    p = (params or {}).copy()
-    if private:
-        ts = int(time.time() * 1000)
-        p.update({'timestamp': ts, 'recvWindow': RECV_WINDOW})
-        p['signature'] = sign(p)
-        headers['X-MBX-APIKEY'] = API_KEY
+    # 多单信号
+    if pct_b <= 0:
+        strength = 'strong' if pct_b<0.2 else 'weak'
+        qty = 0.12 if strength=='strong' and trend==1 else 0.03
+        return 'long', strength, qty if trend==1 else qty
+    # 空单信号
+    if pct_b >= 1:
+        strength = 'strong' if pct_b>0.8 else 'weak'
+        qty = 0.12 if strength=='strong' and trend==-1 else 0.03
+        return 'short', strength, qty if trend==-1 else qty
 
-    if method.upper() == 'GET':
-        async with session.get(url, params=p, headers=headers) as resp:
-            text = await resp.text()
-            if resp.status >= 400: raise Exception(f"{resp.status}, {text}")
-            return await resp.json()
+    return None, None, None
+
+async def place_order(side: str, qty: float, price: float = None, reduceOnly: bool = False):
+    """
+    下单：市价或限价；reduceOnly 用于止盈单
+    """
+    params = dict(
+        symbol=SYMBOL,
+        side='BUY' if side=='long' else 'SELL',
+        type='LIMIT' if price else 'MARKET',
+        quantity=round(qty,6),
+        positionSide='LONG' if side=='long' else 'SHORT',
+        reduceOnly=reduceOnly
+    )
+    if price:
+        params.update(timeInForce='GTC', price=str(round(price,2)))
+    try:
+        res = client.futures_create_order(**params)
+        logging.info(f"下单成功: {res['orderId']} {side} qty={qty}@{price or 'MKT'}")
+        return res
+    except BinanceAPIException as e:
+        logging.error(f"下单失败: {e.code} {e.message}")
+        return None
+
+async def place_take_profits(side: str, entry_price: float, entry_qty: float, strength: str):
+    """
+    提前挂多路限价止盈单 (reduceOnly=True)
+    强信号: offsets=[1.02%,1.23%,1.5%,1.8%,2.2%], props=20%
+    弱信号: offsets=[1.23%,1.8%], props=50%
+    """
+    if strength=='strong':
+        offsets = [0.0102,0.0123,0.0150,0.0180,0.0220]
+        props   = [0.2]*5
     else:
-        # OTOCO 必须放在 body(data)
-        async with session.post(url, data=p, headers=headers) as resp:
-            text = await resp.text()
-            if resp.status >= 400: raise Exception(f"{resp.status}, {text}")
-            return await resp.json()
+        offsets = [0.0123,0.0180]
+        props   = [0.5]*2
 
+    for off, prop in zip(offsets, props):
+        tp_qty = entry_qty * prop
+        if side=='long':
+            tp_price = entry_price * (1 + off)
+            await place_order('short', tp_qty, price=tp_price, reduceOnly=True)
+        else:
+            tp_price = entry_price * (1 - off)
+            await place_order('long', tp_qty, price=tp_price, reduceOnly=True)
 
-# ========== 市场数据 & 指标 ==========
-class MarketData:
-    def __init__(self):
-        self.cache = {}
+# ─── 主循环 ─────────────────────────────────────────────────────────────
+last_main_side = None  # 轮流触发：上一次入场方向
 
-    async def fetch_klines(self, session, interval, limit=100):
-        async with session.get(
-                next(FAPI_DOMAINS) + '/fapi/v1/klines',
-                params={'symbol': SYMBOL, 'interval': interval, 'limit': limit}
-        ) as resp:
-            data = await resp.json()
-        df = pd.DataFrame(data, columns=range(12))
-        df = df.rename(columns={2: 'high', 3: 'low', 4: 'close'})
-        df[['high', 'low', 'close']] = df[['high', 'low', 'close']].astype(float)
-        return df[['high', 'low', 'close']]
+async def main_loop():
+    global last_main_side
+    logging.info("策略启动: 3m%B + 15m SuperTrend + 1h%B 强弱 + 提前止盈挂单")
+    while True:
+        # 并行拉三条 K 线
+        df15, df1h, df3 = await asyncio.gather(
+            get_klines(SYMBOL, INTERVAL_15M,  50),
+            get_klines(SYMBOL, INTERVAL_1H,   50),
+            get_klines(SYMBOL, INTERVAL_3M,   50)
+        )
 
-    async def update(self, session):
-        tasks = {tf: asyncio.create_task(self.fetch_klines(session, tf))
-                 for tf in ('3m', '15m', '1h')}
-        for tf, task in tasks.items():
-            self.cache[tf] = await task
+        # 1) 15m SuperTrend 判主趋势
+        st = SuperTrend(
+            high=df15['high'], low=df15['low'], close=df15['close'],
+            length=10, multiplier=3
+        )
+        super_trend = st.super_trend()
+        trend = 1 if super_trend.iat[-1] < df15['close'].iat[-1] else -1
 
-    def supertrend(self, df, length, mult):
-        s = ta.supertrend(df['high'], df['low'], df['close'],
-                          length=length, multiplier=mult)
-        return s[f"SUPERTd_{length}_{mult}"].iloc[-1]
+        # 2) 1h %B 强弱信号
+        bb1h = BollingerBands(df1h['close'], window=20, window_dev=2)
+        upper1h = bb1h.bollinger_hband().iat[-1]
+        lower1h = bb1h.bollinger_lband().iat[-1]
+        close1h = df1h['close'].iat[-1]
+        pb1h = (close1h - lower1h) / (upper1h - lower1h) if upper1h>lower1h else 0.5
 
-    def bbp(self, df, period, dev):
-        mb = df['close'].rolling(period).mean()
-        sd = df['close'].rolling(period).std()
-        up, lo = mb + dev * sd, mb - dev * sd
-        return ((df['close'] - lo) / (up - lo)).iloc[-1]
+        # 3) 3m 主信号
+        side, strength, qty = compute_main_signal(df3, trend, pb1h)
+        if side and side != last_main_side:
+            entry_price = df3['close'].iat[-1]
+            logging.info(f"主信号触发: {side} 强度={strength} qty={qty} 价格={entry_price}")
+            order = await place_order(side, qty, price=entry_price)
+            if order:
+                await place_take_profits(side, entry_price, qty, strength)
+                last_main_side = side
 
-    def macd_hist(self, df):
-        m = ta.macd(df['close'], fast=MACD_F, slow=MACD_S, signal=MACD_SIG)
-        return m[f"MACDh_{MACD_F}_{MACD_S}_{MACD_SIG}"]
+        await asyncio.sleep(1)
 
-
-# ========== 策略 & 下单 ==========
-class Strategy:
-    def __init__(self):
-        self.md = MarketData()
-        self.last_main = self.last_macd = self.last_st3 = None
-
-    async def place_otoco(self, session, side, qty, price, slp, tpp):
-        params = {
-            'symbol': SYMBOL,
-            'side': side, 'quantity': qty,
-            'price': price,
-            'stopPrice': slp, 'stopLimitPrice': slp, 'stopLimitTimeInForce': 'GTC',
-            'takeProfitPrice': tpp, 'takeProfitLimitPrice': tpp, 'takeProfitTimeInForce': 'GTC',
-            'newOrderRespType': 'RESULT'
-        }
-        logging.info(f"下 OTOCO → {side} {qty}@{price}, SL={slp}, TP={tpp}")
-        return await api_request(session, 'POST', '/fapi/v1/orderList/otoco', params)
-
-    async def tick(self, session):
-        logging.debug("⚡ Tick 开始")
-        await self.md.update(session)
-        df3, df15, df1h = self.md.cache['3m'], self.md.cache['15m'], self.md.cache['1h']
-
-        # — 主策略 —
-        st15 = self.md.supertrend(df15, SUPER_LEN, SUPER_FAC)
-        bb1h = self.md.bbp(df1h, BB_H_P, BB_H_S)
-        bb3 = self.md.bbp(df3, BB_3_P, BB_3_S)
-        side = qty = None
-        if bb3 <= 0:
-            side, qty = 'BUY', 0.12 if (bb1h < 0.2 and st15 > 0) else 0.03
-        elif bb3 >= 1:
-            side, qty = 'SELL', 0.12 if (bb1h > 0.8 and st15 < 0) else 0.03
-        if side and side != self.last_main:
-            price = round(df3['close'].iat[-1], 2)
-            slp = round(price * (0.98 if side == 'BUY' else 1.02), 2)
-            tpp = round(price * (1.02 if side == 'BUY' else 0.98), 2)
-            await self.place_otoco(session, side, qty, price, slp, tpp)
-            self.last_main = side
-
-        # — MACD 子策略 —
-        hist = self.md.macd_hist(df15)
-        cur, prv = hist.iat[-1], hist.iat[-2]
-        mside = 'BUY' if (prv < 0 < cur) else 'SELL' if (prv > 0 > cur) else None
-        if mside and mside != self.last_macd:
-            price = round(df15['close'].iat[-1], 2)
-            slp = round(price * (0.97 if mside == 'BUY' else 1.03), 2)
-            tpp = round(price * (1.02 if mside == 'BUY' else 0.98), 2)
-            await self.place_otoco(session, mside, 0.15, price, slp, tpp)
-            self.last_macd = mside
-
-        # — 三因子 SuperTrend —
-        s1 = self.md.supertrend(df15, 10, 1.0) > 0
-        s2 = self.md.supertrend(df15, 11, 2.0) > 0
-        s3 = self.md.supertrend(df15, 12, 3.0) > 0
-        st3 = 'BUY' if all([s1, s2, s3]) else 'SELL' if not any([s1, s2, s3]) else None
-        if st3 and st3 != self.last_st3:
-            price = round(df15['close'].iat[-1], 2)
-            slp = round(price * (0.97 if st3 == 'BUY' else 1.03), 2)
-            tpp = round(price * (1.02 if st3 == 'BUY' else 0.98), 2)
-            await self.place_otoco(session, st3, 0.15, price, slp, tpp)
-            self.last_st3 = st3
-
-        logging.debug("⚡ Tick 完成")
-
-    async def run(self):
-        logging.info("▶ 策略启动")
-        async with aiohttp.ClientSession() as s:
-            while True:
-                try:
-                    await self.tick(s)
-                except Exception as e:
-                    logging.error("策略异常：%s", e)
-                await asyncio.sleep(3)
-
-
+# ─── 启动 ───────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     try:
-        asyncio.run(Strategy().run())
+        asyncio.run(main_loop())
     except KeyboardInterrupt:
-        logging.info("✋ 策略终止")
+        logging.info("手动终止")
