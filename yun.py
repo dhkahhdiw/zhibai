@@ -1,58 +1,61 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, time, hmac, hashlib, urllib.parse, asyncio
+
+import os
+import time
+import hmac
+import hashlib
+import urllib.parse
+import asyncio
 from itertools import cycle
 from dotenv import load_dotenv
-import aiohttp, pandas as pd, numpy as np, ta
+import aiohttp
+import pandas as pd
+import numpy as np
+import ta  # 使用 python-ta 中的 ATR、MACD、BollingerBands
 
 # ========== 配置 ==========
 load_dotenv('/root/zhibai/.env')
-API_KEY    = os.getenv('BINANCE_API_KEY','')
-API_SECRET = os.getenv('BINANCE_SECRET_KEY','')
-SYMBOL     = 'ETHUSDC'
-# Futures 私有接口（可拓展多域名）
+API_KEY     = os.getenv('BINANCE_API_KEY','')
+API_SECRET  = os.getenv('BINANCE_SECRET_KEY','')
+SYMBOL      = 'ETHUSDC'
 FAPI_DOMAINS = cycle(['https://fapi.binance.com'])
-RECV_WINDOW   = 5000
-TIME_UNIT     = 'MILLISECOND'  # 支持 MILLISECOND 或 MICROSECOND
+RECV_WINDOW  = 5000
+TIME_UNIT    = 'MILLISECOND'
 
 # 策略参数
-SUPER_LEN, SUPER_FACT       = 10, 3.0
-BB_PERIOD_H, BB_STD_H       = 20, 2
-BB_PERIOD_3, BB_STD_3       = 20, 2
+SUPER_LEN   = 10
+BB_PERIOD_H = 20; BB_STD_H  = 2
+BB_PERIOD_3 = 20; BB_STD_3  = 2
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
+LADDER_OFFSETS = [0.25, 0.4, 0.6, 0.8, 1.6]  # %
+LADDER_RATIO   = 0.2
 
-# ========== ExchangeInfo 预加载 & 格式化 ==========
+# ========== 预加载 ExchangeInfo & 格式化 ==========
 class ExchangeInfoFut:
     def __init__(self):
         self.filters = {}
         self.default_stp = 'NONE'
-
     async def load(self, session):
         url = next(FAPI_DOMAINS) + '/fapi/v1/exchangeInfo'
         async with session.get(url) as r:
             data = await r.json()
-        # 某合约的 filters
         for s in data['symbols']:
             if s['symbol']==SYMBOL:
                 for f in s['filters']:
                     self.filters[f['filterType']] = f
-                # triggerProtect 用于条件单保护
-                self.trigger_protect = s.get('triggerProtect', 0.0)
+                self.default_stp = data.get('defaultSelfTradePreventionMode','NONE')
                 break
-        # selfTradePrevention
-        self.default_stp = data.get('defaultSelfTradePreventionMode','NONE')
-
-    def fmt_price(self, p: float) -> str:
+    def fmt_price(self, price):
         tick = float(self.filters['PRICE_FILTER']['tickSize'])
-        qty = (np.floor(p / tick) * tick)
+        p = np.floor(price / tick) * tick
         prec = abs(int(np.log10(tick)))
-        return f"{qty:.{prec}f}"
-
-    def fmt_qty(self, q: float) -> str:
+        return f"{p:.{prec}f}"
+    def fmt_qty(self, qty):
         step = float(self.filters['LOT_SIZE']['stepSize'])
-        qty = (np.floor(q / step) * step)
+        q = np.floor(qty / step) * step
         prec = abs(int(np.log10(step)))
-        return f"{qty:.{prec}f}"
+        return f"{q:.{prec}f}"
 
 # ========== 签名 & 请求 ==========
 def sign(params: dict) -> str:
@@ -63,133 +66,166 @@ def sign(params: dict) -> str:
 async def api_request(session, method, path, params=None, private=True):
     base = next(FAPI_DOMAINS) if private else 'https://fapi.binance.com'
     url  = base + path
-    headers = {}
+    hdrs = {}
     if private:
         ts = int(time.time()*1000)
-        p  = params.copy() if params else {}
-        p.update({'timestamp': ts, 'recvWindow': RECV_WINDOW})
+        p  = (params.copy() if params else {})
+        p.update({'timestamp':ts,'recvWindow':RECV_WINDOW})
         p['signature'] = sign(p)
-        headers['X-MBX-APIKEY'] = API_KEY
-    headers['X-MBX-TIME-UNIT'] = TIME_UNIT
-    async with session.request(method, url, params=(p if private else params), headers=headers) as r:
+        hdrs['X-MBX-APIKEY'] = API_KEY
+    hdrs['X-MBX-TIME-UNIT'] = TIME_UNIT
+    async with session.request(method, url, params=(p if private else params), headers=hdrs) as r:
         if r.status in (418,429):
-            retry = int(r.headers.get('Retry-After', 1))
+            retry = int(r.headers.get('Retry-After',1))
             await asyncio.sleep(retry)
             return await api_request(session, method, path, params, private)
         return await r.json()
 
-# ========== 市场数据 ==========
+# ========== 市场数据 & 指标 ==========
 class MarketDataFut:
     def __init__(self):
         self._cache = {}
-
     async def fetch_klines(self, session, interval, limit=500):
         url = next(FAPI_DOMAINS) + '/fapi/v1/klines'
-        params = {'symbol': SYMBOL, 'interval': interval, 'limit': limit}
-        async with session.get(url, params=params) as r:
+        async with session.get(url, params={'symbol':SYMBOL,'interval':interval,'limit':limit}) as r:
             data = await r.json()
         df = pd.DataFrame(data, columns=range(12))
-        df['close'] = df[4].astype(float)
-        df['high']  = df[2].astype(float)
-        df['low']   = df[3].astype(float)
-        return df[['close','high','low']]
-
+        df.rename(columns={2:'high',3:'low',4:'close'}, inplace=True)
+        df['high']  = df['high'].astype(float)
+        df['low']   = df['low'].astype(float)
+        df['close'] = df['close'].astype(float)
+        return df[['high','low','close']]
     async def update(self, session):
-        tasks = [asyncio.create_task(self.fetch_klines(session, tf))
-                 for tf in ('15m','1h','3m')]
-        res = await asyncio.gather(*tasks)
-        self._cache = dict(zip(('15m','1h','3m'), res))
+        tasks = {tf:asyncio.create_task(self.fetch_klines(session,tf))
+                 for tf in ('15m','1h','3m')}
+        for tf,t in tasks.items():
+            self._cache[tf] = await t
 
-# ========== 策略 ==========
+    def supertrend(self, df, length, factor):
+        hl2 = (df['high']+df['low'])/2
+        atr = ta.volatility.average_true_range(df['high'],df['low'],df['close'],length)
+        up = hl2 - factor*atr
+        dn = hl2 + factor*atr
+        trend = np.ones(len(df))
+        for i in range(1,len(df)):
+            if df['close'].iat[i] > up.iat[i-1]:
+                trend[i] = 1
+            elif df['close'].iat[i] < dn.iat[i-1]:
+                trend[i] = -1
+            else:
+                trend[i] = trend[i-1]
+                up.iat[i] = min(up.iat[i], up.iat[i-1]) if trend[i]==1 else up.iat[i]
+                dn.iat[i] = max(dn.iat[i], dn.iat[i-1]) if trend[i]==-1 else dn.iat[i]
+        return pd.Series(trend, index=df.index)
+
+    def bb_percent(self, df, period, std):
+        bb = ta.volatility.BollingerBands(df['close'], window=period, window_dev=std)
+        return (df['close'] - bb.bollinger_lband())/(bb.bollinger_hband()-bb.bollinger_lband())
+
+    def macd_diff(self, df):
+        m = ta.trend.MACD(df['close'], n_fast=MACD_FAST, n_slow=MACD_SLOW, n_sign=MACD_SIGNAL)
+        return m.macd_diff()
+
+# ========== 策略核心 ==========
 class StrategyFut:
     def __init__(self):
         self.md   = MarketDataFut()
         self.exi  = ExchangeInfoFut()
-        self.last_side = None
+        self.last_side  = None
         self.last_trend = None
 
-    async def place_bracket(self, session, side, qty, entry, sl, tp):
+    def compute_ladder(self, base_price, side, total_qty):
+        sign_ = 1 if side=='SELL' else -1
+        return [(base_price*(1+sign_*off/100), total_qty*LADDER_RATIO)
+                for off in LADDER_OFFSETS]
+
+    async def place_bracket(self, session, side, qty, entry, slp, tpp):
         # 1) 限价入场
         ep = self.exi.fmt_price(entry)
         qf = self.exi.fmt_qty(qty)
-        await api_request(session, 'POST', '/fapi/v1/order', {
-            'symbol': SYMBOL, 'side': side, 'type': 'LIMIT',
+        await api_request(session,'POST','/fapi/v1/order',{
+            'symbol':SYMBOL,'side':side,'type':'LIMIT',
             'timeInForce':'GTC','quantity':qf,'price':ep,
-            'selfTradePreventionMode': self.exi.default_stp
+            'selfTradePreventionMode':self.exi.default_stp
         })
-        # 2) 止损 (STOP_MARKET)
-        slp = self.exi.fmt_price(sl)
-        await api_request(session, 'POST','/fapi/v1/order', {
-            'symbol': SYMBOL, 'side': 'SELL' if side=='BUY' else 'BUY',
+        # 2) 止损
+        slp_f = self.exi.fmt_price(slp)
+        await api_request(session,'POST','/fapi/v1/order',{
+            'symbol':SYMBOL,'side':('SELL' if side=='BUY' else 'BUY'),
             'type':'STOP_MARKET','closePosition':'true',
-            'stopPrice':slp,'workingType':'CONTRACT_PRICE',
-            'selfTradePreventionMode': self.exi.default_stp
+            'stopPrice':slp_f,'workingType':'CONTRACT_PRICE',
+            'selfTradePreventionMode':self.exi.default_stp
         })
-        # 3) 止盈 (TAKE_PROFIT_MARKET)
-        tpp = self.exi.fmt_price(tp)
-        await api_request(session,'POST','/fapi/v1/order', {
-            'symbol': SYMBOL, 'side': 'SELL' if side=='BUY' else 'BUY',
+        # 3) 止盈
+        tpp_f = self.exi.fmt_price(tpp)
+        await api_request(session,'POST','/fapi/v1/order',{
+            'symbol':SYMBOL,'side':('SELL' if side=='BUY' else 'BUY'),
             'type':'TAKE_PROFIT_MARKET','closePosition':'true',
-            'stopPrice':tpp,'workingType':'CONTRACT_PRICE',
-            'selfTradePreventionMode': self.exi.default_stp
+            'stopPrice':tpp_f,'workingType':'CONTRACT_PRICE',
+            'selfTradePreventionMode':self.exi.default_stp
         })
 
     async def main_trend(self, session):
-        df15 = self.md._cache['15m']
-        # SuperTrend
-        st = ta.volatility.average_true_range(df15['high'],df15['low'],df15['close'],SUPER_LEN)
-        trend = 'up' if df15['close'].iloc[-1]>st.iloc[-1] else 'down'
-        if trend==self.last_trend: return
-        bb1h = ta.volatility.BollingerBands(self.md._cache['1h']['close'],BB_PERIOD_H,BB_STD_H).bollinger_pband().iloc[-1]
-        bb3m = ta.volatility.BollingerBands(self.md._cache['3m']['close'],BB_PERIOD_3,BB_STD_3).bollinger_pband().iloc[-1]
-        # 信号判定
+        df15, df1h, df3m = (self.md._cache[k] for k in ('15m','1h','3m'))
+        st = self.md.supertrend(df15, SUPER_LEN, SUPER_FACT=3.0).iat[-1]
+        trend = 'up' if st>0 else 'down'
+        if trend==self.last_trend:
+            return
+        bb1h = self.md.bb_percent(df1h, BB_PERIOD_H, BB_STD_H).iat[-1]
+        bb3m = self.md.bb_percent(df3m, BB_PERIOD_3, BB_STD_3).iat[-1]
+
         if trend=='up' and bb3m<=0:
             side, qty = 'BUY', 0.12 if bb1h<0.2 else 0.03
         elif trend=='down' and bb3m>=1:
             side, qty = 'SELL', 0.12 if bb1h>0.8 else 0.03
         else:
             return
-        if side==self.last_side: return
-        price = self.md._cache['3m']['close'].iloc[-1]
-        # 止损 / 止盈
-        if side=='BUY':
-            sl, tp = price*0.98, price*1.02
-        else:
-            sl, tp = price*1.02, price*0.98
-        await self.place_bracket(session, side, qty, price, sl, tp)
+        if side==self.last_side:
+            return
+
+        price = df3m['close'].iat[-1]
+        slp = price*0.98 if side=='BUY' else price*1.02
+        tpp = price*1.02 if side=='BUY' else price*0.98
+
+        await self.place_bracket(session, side, qty, price, slp, tpp)
         self.last_side  = side
         self.last_trend = trend
 
     async def macd_sub(self, session):
         df15 = self.md._cache['15m']
-        diff = ta.trend.MACD(df15['close'],MACD_FAST,MACD_SLOW,MACD_SIGNAL).macd_diff()
-        cur, prev = diff.iloc[-1], diff.iloc[-2]
-        price = df15['close'].iloc[-1]
-        if cur<0<=prev and abs(cur)>=11:
-            side, qty = 'SELL', 0.15
-        elif cur>0>=prev and abs(cur)>=11:
-            side, qty = 'BUY',  0.15
-        else:
+        diff = self.md.macd_diff(df15)
+        cur, prev = diff.iat[-1], diff.iat[-2]
+        if not ((cur<0<=prev) or (cur>0>=prev)):
             return
-        if side==self.last_side: return
-        sl = price*(0.97 if side=='BUY' else 1.03)
-        tp = price*(1.00)
-        await self.place_bracket(session, side, qty, price, sl, tp)
+        side = 'SELL' if cur<0 else 'BUY'
+        if side==self.last_side:
+            return
+
+        qty   = 0.15
+        price = df15['close'].iat[-1]
+        slp   = price * (0.97 if side=='BUY' else 1.03)
+        tpp   = price
+
+        await self.place_bracket(session, side, qty, price, slp, tpp)
         self.last_side = side
 
     async def super_sub(self, session):
         df15 = self.md._cache['15m']
-        sts = [ta.trend.STC(df15['close'],fast=10,slow=26,short=23).stc() for _ in (1,2,3)]
-        # 简化：当三条 STC 都极端时触发
-        buy  = all(s.iloc[-1]>0.8 for s in sts)
-        sell = all(s.iloc[-1]<0.2 for s in sts)
-        if not (buy or sell): return
-        side = 'BUY' if buy else 'SELL'
-        if side==self.last_side: return
-        price = df15['close'].iloc[-1]
-        sl = price*(0.97 if side=='BUY' else 1.03)
-        tp = price*(1.01 if side=='BUY' else 0.99)
-        await self.place_bracket(session, side, 0.15, price, sl, tp)
+        # 三因子 SuperTrend: (length,factor) = (10,1), (11,2), (12,3)
+        s1 = self.md.supertrend(df15,10,1.0).iat[-1]
+        s2 = self.md.supertrend(df15,11,2.0).iat[-1]
+        s3 = self.md.supertrend(df15,12,3.0).iat[-1]
+        if not ((s1>0 and s2>0 and s3>0) or (s1<0 and s2<0 and s3<0)):
+            return
+        side = 'BUY' if s1>0 else 'SELL'
+        if side==self.last_side:
+            return
+
+        price = df15['close'].iat[-1]
+        slp   = price * (0.97 if side=='BUY' else 1.03)
+        tpp   = price * (1.01 if side=='BUY' else 0.99)
+
+        await self.place_bracket(session, side, 0.15, price, slp, tpp)
         self.last_side = side
 
     async def tick(self, session):
@@ -203,9 +239,10 @@ class StrategyFut:
     async def run(self):
         async with aiohttp.ClientSession() as s:
             while True:
-                try:    await self.tick(s)
+                try:
+                    await self.tick(s)
                 except Exception as e:
-                    print("Error:", e)
+                    print("策略异常：", e)
                 await asyncio.sleep(3*60)
 
 if __name__=='__main__':
