@@ -1,40 +1,57 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-yun.py — 一次性 OTOCO 挂单版（修正 Client 初始化）
-  • 主策略、MACD、三因子 SuperTrend 均改为 OTOCO
-  • 确保多空交替，单向每轮只进一次
-  • 使用 python-binance 客户端直接调用 futures_* 接口
+yun.py — 实时跟踪版：WebSocket + REST OTOCO
+  • 实时订阅 ETHUSDC 3m/15m/1h K 线
+  • 收盘事件触发指标更新 & 策略信号
+  • 一次性 OTOCO 挂单框架（入场限价 + 止损限价 + 止盈限价）
+  • 多空交替执行，防止重复下单
+  • 加载 /root/zhibai/.env，适配 Vultr VHF‑1C‑1GB Ubuntu22.04
 """
 
 import os, time, asyncio, logging
-from concurrent.futures import ThreadPoolExecutor
-
+from collections import deque
+from dotenv import load_dotenv
 import pandas as pd
 import pandas_ta as pta
 from ta.trend import MACD
 from ta.volatility import BollingerBands
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
-from dotenv import load_dotenv
+import websockets
 
 # ─── 配置 ──────────────────────────────────────────────────────────────
-load_dotenv('/root/zhibai/.env')  # 强制指定 .env 路径
-API_KEY, API_SEC = os.getenv('BINANCE_API_KEY'), os.getenv('BINANCE_SECRET_KEY')
-SYMBOL       = 'ETHUSDC'
-INTERVAL_3M  = Client.KLINE_INTERVAL_3MINUTE
-INTERVAL_1H  = Client.KLINE_INTERVAL_1HOUR
-INTERVAL_15M = Client.KLINE_INTERVAL_15MINUTE
+load_dotenv('/root/zhibai/.env')
+API_KEY = os.getenv('BINANCE_API_KEY')
+API_SEC = os.getenv('BINANCE_SECRET_KEY')
+SYMBOL      = 'ETHUSDC'
+STREAM_URL  = f"wss://fstream.binance.com/stream?streams={SYMBOL.lower()}@kline_3m/{SYMBOL.lower()}@kline_15m/{SYMBOL.lower()}@kline_1h"
+MAX_BARS    = 500
 
-# 直接初始化，不带 futures=True（python‑binance 客户端即支持 futures_* 方法） binanec api.txt](file-service://file-MvNSPEe6fLdwTVsVL3zaoQ)
+# OTOCO 参数
+# 示例： off_sl=0.98 表示止损触发价 = entry*0.98； off_tp=1.02 表示止盈触发价 = entry*1.02
+# OTOCO 下单路径参考 币安更新日志：POST /api/v3/orderList/otoco 币安更新文档.txt](file-service://file-JHjASW8P4vZphWZjZwbZSR)
+
+# 策略参数
+BB_PERIOD   = 20; BB_STD    = 2
+MACD_FAST   = 12; MACD_SLOW  = 26; MACD_SIGNAL = 9
+
+# 初始化 Binance 客户端（支持 futures_* 方法）
 client = Client(API_KEY, API_SEC)
 
-executor = ThreadPoolExecutor(4)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-# ─── 工具：拉 K 线 ───────────────────────────────────────────────────────
-def fetch_klines(symbol, interval, limit):
-    data = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+# ─── 全局状态 ───────────────────────────────────────────────────────────
+ohlc = {
+    '3m':  deque(maxlen=MAX_BARS),
+    '15m': deque(maxlen=MAX_BARS),
+    '1h':  deque(maxlen=MAX_BARS),
+}
+last_main = last_macd = last_st3 = None
+
+# ─── 辅助：REST 拉取历史 K 线 ───────────────────────────────────────────
+def fetch_klines(interval):
+    data = client.futures_klines(symbol=SYMBOL, interval=interval, limit=MAX_BARS)
     df = pd.DataFrame(data, columns=[
         'open_time','open','high','low','close','volume',
         'close_time','qav','trades','tbav','tqav','ignore'
@@ -42,16 +59,22 @@ def fetch_klines(symbol, interval, limit):
     df[['open','high','low','close','volume']] = df[['open','high','low','close','volume']].astype(float)
     return df
 
-async def get_klines(symbol, interval, limit=50):
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(executor, fetch_klines, symbol, interval, limit)
+def init_ohlc():
+    for tf in ('3m','15m','1h'):
+        interval = {'3m':'3m','15m':'15m','1h':'1h'}[tf]
+        df = fetch_klines(interval)
+        for _, row in df.iterrows():
+            ohlc[tf].append({
+                'open': row.open, 'high': row.high,
+                'low': row.low,   'close': row.close
+            })
 
-# ─── 一次性 OTOCO 挂单 ───────────────────────────────────────────────────
-async def place_otoco(side, qty, entry, sl_off, tp_off):
+# ─── OTOCO 下单 ─────────────────────────────────────────────────────────
+async def place_otoco(side, qty, entry, off_sl, off_tp):
     side_s = 'BUY' if side=='long' else 'SELL'
-    sl_price = round(entry * sl_off, 2)
+    sl_price = round(entry * off_sl, 2)
     sl_limit = round(sl_price * (0.995 if side=='long' else 1.005), 2)
-    tp_price = round(entry * tp_off, 2)
+    tp_price = round(entry * off_tp, 2)
     tp_limit = round(tp_price * (0.995 if side=='short' else 1.005), 2)
 
     params = {
@@ -61,33 +84,36 @@ async def place_otoco(side, qty, entry, sl_off, tp_off):
         'price': str(round(entry,2)),
         'stopPrice': str(sl_price),
         'stopLimitPrice': str(sl_limit),
-        'stopLimitTimeInForce':'GTC',
+        'stopLimitTimeInForce': 'GTC',
         'takeProfitPrice': str(tp_price),
         'takeProfitLimitPrice': str(tp_limit),
-        'takeProfitTimeInForce':'GTC',
-        'newOrderRespType':'RESULT',
+        'takeProfitTimeInForce': 'GTC',
+        'newOrderRespType': 'RESULT',
     }
     try:
-        res = client.futures_order_otoco(**params)
-        logging.info(f"OTOCO 下单[{side}]: entry={entry}@{qty}, SL@{sl_price}, TP@{tp_price}")
+        res = client.futures_post('orderList/otoco', params)
+        logging.info(f"OTOCO下单[{side}] entry={entry}@{qty}, SL@{sl_price}, TP@{tp_price}")
         return res
     except BinanceAPIException as e:
-        logging.error(f"OTOCO 下单失败: {e.code} {e.message}")
+        logging.error(f"OTOCO下单失败: {e.code} {e.message}")
         return None
 
 # ─── 策略信号 ───────────────────────────────────────────────────────────
 def main_signal(df3m, df1h, df15):
+    # 15m SuperTrend via pandas_ta
     st15 = pta.supertrend(df15['high'], df15['low'], df15['close'], length=10, multiplier=3.0)
-    st_val = st15["SUPERT_10_3.0"].iat[-1]
-    trend = 1 if df15['close'].iat[-1] > st_val else -1
+    sup = st15["SUPERT_10_3.0"].iat[-1]
+    trend = 1 if df15['close'].iat[-1] > sup else -1
 
-    bb1h = BollingerBands(df1h['close'], window=20, window_dev=2)
-    up1, lo1 = bb1h.bollinger_hband().iat[-1], bb1h.bollinger_lband().iat[-1]
-    p1 = (df1h['close'].iat[-1]-lo1)/(up1-lo1) if up1>lo1 else 0.5
+    # 1h %B
+    bb1 = BollingerBands(df1h['close'], window=BB_PERIOD, window_dev=BB_STD)
+    up1, lo1 = bb1.bollinger_hband().iat[-1], bb1.bollinger_lband().iat[-1]
+    p1 = (df1h['close'].iat[-1] - lo1) / (up1 - lo1) if up1>lo1 else 0.5
 
-    bb3 = BollingerBands(df3m['close'], window=20, window_dev=2)
+    # 3m %B
+    bb3 = BollingerBands(df3m['close'], window=BB_PERIOD, window_dev=BB_STD)
     up3, lo3 = bb3.bollinger_hband().iat[-1], bb3.bollinger_lband().iat[-1]
-    p3 = (df3m['close'].iat[-1]-lo3)/(up3-lo3) if up3>lo3 else 0.5
+    p3 = (df3m['close'].iat[-1] - lo3) / (up3 - lo3) if up3>lo3 else 0.5
 
     if p3 <= 0:
         strength = 'strong' if p3 < 0.2 else 'weak'
@@ -100,8 +126,8 @@ def main_signal(df3m, df1h, df15):
     return None, None, None
 
 def macd_signal(df15):
-    macd = MACD(df15['close'], window_slow=26, window_fast=12, window_sign=9)
-    h, p = macd.macd_diff().iat[-1], macd.macd_diff().iat[-2]
+    m = MACD(df15['close'], window_slow=MACD_SLOW, window_fast=MACD_FAST, window_sign=MACD_SIGNAL)
+    h, p = m.macd_diff().iat[-1], m.macd_diff().iat[-2]
     if p>0 and h<0: return 'short', 0.15
     if p<0 and h>0: return 'long',  0.15
     return None, None
@@ -114,53 +140,69 @@ def st3_signal(df15):
     if not s1 and not s2 and not s3: return 'short', 0.15
     return None, None
 
-# ─── 状态管理：轮流触发 ─────────────────────────────────────────────────
-last_main = None
-last_macd = None
-last_st3  = None
-
-# ─── 主循环 ─────────────────────────────────────────────────────────────
-async def main_loop():
+# ─── WebSocket 处理 ─────────────────────────────────────────────────────
+async def ws_loop():
     global last_main, last_macd, last_st3
-    logging.info("策略启动，使用 OTOCO 挂单")
-    while True:
-        df3, df1h, df15 = await asyncio.gather(
-            get_klines(SYMBOL, INTERVAL_3M,  50),
-            get_klines(SYMBOL, INTERVAL_1H,  50),
-            get_klines(SYMBOL, INTERVAL_15M, 50),
-        )
+    # 初始化历史
+    init_ohlc()
+    logging.info("WebSocket 连接中…")
+    async with websockets.connect(STREAM_URL) as ws:
+        async for msg in ws:
+            data = await asyncio.wrap_future(asyncio.get_event_loop().run_in_executor(None, lambda: None))  # no-op to yield
+            msg = await ws.recv()
+            stream = await asyncio.get_event_loop().run_in_executor(None, lambda: msg)
+            import json
+            payload = json.loads(stream)['data']['k']
+            tf = payload['i']  # "3m"/"15m"/"1h"
+            if payload['x']:  # 收盘
+                bar = {
+                    'open':  float(payload['o']),
+                    'high':  float(payload['h']),
+                    'low':   float(payload['l']),
+                    'close': float(payload['c']),
+                }
+                ohlc[tf].append(bar)
 
-        side, strength, qty = main_signal(df3, df1h, df15)
-        if side and side != last_main:
-            entry = df3['close'].iat[-1]
-            off_sl = 0.98 if side=='long' else 1.02
-            off_tp = 1.02 if side=='long' else 0.98
-            logging.info(f"[主] 信号 {side} 强度={strength} qty={qty}")
-            if await place_otoco(side, qty, entry, off_sl, off_tp):
-                last_main = side
+                # 构建 DataFrame
+                df3  = pd.DataFrame(ohlc['3m'])
+                df15 = pd.DataFrame(ohlc['15m'])
+                df1h = pd.DataFrame(ohlc['1h'])
 
-        m_side, m_qty = macd_signal(df15)
-        if m_side and m_side != last_macd:
-            entry = df15['close'].iat[-1]
-            off_sl = 0.97 if m_side=='long' else 1.03
-            off_tp = 1.00
-            logging.info(f"[MACD] 信号 {m_side} qty={m_qty}")
-            if await place_otoco(m_side, m_qty, entry, off_sl, off_tp):
-                last_macd = m_side
+                # 主策略
+                side, strength, qty = main_signal(df3, df1h, df15)
+                if side and side != last_main:
+                    entry = df3['close'].iat[-1]
+                    off_sl = 0.98 if side=='long' else 1.02
+                    off_tp = 1.02 if side=='long' else 0.98
+                    logging.info(f"[主] 信号 {side} 强度={strength} qty={qty}")
+                    if await place_otoco(side, qty, entry, off_sl, off_tp):
+                        last_main = side
 
-        st_side, st_qty = st3_signal(df15)
-        if st_side and st_side != last_st3:
-            entry = df15['close'].iat[-1]
-            off_sl = 0.97 if st_side=='long' else 1.03
-            off_tp = 1.01 if st_side=='long' else 0.99
-            logging.info(f"[ST3] 信号 {st_side} qty={st_qty}")
-            if await place_otoco(st_side, st_qty, entry, off_sl, off_tp):
-                last_st3 = st_side
+                # MACD 子策略
+                m_side, m_qty = macd_signal(df15)
+                if m_side and m_side != last_macd:
+                    entry = df15['close'].iat[-1]
+                    off_sl = 0.97 if m_side=='long' else 1.03
+                    off_tp = 1.00
+                    logging.info(f"[MACD] 信号 {m_side} qty={m_qty}")
+                    if await place_otoco(m_side, m_qty, entry, off_sl, off_tp):
+                        last_macd = m_side
 
-        await asyncio.sleep(1)
+                # 三因子 SuperTrend 子策略
+                st_side, st_qty = st3_signal(df15)
+                if st_side and st_side != last_st3:
+                    entry = df15['close'].iat[-1]
+                    off_sl = 0.97 if st_side=='long' else 1.03
+                    off_tp = 1.01 if st_side=='long' else 0.99
+                    logging.info(f"[ST3] 信号 {st_side} qty={st_qty}")
+                    if await place_otoco(st_side, st_qty, entry, off_sl, off_tp):
+                        last_st3 = st_side
 
-if __name__=='__main__':
+async def main():
     try:
-        asyncio.run(main_loop())
+        await ws_loop()
     except KeyboardInterrupt:
         logging.info("策略已终止")
+
+if __name__ == '__main__':
+    asyncio.run(main())
