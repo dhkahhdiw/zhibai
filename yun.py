@@ -14,7 +14,7 @@ import aiohttp
 import pandas as pd
 import numpy as np
 import ta
-from ta.trend import MACDIndicator  # 用于 MACD 计算
+from ta.trend import MACD  # 修正：使用 MACD 类，参数名为 window_fast, window_slow, window_sign
 
 # ========== 配置 ==========
 load_dotenv('/root/zhibai/.env')
@@ -22,31 +22,26 @@ API_KEY     = os.getenv('BINANCE_API_KEY', '')
 API_SECRET  = os.getenv('BINANCE_SECRET_KEY', '')
 SYMBOL      = 'ETHUSDC'
 
-# 合约私有接口域名列表（支持容灾）
+# 合约接口域名（可按需扩展容灾）
 FAPI_DOMAINS = cycle([
     'https://fapi.binance.com',
-    # 如果有备用域名可加入：
     # 'https://fapi1.binance.com',
 ])
-
-# 接收窗口、时间单位
 RECV_WINDOW = 5000
 TIME_UNIT   = 'MILLISECOND'
 
 # 策略参数
 SUPER_LEN     = 10
 SUPER_FACT    = 3.0
-BB_PERIOD_H   = 20
-BB_STD_H      = 2
-BB_PERIOD_3   = 20
-BB_STD_3      = 2
+BB_PERIOD_H   = 20; BB_STD_H   = 2
+BB_PERIOD_3   = 20; BB_STD_3   = 2
 MACD_FAST     = 12
 MACD_SLOW     = 26
 MACD_SIGNAL   = 9
-LADDER_OFFSETS = [0.25, 0.4, 0.6, 0.8, 1.6]  # 阶梯偏移百分比
-LADDER_RATIO   = 0.2  # 每阶仓位占比
+LADDER_OFFSETS = [0.25, 0.4, 0.6, 0.8, 1.6]  # 阶梯偏移 (%)
+LADDER_RATIO   = 0.2  # 每阶仓位比例
 
-# ========== 交易对参数 & 格式化 ==========
+# ========== 交易对信息 & 格式化 ==========
 class ExchangeInfoFut:
     def __init__(self):
         self.filters = {}
@@ -75,7 +70,7 @@ class ExchangeInfoFut:
         prec = abs(int(np.log10(step)))
         return f"{q:.{prec}f}"
 
-# ========== 签名 & HTTP 请求 ==========
+# ========== 签名 & 请求 ==========
 def sign(params: dict) -> str:
     qs = '&'.join(f"{k}={params[k]}" for k in sorted(params))
     raw = hmac.new(API_SECRET.encode(), qs.encode(), hashlib.sha256).digest()
@@ -111,12 +106,12 @@ class MarketDataFut:
             data = await r.json()
         df = pd.DataFrame(data, columns=range(12))
         df = df.rename(columns={2: 'high', 3: 'low', 4: 'close'})
-        df[['high', 'low', 'close']] = df[['high', 'low', 'close']].astype(float)
-        return df[['high', 'low', 'close']]
+        df[['high','low','close']] = df[['high','low','close']].astype(float)
+        return df[['high','low','close']]
 
     async def update(self, session):
         tasks = {tf: asyncio.create_task(self.fetch_klines(session, tf))
-                 for tf in ('15m', '1h', '3m')}
+                 for tf in ('15m','1h','3m')}
         for tf, t in tasks.items():
             self._cache[tf] = await t
 
@@ -142,7 +137,7 @@ class MarketDataFut:
         return (df['close'] - bb.bollinger_lband()) / (bb.bollinger_hband() - bb.bollinger_lband())
 
     def macd_diff(self, df: pd.DataFrame) -> pd.Series:
-        macd = MACDIndicator(
+        macd = MACD(
             close=df['close'],
             window_fast=MACD_FAST,
             window_slow=MACD_SLOW,
@@ -164,7 +159,7 @@ class StrategyFut:
                 for off in LADDER_OFFSETS]
 
     async def place_bracket(self, session, side: str, qty: float, entry: float, slp: float, tpp: float):
-        # 1) 限价入场
+        # 限价入场
         ep = self.exi.fmt_price(entry)
         qf = self.exi.fmt_qty(qty)
         await api_request(session, 'POST', '/fapi/v1/order', {
@@ -172,7 +167,7 @@ class StrategyFut:
             'timeInForce': 'GTC', 'quantity': qf, 'price': ep,
             'selfTradePreventionMode': self.exi.default_stp
         })
-        # 2) 止损
+        # 止损
         slp_f = self.exi.fmt_price(slp)
         await api_request(session, 'POST', '/fapi/v1/order', {
             'symbol': SYMBOL,
@@ -183,7 +178,7 @@ class StrategyFut:
             'workingType': 'CONTRACT_PRICE',
             'selfTradePreventionMode': self.exi.default_stp
         })
-        # 3) 止盈
+        # 止盈
         tpp_f = self.exi.fmt_price(tpp)
         await api_request(session, 'POST', '/fapi/v1/order', {
             'symbol': SYMBOL,
