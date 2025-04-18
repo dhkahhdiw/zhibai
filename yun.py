@@ -185,7 +185,7 @@ class Strategy:
                     await self.tick(session)
                 except Exception as e:
                     logging.error("策略异常：%s", e)
-                await asyncio.sleep(3)
+                await asyncio.sleep(1)
 
 if __name__ == '__main__':
     try:
