@@ -4,9 +4,10 @@
 import os
 import time
 import json
+import hmac
+import hashlib
 import asyncio
 import logging
-import base64
 
 import uvloop
 import aiohttp
@@ -18,13 +19,14 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from ta.volatility import BollingerBands
 from ta.trend import MACD
 
-# ———— uvloop for performance ————
+# ———— uvloop 高性能事件循环 ————
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
-# ———— Configuration ————
+# ———— 加载环境变量 ————
 load_dotenv('/root/zhibai/.env')
-API_KEY          = os.getenv('ED25519_API_KEY')
-PRIVATE_KEY_PATH = os.getenv('ED25519_KEY_PATH')
+API_KEY          = os.getenv('BINANCE_API_KEY')
+SECRET_KEY       = os.getenv('BINANCE_SECRET_KEY').encode('ascii')
+ED25519_KEY_PATH = os.getenv('ED25519_KEY_PATH')
 SYMBOL           = 'ETHUSDC'
 PAIR_LOWER       = SYMBOL.lower()
 WS_DATA_URL      = (
@@ -37,27 +39,30 @@ WS_DATA_URL      = (
 REST_BASE   = 'https://fapi.binance.com'
 RECV_WINDOW = 5000
 
-# ———— Global state ————
+# ———— 全局状态 ————
 klines       = {'3m': pd.DataFrame(), '15m': pd.DataFrame(), '1h': pd.DataFrame()}
 latest_price = None
 price_ts     = None
 lock         = asyncio.Lock()
 last_side    = None
-session      = None  # initialized in main()
+session      = None  # aiohttp.Session
 
-# ———— Load Ed25519 key & sign function ————
-with open(PRIVATE_KEY_PATH, 'rb') as f:
+# ———— 加载 Ed25519 私钥（如需用户流） ————
+with open(ED25519_KEY_PATH, 'rb') as f:
     ed_priv = load_pem_private_key(f.read(), password=None)
 
-def sign_ed25519(params: dict) -> str:
-    """
-    拼接 payload，Ed25519 签名，返回 raw Base64 字符串（不再 urlencode）。
-    """
+def sign_ws_ed25519(params: dict) -> str:
+    """WebSocket 用户流 Ed25519 签名（base64）。"""
     payload = '&'.join(f"{k}={v}" for k,v in sorted(params.items()))
-    raw = ed_priv.sign(payload.encode('ascii'))
-    return base64.b64encode(raw).decode('ascii')
+    sig = ed_priv.sign(payload.encode('ascii'))
+    return base64.b64encode(sig).decode('ascii')
 
-# ———— Update indicators ————
+def sign_rest_hmac(params: dict) -> str:
+    """REST 下单 HMAC SHA256 签名（hex）。"""
+    query = '&'.join(f"{k}={v}" for k,v in sorted(params.items()))
+    return hmac.new(SECRET_KEY, query.encode('ascii'), hashlib.sha256).hexdigest()  # binanec合约.txt](file-service://file-LMnfGcqyxu7gkTs7aSjyZ3)
+
+# ———— 指标更新 ————
 def update_indicators():
     for tf, df in klines.items():
         if df.empty: continue
@@ -66,53 +71,51 @@ def update_indicators():
         df['bb_dn']  = bb.bollinger_lband()
         df['bb_pct'] = (df['close'] - df['bb_dn'])/(df['bb_up'] - df['bb_dn'])
         if tf=='15m':
-            hl2 = (df['high']+df['low'])/2
-            atr = df['high'].rolling(10).max() - df['low'].rolling(10).min()
-            df['st']   = hl2 - 3*atr
+            hl2      = (df['high'] + df['low'])/2
+            atr      = df['high'].rolling(10).max() - df['low'].rolling(10).min()
+            df['st'] = hl2 - 3*atr
             df['macd']= MACD(df['close'],12,26,9).macd_diff()
         if tf=='3m':
-            num=(df['close']-df['open']).ewm(span=10).mean()
-            den=(df['high']-df['low']).ewm(span=10).mean()
+            num       = (df['close']-df['open']).ewm(span=10).mean()
+            den       = (df['high']-df['low']).ewm(span=10).mean()
             df['rvgi']  = num/den
             df['rvsig'] = df['rvgi'].ewm(span=4).mean()
         klines[tf] = df
 
-# ———— Market data via WebSocket ————
+# ———— 市场数据 WebSocket ————
 async def market_ws():
     global latest_price, price_ts
     async with websockets.connect(WS_DATA_URL) as ws:
         async for msg in ws:
-            o = json.loads(msg)
-            s, d = o.get('stream',''), o.get('data',{})
+            o = json.loads(msg); s=o['stream']; d=o['data']
             if s.endswith('@markPrice'):
                 latest_price = float(d['p'])
                 price_ts     = int(time.time()*1000)
             if 'kline' in s:
                 tf = s.split('@')[1].split('_')[1]; k=d['k']
-                rec = {'open':float(k['o']),'high':float(k['h']),
-                       'low':float(k['l']),'close':float(k['c'])}
+                rec = {
+                    'open': float(k['o']), 'high': float(k['h']),
+                    'low':  float(k['l']), 'close': float(k['c'])
+                }
                 df = klines[tf]
                 if df.empty:
                     klines[tf] = pd.DataFrame([rec])
                 else:
-                    if int(k['t'])>df.index[-1]:
+                    if int(k['t']) > df.index[-1]:
                         df.loc[len(df)] = rec
                     else:
                         df.iloc[-1] = [rec['open'],rec['high'],rec['low'],rec['close']]
                     klines[tf] = df
                 update_indicators()
 
-# ———— REST order helper (body form-encoded) ————
-async def rest_order(side: str, order_type: str, qty: float, price: float=None, stopPrice: float=None):
+# ———— REST 下单 ————
+async def rest_order(side, otype, qty, price=None, stopPrice=None):
     ts = int(time.time()*1000)
     params = {
-        'symbol': SYMBOL,
-        'side':   side,
-        'type':   order_type,
-        'timestamp': ts,
-        'recvWindow': RECV_WINDOW
+        'symbol': SYMBOL, 'side': side, 'type': otype,
+        'timestamp': ts, 'recvWindow': RECV_WINDOW
     }
-    if order_type == 'LIMIT':
+    if otype=='LIMIT':
         params.update({
             'timeInForce':'GTC',
             'quantity': f"{qty:.6f}",
@@ -123,21 +126,21 @@ async def rest_order(side: str, order_type: str, qty: float, price: float=None, 
             'closePosition':'true',
             'stopPrice': f"{stopPrice:.2f}"
         })
-    params['signature'] = sign_ed25519(params)
-    async with session.post(f"{REST_BASE}/fapi/v1/order", data=params) as resp:
-        result = await resp.json()
-        logging.info("REST %s %s => %s", order_type, side, result)
-        return result
+    params['signature'] = sign_rest_hmac(params)
+    async with session.post(f"{REST_BASE}/fapi/v1/order", data=params, headers={'X-MBX-APIKEY': API_KEY}) as r:
+        res = await r.json()
+        logging.info("REST %s %s => %s", otype, side, res)
+        return res
 
-# ———— Bracket orders (entry + TP + SL) ————
-async def bracket(qty: float, entry: float, side: str):
+# ———— 组合单 (限价 + 止盈市价 + 止损市价) ————
+async def bracket(qty, entry, side):
     await rest_order(side, 'LIMIT', qty, price=entry)
-    tp = entry * (1.02 if side=='BUY' else 0.98)
+    tp = entry*(1.02 if side=='BUY' else 0.98)
     await rest_order('SELL' if side=='BUY' else 'BUY', 'TAKE_PROFIT_MARKET', qty, stopPrice=tp)
-    sl = entry * (0.98 if side=='BUY' else 1.02)
+    sl = entry*(0.98 if side=='BUY' else 1.02)
     await rest_order('SELL' if side=='BUY' else 'BUY', 'STOP_MARKET', qty, stopPrice=sl)
 
-# ———— Main strategy & child strategies (as before) ————
+# ———— 主策略 + 强弱 + 轮换 ————
 async def main_strategy():
     global last_side
     while price_ts is None:
@@ -153,36 +156,38 @@ async def main_strategy():
             bb1h = klines['1h']['bb_pct'].iloc[-1]
             bb3m = klines['3m']['bb_pct'].iloc[-1]
             up, down = p>st, p<st
-            s_long  = up  and bb1h<0.2
-            s_short = down and bb1h>0.8
+            strong_long  = up  and bb1h<0.2
+            strong_short = down and bb1h>0.8
 
-            if s_long and bb3m<=0 and last_side!='LONG':
-                await bracket(0.12, p, 'BUY');  last_side='LONG'
-            elif s_short and bb3m>=1 and last_side!='SHORT':
-                await bracket(0.12, p, 'SELL'); last_side='SHORT'
-            elif up and not s_long and 0<bb3m<=0.5 and last_side!='LONG':
-                await bracket(0.03, p, 'BUY');  last_side='LONG'
-            elif down and not s_short and 0.5<=bb3m<1 and last_side!='SHORT':
-                await bracket(0.03, p, 'SELL'); last_side='SHORT'
-            elif s_long and bb3m>=1 and last_side!='SHORT':
-                await bracket(0.07, p, 'SELL'); last_side='SHORT'
-            elif s_short and bb3m<=0 and last_side!='LONG':
-                await bracket(0.07, p, 'BUY');  last_side='LONG'
+            if strong_long and bb3m<=0 and last_side!='LONG':
+                await bracket(0.12,p,'BUY');  last_side='LONG'
+            elif strong_short and bb3m>=1 and last_side!='SHORT':
+                await bracket(0.12,p,'SELL'); last_side='SHORT'
+            elif up and not strong_long and 0<bb3m<=0.5 and last_side!='LONG':
+                await bracket(0.03,p,'BUY');  last_side='LONG'
+            elif down and not strong_short and 0.5<=bb3m<1 and last_side!='SHORT':
+                await bracket(0.03,p,'SELL'); last_side='SHORT'
+            elif strong_long and bb3m>=1 and last_side!='SHORT':
+                await bracket(0.07,p,'SELL'); last_side='SHORT'
+            elif strong_short and bb3m<=0 and last_side!='LONG':
+                await bracket(0.07,p,'BUY');  last_side='LONG'
         await asyncio.sleep(0.5)
 
+# ———— 子策略：15m MACD ————
 async def macd_strategy():
-    trig = False
+    triggered = False
     while True:
         await asyncio.sleep(15)
         async with lock:
             df = klines['15m']
             if df.empty or 'macd' not in df: continue
             macd, prev = df['macd'].iloc[-1], df['macd'].iloc[-2]
-            if not trig and prev>0 and macd<prev and macd>=11:
-                await bracket(0.15, latest_price, 'SELL'); trig=True
-            if trig and prev<0 and macd>prev and macd<=-11:
-                await bracket(0.15, latest_price, 'BUY'); trig=False
+            if not triggered and prev>0 and macd<prev and macd>=11:
+                await bracket(0.15, latest_price, 'SELL'); triggered = True
+            if triggered and prev<0 and macd>prev and macd<=-11:
+                await bracket(0.15, latest_price, 'BUY');  triggered = False
 
+# ———— 子策略：15m RVGI ————
 async def rvgi_strategy():
     cnt_l = cnt_s = 0
     while True:
@@ -192,10 +197,11 @@ async def rvgi_strategy():
             if df.empty or 'rvgi' not in df or 'rvsig' not in df: continue
             rv, sig = df['rvgi'].iloc[-1], df['rvsig'].iloc[-1]
             if rv>sig and cnt_l*0.05<0.2:
-                await bracket(0.05, latest_price, 'BUY'); cnt_l+=1
+                await bracket(0.05, latest_price, 'BUY');  cnt_l += 1
             if rv<sig and cnt_s*0.05<0.2:
-                await bracket(0.05, latest_price, 'SELL'); cnt_s+=1
+                await bracket(0.05, latest_price, 'SELL'); cnt_s += 1
 
+# ———— 子策略：Triple SuperTrend ————
 async def triple_st_strategy():
     firing = False
     while True:
@@ -203,23 +209,24 @@ async def triple_st_strategy():
         async with lock:
             df = klines['15m']
             if df.empty or 'st' not in df or len(df['st'])<3: continue
-            p = latest_price; stv = df['st']
-            rising  = stv.iloc[-3]<stv.iloc[-2]<stv.iloc[-1]<p
-            falling = stv.iloc[-3]>stv.iloc[-2]>stv.iloc[-1]>p
+            p   = latest_price
+            stv = df['st']
+            rising  = stv.iloc[-3] < stv.iloc[-2] < stv.iloc[-1] < p
+            falling = stv.iloc[-3] > stv.iloc[-2] > stv.iloc[-1] > p
             if rising and not firing:
-                await bracket(0.15,p,'BUY');  firing=True
+                await bracket(0.15,p,'BUY');  firing = True
             if falling and not firing:
-                await bracket(0.15,p,'SELL'); firing=True
+                await bracket(0.15,p,'SELL'); firing = True
             prev_st = stv.iloc[-2]
             if firing and ((rising and p<prev_st) or (falling and p>prev_st)):
                 side = 'SELL' if rising else 'BUY'
-                await bracket(0.15,p,side); firing=False
+                await bracket(0.15,p,side); firing = False
 
-# ———— Entry point ————
+# ———— 入口 ————
 async def main():
     global session
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
-    session = aiohttp.ClientSession(headers={'X-MBX-APIKEY': API_KEY})
+    session = aiohttp.ClientSession()
     try:
         await asyncio.gather(
             market_ws(),
