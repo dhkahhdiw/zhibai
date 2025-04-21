@@ -175,7 +175,7 @@ async def market_ws():
                             update_indicators()
         except Exception as e:
             logging.error("Market WS error %s; reconnect in 5s", e)
-            await asyncio.sleep(5)
+            await asyncio.sleep(1)
 
 # ———— User WS (Ed25519 JSON-RPC) ————
 def sign_ws_ed25519(params:dict)->str:
@@ -197,7 +197,7 @@ async def user_ws():
             sig=sign_ws_ed25519(params)
             rpc={"id":req_id,"method":"order.place","params":{**params,"signature":sig}}
             await ws.send(json.dumps(rpc))
-            await asyncio.sleep(30)
+            await asyncio.sleep(1)
 
 # ———— Main strategy ————
 async def main_strategy():
@@ -241,7 +241,7 @@ async def macd_strategy():
                 await bracket(0.15,latest_price,'SELL');fired=True
             if fired and pre<0 and cur>pre:
                 await bracket(0.15,latest_price,'BUY'); fired=False
-        await asyncio.sleep(15)
+        await asyncio.sleep(1)
 
 # ———— 15m RVGI 子策略 ————
 async def rvgi_strategy():
@@ -255,7 +255,7 @@ async def rvgi_strategy():
                 await bracket(0.05,latest_price,'BUY');cnt_long+=1
             if rv<sg and cnt_short*0.05<0.2:
                 await bracket(0.05,latest_price,'SELL');cnt_short+=1
-        await asyncio.sleep(20)
+        await asyncio.sleep(1)
 
 # ———— Triple ST 子策略 ————
 async def triple_st_strategy():
@@ -275,7 +275,7 @@ async def triple_st_strategy():
             if active and ((rise and p<prev) or (fall and p>prev)):
                 side='SELL' if rise else 'BUY'
                 await bracket(0.15,p,side);active=False
-        await asyncio.sleep(30)
+        await asyncio.sleep(1)
 
 # ———— Time sync task ————
 async def time_sync_task():
