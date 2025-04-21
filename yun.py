@@ -23,8 +23,8 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 # ————————— Configuration —————————
 ENV_PATH     = '/root/zhibai/.env'
 load_dotenv(ENV_PATH)
-API_KEY      = os.getenv('API_KEY')
-PRIV_KEY_PATH= os.getenv('PRIVATE_KEY_PATH')
+API_KEY      = os.getenv('BINANCE_API_KEY')
+PRIV_KEY_PATH= os.getenv('ED25519_KEY_PATH')
 SYMBOL       = 'ETHUSDC'
 PAIR_LOWER   = SYMBOL.lower()
 WS_DATA_URL  = (
