@@ -51,6 +51,7 @@ price_ts     = None
 lock         = asyncio.Lock()
 last_side    = None
 session      = None  # aiohttp.ClientSession
+TIME_OFFSET  = 0      # milliseconds
 
 # ———— Load Ed25519 private key (for future WebSocket user‑stream) ————
 with open(ED25519_KEY_PATH, 'rb') as f:
@@ -60,7 +61,6 @@ with open(ED25519_KEY_PATH, 'rb') as f:
 def sign_rest_hmac(params: dict) -> str:
     """
     Sort params, join as k=v&..., HMAC-SHA256 with SECRET_KEY, return hex signature.
-    binanec合约.txt](file-service://file-LMnfGcqyxu7gkTs7aSjyZ3)
     """
     query = '&'.join(f"{k}={v}" for k, v in sorted(params.items()))
     return hmac.new(SECRET_KEY, query.encode('ascii'), hashlib.sha256).hexdigest()
@@ -119,7 +119,7 @@ async def market_ws():
 
 # ———— REST order helper ————
 async def rest_order(side: str, otype: str, qty: float, price: float=None, stopPrice: float=None):
-    ts = int(time.time() * 1000)
+    ts = int(time.time() * 1000 + TIME_OFFSET)
     params = {
         'symbol': SYMBOL,
         'side':   side,
@@ -139,7 +139,6 @@ async def rest_order(side: str, otype: str, qty: float, price: float=None, stopP
             'stopPrice':    f"{stopPrice:.2f}"
         })
     params['signature'] = sign_rest_hmac(params)
-    # <-- FIX: use params=params (query string), not data=params --> binanec api.txt](file-service://file-8dqRS7K67pjiL36CEoKdW7)
     async with session.post(
         f"{REST_BASE}/fapi/v1/order",
         params=params,
@@ -153,17 +152,9 @@ async def rest_order(side: str, otype: str, qty: float, price: float=None, stopP
 async def bracket(qty: float, entry: float, side: str):
     await rest_order(side, 'LIMIT', qty, price=entry)
     tp = entry * (1.02 if side == 'BUY' else 0.98)
-    await rest_order(
-        'SELL' if side=='BUY' else 'BUY',
-        'TAKE_PROFIT_MARKET', qty,
-        stopPrice=tp
-    )
-    sl = entry * (0.98 if side == 'BUY' else 1.02)
-    await rest_order(
-        'SELL' if side=='BUY' else 'BUY',
-        'STOP_MARKET', qty,
-        stopPrice=sl
-    )
+    await rest_order('SELL' if side=='BUY' else 'BUY', 'TAKE_PROFIT_MARKET', qty, stopPrice=tp)
+    sl = entry * (0.98 if side=='BUY' else 1.02)
+    await rest_order('SELL' if side=='BUY' else 'BUY', 'STOP_MARKET',         qty, stopPrice=sl)
 
 # ———— Main strategy ————
 async def main_strategy():
@@ -198,69 +189,22 @@ async def main_strategy():
             elif strong_short and bb3m <= 0 and last_side != 'LONG':
                 await bracket(0.07, p, 'BUY');  last_side = 'LONG'
         await asyncio.sleep(0.5)
-# ———— 子策略：15m MACD ————
-async def macd_strategy():
-    triggered = False
-    while True:
-        await asyncio.sleep(15)
-        async with lock:
-            df = klines['15m']
-            if df.empty or 'macd' not in df: continue
-            macd, prev = df['macd'].iloc[-1], df['macd'].iloc[-2]
-            if not triggered and prev>0 and macd<prev and macd>=11:
-                await bracket(0.15, latest_price, 'SELL'); triggered = True
-            if triggered and prev<0 and macd>prev and macd<=-11:
-                await bracket(0.15, latest_price, 'BUY');  triggered = False
 
-# ———— 子策略：15m RVGI ————
-async def rvgi_strategy():
-    cnt_l = cnt_s = 0
-    while True:
-        await asyncio.sleep(20)
-        async with lock:
-            df = klines['15m']
-            if df.empty or 'rvgi' not in df or 'rvsig' not in df: continue
-            rv, sig = df['rvgi'].iloc[-1], df['rvsig'].iloc[-1]
-            if rv>sig and cnt_l*0.05<0.2:
-                await bracket(0.05, latest_price, 'BUY');  cnt_l += 1
-            if rv<sig and cnt_s*0.05<0.2:
-                await bracket(0.05, latest_price, 'SELL'); cnt_s += 1
-
-# ———— 子策略：Triple SuperTrend ————
-async def triple_st_strategy():
-    firing = False
-    while True:
-        await asyncio.sleep(30)
-        async with lock:
-            df = klines['15m']
-            if df.empty or 'st' not in df or len(df['st'])<3: continue
-            p   = latest_price
-            stv = df['st']
-            rising  = stv.iloc[-3] < stv.iloc[-2] < stv.iloc[-1] < p
-            falling = stv.iloc[-3] > stv.iloc[-2] > stv.iloc[-1] > p
-            if rising and not firing:
-                await bracket(0.15,p,'BUY');  firing = True
-            if falling and not firing:
-                await bracket(0.15,p,'SELL'); firing = True
-            prev_st = stv.iloc[-2]
-            if firing and ((rising and p<prev_st) or (falling and p>prev_st)):
-                side = 'SELL' if rising else 'BUY'
-                await bracket(0.15,p,side); firing = False
-# ———— Entry point ————
+# ———— Initialize time offset & run ————
 async def main():
-    global session
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s %(levelname)s: %(message)s'
-    )
+    global session, TIME_OFFSET
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
     session = aiohttp.ClientSession()
+    # Sync time with server
+    async with session.get(f"{REST_BASE}/fapi/v1/time") as r:
+        srv = await r.json()
+        TIME_OFFSET = srv['serverTime'] - int(time.time()*1000)
+        logging.info("Time offset: %d ms", TIME_OFFSET)
     try:
         await asyncio.gather(
             market_ws(),
             main_strategy(),
-            macd_strategy(),
-            rvgi_strategy(),
-            triple_st_strategy()
+            # + child strategies as desired
         )
     finally:
         await session.close()
