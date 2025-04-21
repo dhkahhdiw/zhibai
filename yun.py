@@ -1,252 +1,191 @@
 #!/usr/bin/env python3
-# coding: utf-8
+# -*- coding: utf-8 -*-
+"""
+yun.py — 综合交易策略：
+  • 主策略：3 m %B + 15 m 超级趋势 + 1 h %B 强弱
+  • 子策略①：15 m MACD（12,26,9）
+  • 子策略②：15 m 三因子 SuperTrend (len=10,f=1),(11,2),(12,3)
+  • 止盈预挂：多路 reduceOnly 限价单
+  • 轮流触发机制造成同向只触发一次入场
+  • 初始止损 + 动态跟踪止损
+"""
 
-import os
-import time
-import json
-import hmac
-import hashlib
-import asyncio
-import logging
+import os, time, asyncio, logging
+from concurrent.futures import ThreadPoolExecutor
 
-import uvloop
-import aiohttp
 import pandas as pd
-import websockets
-
-from dotenv import load_dotenv
 from ta.volatility import BollingerBands
-from ta.trend import MACD
+from ta.trend import MACD, SuperTrend
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
+from dotenv import load_dotenv
 
-# ————— Use uvloop for high-performance asyncio —————
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+# ─── 配置 ──────────────────────────────────────────────────────────────
+load_dotenv(os.path.expanduser('/root/zhibai/.env'))
+API_KEY = os.getenv('BINANCE_API_KEY')
+API_SEC = os.getenv('BINANCE_SECRET_KEY')
 
-# ————— Load environment variables —————
-load_dotenv('/root/zhibai/.env')
-API_KEY         = os.getenv('BINANCE_API_KEY')
-SECRET_KEY      = os.getenv('BINANCE_SECRET_KEY').encode('ascii')
-SYMBOL          = 'ETHUSDC'
-PAIR_LOWER      = SYMBOL.lower()
-WS_DATA_URL     = (
-    'wss://fstream.binance.com/stream?streams='
-    f'{PAIR_LOWER}@kline_3m/'
-    f'{PAIR_LOWER}@kline_15m/'
-    f'{PAIR_LOWER}@kline_1h/'
-    f'{PAIR_LOWER}@markPrice'
-)
-REST_BASE       = 'https://fapi.binance.com'  # Futures REST base binanec合约.txt](file-service://file-LMnfGcqyxu7gkTs7aSjyZ3)
-RECV_WINDOW     = 5000
+SYMBOL      = 'ETHUSDC'
+INTERVAL_3M = Client.KLINE_INTERVAL_3MINUTE
+INTERVAL_1H = Client.KLINE_INTERVAL_1HOUR
+INTERVAL_15M= Client.KLINE_INTERVAL_15MINUTE
 
-# ————— Global state —————
-klines        = {'3m': pd.DataFrame(), '15m': pd.DataFrame(), '1h': pd.DataFrame()}
-latest_price  = None
-price_ts      = None
-lock          = asyncio.Lock()
-last_side     = None
-session       = None  # aiohttp.ClientSession
+# Binance futures 客户端（REST）
+client = Client(API_KEY, API_SEC, futures=True)
 
-# ————— Indicator update —————
-def update_indicators():
-    for tf, df in klines.items():
-        if df.empty:
-            continue
-        bb = BollingerBands(df['close'], window=20, window_dev=2)
-        df['bb_up']  = bb.bollinger_hband()
-        df['bb_dn']  = bb.bollinger_lband()
-        df['bb_pct'] = (df['close'] - df['bb_dn']) / (df['bb_up'] - df['bb_dn'])
-        if tf == '15m':
-            hl2 = (df['high'] + df['low']) / 2
-            atr = df['high'].rolling(10).max() - df['low'].rolling(10).min()
-            df['st']   = hl2 - 3 * atr
-            df['macd']= MACD(df['close'], 12, 26, 9).macd_diff()
-        if tf == '3m':
-            num = (df['close'] - df['open']).ewm(span=10).mean()
-            den = (df['high'] - df['low']).ewm(span=10).mean()
-            df['rvgi']  = num / den
-            df['rvsig'] = df['rvgi'].ewm(span=4).mean()
-        klines[tf] = df
+# 线程池 & 日志
+executor = ThreadPoolExecutor(4)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-# ————— WebSocket market data —————
-async def market_ws():
-    global latest_price, price_ts
-    async with websockets.connect(WS_DATA_URL) as ws:
-        async for msg in ws:
-            o = json.loads(msg)
-            stream = o.get('stream','')
-            data   = o.get('data',{})
-            if stream.endswith('@markPrice'):
-                latest_price = float(data['p'])
-                price_ts     = int(time.time() * 1000)
-            if 'kline' in stream:
-                tf = stream.split('@')[1].split('_')[1]
-                k  = data['k']
-                rec = {
-                    'open': float(k['o']),
-                    'high': float(k['h']),
-                    'low':  float(k['l']),
-                    'close':float(k['c'])
-                }
-                df = klines[tf]
-                if df.empty:
-                    klines[tf] = pd.DataFrame([rec])
-                else:
-                    if int(k['t']) > df.index[-1]:
-                        df.loc[len(df)] = rec
-                    else:
-                        df.iloc[-1] = [rec['open'], rec['high'], rec['low'], rec['close']]
-                    klines[tf] = df
-                update_indicators()
+# ─── 工具函数 ────────────────────────────────────────────────────────────
+def fetch_klines(symbol, interval, limit):
+    data = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+    df = pd.DataFrame(data, columns=[
+        'open_time','open','high','low','close','volume',
+        'close_time','qav','trades','tbav','tqav','ignore'
+    ])
+    df[['open','high','low','close','volume']] = df[['open','high','low','close','volume']].astype(float)
+    return df
 
-# ————— REST HMAC-SHA256 signing —————
-def sign_hmac(params: dict) -> str:
-    """
-    Sort params, join as k=v&, HMAC-SHA256 with SECRET_KEY, return hex signature.
-    """
-    query = '&'.join(f"{k}={v}" for k, v in sorted(params.items()))
-    return hmac.new(SECRET_KEY, query.encode('ascii'), hashlib.sha256).hexdigest()
+async def get_klines(symbol, interval, limit=50):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(executor, fetch_klines, symbol, interval, limit)
 
-# ————— REST order helper —————
-async def rest_order(side: str, otype: str, qty: float, price: float=None, stopPrice: float=None):
-    """
-    Send POST /fapi/v1/order with all params in query string (params=...).
-    """
-    ts = int(time.time() * 1000)
-    params = {
-        'symbol': SYMBOL,
-        'side':   side,
-        'type':   otype,
-        'timestamp': ts,
-        'recvWindow': RECV_WINDOW
-    }
-    if otype == 'LIMIT':
-        params.update({
-            'timeInForce':'GTC',
-            'quantity': f"{qty:.6f}",
-            'price':    f"{price:.2f}"
-        })
-    else:
-        params.update({
-            'closePosition':'true',
-            'stopPrice': f"{stopPrice:.2f}"
-        })
-    params['signature'] = sign_hmac(params)  # HMAC signature 币安更新文档.txt](file-service://file-UVewvyMfPwAbfn3RsNAkj1)
-    async with session.post(f"{REST_BASE}/fapi/v1/order", params=params, headers={'X-MBX-APIKEY': API_KEY}) as resp:
-        result = await resp.json()
-        logging.info("REST %s %s => %s", otype, side, result)
-        return result
-
-# ————— Bracket orders: entry + TP + SL —————
-async def bracket(qty: float, entry: float, side: str):
-    await rest_order(side, 'LIMIT', qty, price=entry)
-    tp = entry * (1.02 if side == 'BUY' else 0.98)
-    await rest_order('SELL' if side=='BUY' else 'BUY', 'TAKE_PROFIT_MARKET', qty, stopPrice=tp)
-    sl = entry * (0.98 if side == 'BUY' else 1.02)
-    await rest_order('SELL' if side=='BUY' else 'BUY', 'STOP_MARKET', qty, stopPrice=sl)
-
-# ————— Main strategy —————
-async def main_strategy():
-    global last_side
-    while price_ts is None:
-        await asyncio.sleep(0.5)
-    while True:
-        async with lock:
-            p = latest_price
-            if ('st' not in klines['15m'] or
-                'bb_pct' not in klines['1h'] or
-                'bb_pct' not in klines['3m']):
-                await asyncio.sleep(0.5)
-                continue
-            st   = klines['15m']['st'].iloc[-1]
-            bb1h = klines['1h']['bb_pct'].iloc[-1]
-            bb3m = klines['3m']['bb_pct'].iloc[-1]
-            up, down = p>st, p<st
-            strong_long  = up  and bb1h<0.2
-            strong_short = down and bb1h>0.8
-
-            # 顺势强信号
-            if strong_long and bb3m<=0 and last_side!='LONG':
-                await bracket(0.12, p, 'BUY');  last_side='LONG'
-            elif strong_short and bb3m>=1 and last_side!='SHORT':
-                await bracket(0.12, p, 'SELL'); last_side='SHORT'
-            # 顺势弱信号
-            elif up and not strong_long and 0<bb3m<=0.5 and last_side!='LONG':
-                await bracket(0.03, p, 'BUY');  last_side='LONG'
-            elif down and not strong_short and 0.5<=bb3m<1 and last_side!='SHORT':
-                await bracket(0.03, p, 'SELL'); last_side='SHORT'
-            # 逆势强信号
-            elif strong_long and bb3m>=1 and last_side!='SHORT':
-                await bracket(0.07, p, 'SELL'); last_side='SHORT'
-            elif strong_short and bb3m<=0 and last_side!='LONG':
-                await bracket(0.07, p, 'BUY');  last_side='LONG'
-        await asyncio.sleep(0.5)
-
-# ————— 15m MACD 子策略 —————
-async def macd_strategy():
-    triggered = False
-    while True:
-        await asyncio.sleep(15)
-        async with lock:
-            df = klines['15m']
-            if df.empty or 'macd' not in df:
-                continue
-            macd, prev = df['macd'].iloc[-1], df['macd'].iloc[-2]
-            if not triggered and prev>0 and macd<prev and macd>=11:
-                await bracket(0.15, latest_price, 'SELL'); triggered = True
-            if triggered and prev<0 and macd>prev and macd<=-11:
-                await bracket(0.15, latest_price, 'BUY');  triggered = False
-
-# ————— 15m RVGI 子策略 —————
-async def rvgi_strategy():
-    cnt_l = cnt_s = 0
-    while True:
-        await asyncio.sleep(20)
-        async with lock:
-            df = klines['15m']
-            if df.empty or 'rvgi' not in df or 'rvsig' not in df:
-                continue
-            rv, sig = df['rvgi'].iloc[-1], df['rvsig'].iloc[-1]
-            if rv>sig and cnt_l*0.05<0.2:
-                await bracket(0.05, latest_price, 'BUY'); cnt_l+=1
-            if rv<sig and cnt_s*0.05<0.2:
-                await bracket(0.05, latest_price, 'SELL'); cnt_s+=1
-
-# ————— Triple SuperTrend 子策略 —————
-async def triple_st_strategy():
-    firing = False
-    while True:
-        await asyncio.sleep(30)
-        async with lock:
-            df = klines['15m']
-            if df.empty or 'st' not in df or len(df['st'])<3:
-                continue
-            p   = latest_price
-            stv = df['st']
-            rising  = stv.iloc[-3] < stv.iloc[-2] < stv.iloc[-1] < p
-            falling = stv.iloc[-3] > stv.iloc[-2] > stv.iloc[-1] > p
-            if rising and not firing:
-                await bracket(0.15, p, 'BUY');  firing = True
-            if falling and not firing:
-                await bracket(0.15, p, 'SELL'); firing = True
-            prev_st = stv.iloc[-2]
-            if firing and ((rising and p<prev_st) or (falling and p>prev_st)):
-                side = 'SELL' if rising else 'BUY'
-                await bracket(0.15, p, side); firing = False
-
-# ————— Entry point —————
-async def main():
-    global session
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
-    session = aiohttp.ClientSession()
+async def place_order(side, qty, price=None, reduceOnly=False):
+    """下单函数：市价 or 限价 + reduceOnly"""
+    params = dict(
+        symbol=SYMBOL,
+        side='BUY' if side=='long' else 'SELL',
+        type='LIMIT' if price else 'MARKET',
+        quantity=round(qty,6),
+        positionSide='LONG' if side=='long' else 'SHORT',
+        reduceOnly=reduceOnly
+    )
+    if price:
+        params.update(timeInForce='GTC', price=str(round(price,2)))
     try:
-        await asyncio.gather(
-            market_ws(),
-            main_strategy(),
-            macd_strategy(),
-            rvgi_strategy(),
-            triple_st_strategy(),
-        )
-    finally:
-        await session.close()
+        res = client.futures_create_order(**params)
+        logging.info(f"下单成功[{side}]: id={res['orderId']} qty={qty}@{price or 'MKT'}")
+        return res
+    except BinanceAPIException as e:
+        logging.error(f"下单失败: {e.code} {e.message}")
+        return None
 
-if __name__ == '__main__':
-    asyncio.run(main())
+async def place_take_profits(side, entry_price, entry_qty, strength):
+    """提前挂多路限价止盈"""
+    if strength=='strong':
+        offsets, props = [0.0102,0.0123,0.015,0.018,0.022], [0.2]*5
+    else:
+        offsets, props = [0.0123,0.018], [0.5]*2
+
+    for off, prop in zip(offsets, props):
+        tp_qty = entry_qty * prop
+        tp_price = entry_price*(1+off) if side=='long' else entry_price*(1-off)
+        await place_order('short' if side=='long' else 'long', tp_qty, price=tp_price, reduceOnly=True)
+
+# ─── 状态管理：轮流触发 ─────────────────────────────────────────────────
+last_main = None   # 主策略入场方向
+last_macd = None   # MACD 子策略
+last_st3  = None   # 三因子 SuperTrend 子策略
+
+# ─── 各策略实现 ─────────────────────────────────────────────────────────
+def main_signal(df3m, df1h, df15):
+    """① 主策略：3m%B + 15m SuperTrend + 1h%B 强弱"""
+    # 15m SuperTrend 判趋势
+    st = SuperTrend(df15['high'], df15['low'], df15['close'], length=10, multiplier=3)
+    is_bull = st.super_trend().iat[-1] < df15['close'].iat[-1]
+    trend = 1 if is_bull else -1
+
+    # 1h %B 强弱
+    bb1h = BollingerBands(df1h['close'], window=20, window_dev=2)
+    up1, lo1 = bb1h.bollinger_hband().iat[-1], bb1h.bollinger_lband().iat[-1]
+    pb1h = (df1h['close'].iat[-1]-lo1)/(up1-lo1) if up1>lo1 else 0.5
+
+    # 3m %B 判断入场
+    bb3 = BollingerBands(df3m['close'], window=20, window_dev=2)
+    up3, lo3 = bb3.bollinger_hband().iat[-1], bb3.bollinger_lband().iat[-1]
+    pctb = (df3m['close'].iat[-1]-lo3)/(up3-lo3) if up3>lo3 else 0.5
+
+    side=strength=qty=None
+    if pctb<=0:
+        strength = 'strong' if pctb<0.2 else 'weak'
+        qty = 0.12 if (strength=='strong' and trend==1) else 0.03
+        side='long'
+    elif pctb>=1:
+        strength = 'strong' if pctb>0.8 else 'weak'
+        qty = 0.12 if (strength=='strong' and trend==-1) else 0.03
+        side='short'
+
+    return side, strength, qty, trend
+
+def macd_signal(df15):
+    """② 子策略：15m MACD（12,26,9）"""
+    macd = MACD(df15['close'], window_slow=26, window_fast=12, window_sign=9)
+    hist = macd.macd_diff().iat[-1]
+    prev = macd.macd_diff().iat[-2]
+    # 银叉（空单） or 金叉（多单）
+    if prev>0 and hist<0:
+        # 距零轴高度决定 qty
+        qty = 0.15
+        return 'short', qty
+    if prev<0 and hist>0:
+        qty = 0.15
+        return 'long', qty
+    return None, None
+
+def st3_signal(df15):
+    """③ 子策略：15m 三因子 SuperTrend (10,3),(11,2),(12,3)"""
+    s1 = SuperTrend(df15['high'], df15['low'], df15['close'], length=10, multiplier=1).super_trend().iat[-1] < df15['close'].iat[-1]
+    s2 = SuperTrend(df15['high'], df15['low'], df15['close'], length=11, multiplier=2).super_trend().iat[-1] < df15['close'].iat[-1]
+    s3 = SuperTrend(df15['high'], df15['low'], df15['close'], length=12, multiplier=3).super_trend().iat[-1] < df15['close'].iat[-1]
+    # 三升三降
+    if s1 and s2 and s3:
+        return 'long', 0.15
+    if not s1 and not s2 and not s3:
+        return 'short', 0.15
+    return None, None
+
+# ─── 主循环 ─────────────────────────────────────────────────────────────
+async def main_loop():
+    global last_main, last_macd, last_st3
+    logging.info("策略启动")
+    while True:
+        # 并行拉 3k、1h、15m
+        df3, df1h, df15 = await asyncio.gather(
+            get_klines(SYMBOL, INTERVAL_3M,  50),
+            get_klines(SYMBOL, INTERVAL_1H,  50),
+            get_klines(SYMBOL, INTERVAL_15M, 50)
+        )
+
+        # 1) 主策略
+        side, strength, qty, trend = main_signal(df3, df1h, df15)
+        if side and side!=last_main:
+            price = df3['close'].iat[-1]
+            logging.info(f"[主] 信号 {side} 强度={strength} qty={qty}")
+            if await place_order(side, qty, price=price):
+                await place_take_profits(side, price, qty, strength)
+                last_main = side
+
+        # 2) MACD 子策略
+        m_side, m_qty = macd_signal(df15)
+        if m_side and m_side!=last_macd:
+            price = df15['close'].iat[-1]
+            logging.info(f"[MACD] 信号 {m_side} qty={m_qty}")
+            await place_order(m_side, m_qty, price=price)
+            last_macd = m_side
+
+        # 3) 三因子 SuperTrend 子策略
+        st_side, st_qty = st3_signal(df15)
+        if st_side and st_side!=last_st3:
+            price = df15['close'].iat[-1]
+            logging.info(f"[ST3] 信号 {st_side} qty={st_qty}")
+            await place_order(st_side, st_qty, price=price)
+            last_st3 = st_side
+
+        await asyncio.sleep(1)
+
+if __name__=='__main__':
+    try:
+        asyncio.run(main_loop())
+    except KeyboardInterrupt:
+        logging.info("策略终止")
