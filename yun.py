@@ -19,14 +19,14 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from ta.volatility import BollingerBands
 from ta.trend import MACD
 
-# ———— Use uvloop for high‑performance asyncio ————
+# ——— Use uvloop for high‑performance asyncio ———
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
-# ———— Configuration ————
+# ——— Configuration ———
 ENV_PATH         = '/root/zhibai/.env'
 load_dotenv(ENV_PATH)
 API_KEY          = os.getenv('BINANCE_API_KEY')
-PRIVATE_KEY_PATH = os.getenv('ED25519_KEY_PATH')  # Ed25519 private key (PEM)
+PRIVATE_KEY_PATH = os.getenv('ED25519_KEY_PATH')  # Ed25519 private key PEM
 SYMBOL           = 'ETHUSDC'
 PAIR_LOWER       = SYMBOL.lower()
 WS_DATA_URL      = (
@@ -36,31 +36,31 @@ WS_DATA_URL      = (
     f'{PAIR_LOWER}@kline_1h/'
     f'{PAIR_LOWER}@markPrice'
 )
-REST_BASE        = 'https://fapi.binance.com'  # Futures REST base
+REST_BASE        = 'https://fapi.binance.com'
 RECV_WINDOW      = 5000
 
-# ———— Global State ————
+# ——— Global state ———
 klines       = {'3m': pd.DataFrame(), '15m': pd.DataFrame(), '1h': pd.DataFrame()}
 latest_price = None
 price_ts     = None
 lock         = asyncio.Lock()
 last_side    = None
-session      = None  # aiohttp session to initialize in main()
+session      = None  # aiohttp.ClientSession init in main()
 
-# ———— Load Ed25519 key & signing ————
+# ——— Load Ed25519 private key & signing ———
 with open(PRIVATE_KEY_PATH, 'rb') as f:
     ed_priv = load_pem_private_key(f.read(), password=None)
 
 def sign_ed25519(params: dict) -> str:
     """
-    Sort params, join as payload, sign with Ed25519, base64, URL-encode.
+    Sort params alphabetically, join as 'k=v' with &, sign with Ed25519,
+    base64‑encode signature, return raw base64 (let urlencode handle quoting).
     """
     payload = '&'.join(f"{k}={v}" for k, v in sorted(params.items()))
-    sig = ed_priv.sign(payload.encode('ascii'))
-    b64 = base64.b64encode(sig).decode('ascii')
-    return urllib.parse.quote(b64, safe='')
+    raw_sig = ed_priv.sign(payload.encode('ascii'))
+    return base64.b64encode(raw_sig).decode('ascii')
 
-# ———— Indicators update ————
+# ——— Indicators update ———
 def update_indicators():
     for tf, df in klines.items():
         if df.empty: continue
@@ -69,7 +69,7 @@ def update_indicators():
         df['bb_dn']  = bb.bollinger_lband()
         df['bb_pct'] = (df['close'] - df['bb_dn'])/(df['bb_up'] - df['bb_dn'])
         if tf=='15m':
-            hl2 = (df['high']+df['low'])/2
+            hl2 = (df['high'] + df['low'])/2
             atr = df['high'].rolling(10).max() - df['low'].rolling(10).min()
             df['st']   = hl2 - 3*atr
             df['macd']= MACD(df['close'],12,26,9).macd_diff()
@@ -80,7 +80,7 @@ def update_indicators():
             df['rvsig'] = df['rvgi'].ewm(span=4).mean()
         klines[tf] = df
 
-# ———— WebSocket market data ————
+# ——— WebSocket market data ———
 async def market_ws():
     global latest_price, price_ts
     async with websockets.connect(WS_DATA_URL) as ws:
@@ -91,34 +91,35 @@ async def market_ws():
                 price_ts     = int(time.time()*1000)
             if 'kline' in s:
                 tf = s.split('@')[1].split('_')[1]; k=d['k']
-                rec={'open':float(k['o']),'high':float(k['h']),
-                     'low':float(k['l']),'close':float(k['c'])}
-                df=klines[tf]
+                rec = {
+                    'open': float(k['o']), 'high': float(k['h']),
+                    'low':  float(k['l']), 'close': float(k['c'])
+                }
+                df = klines[tf]
                 if df.empty:
-                    klines[tf]=pd.DataFrame([rec])
+                    klines[tf] = pd.DataFrame([rec])
                 else:
-                    if int(k['t'])>df.index[-1]:
-                        df.loc[len(df)]=rec
+                    if int(k['t']) > df.index[-1]:
+                        df.loc[len(df)] = rec
                     else:
-                        df.iloc[-1]=[rec['open'],rec['high'],rec['low'],rec['close']]
-                    klines[tf]=df
+                        df.iloc[-1] = [rec['open'],rec['high'],rec['low'],rec['close']]
+                    klines[tf] = df
                 update_indicators()
 
-# ———— REST order via query string ————
+# ——— REST order helper ———
 async def rest_order(side: str, order_type: str, qty: float, price: float=None, stopPrice: float=None):
     ts = int(time.time()*1000)
     params = {
         'symbol': SYMBOL,
-        'side': side,
-        'type': order_type,
+        'side':   side,
+        'type':   order_type,
         'timestamp': ts,
         'recvWindow': RECV_WINDOW
     }
-    if order_type=='LIMIT':
+    if order_type == 'LIMIT':
         params.update({'timeInForce':'GTC','quantity':f"{qty:.6f}",'price':f"{price:.2f}"})
     else:
         params.update({'closePosition':'true','stopPrice':f"{stopPrice:.2f}"})
-    # sign and build query string
     params['signature'] = sign_ed25519(params)
     qs = urllib.parse.urlencode(params)
     url = f"{REST_BASE}/fapi/v1/order?{qs}"
@@ -127,7 +128,7 @@ async def rest_order(side: str, order_type: str, qty: float, price: float=None, 
         logging.info("REST %s %s => %s", order_type, side, data)
         return data
 
-# ———— Bracket: LIMIT + TP + SL ————
+# ——— Bracket: entry + TP + SL ———
 async def bracket(qty: float, entry: float, side: str):
     await rest_order(side, 'LIMIT', qty, price=entry)
     tp = entry * (1.02 if side=='BUY' else 0.98)
@@ -135,7 +136,7 @@ async def bracket(qty: float, entry: float, side: str):
     sl = entry * (0.98 if side=='BUY' else 1.02)
     await rest_order('SELL' if side=='BUY' else 'BUY', 'STOP_MARKET', qty, stopPrice=sl)
 
-# ———— Main strategy ————
+# ——— Main strategy ———
 async def main_strategy():
     global last_side
     while price_ts is None:
@@ -168,27 +169,27 @@ async def main_strategy():
                 await bracket(0.07, p, 'BUY');  last_side='LONG'
         await asyncio.sleep(0.5)
 
-# ———— Child: MACD ————
+# ——— Child: MACD ———
 async def macd_strategy():
-    triggered = False
+    trig=False
     while True:
         await asyncio.sleep(15)
         async with lock:
-            df=klines['15m']
+            df = klines['15m']
             if df.empty or 'macd' not in df: continue
             macd, prev = df['macd'].iloc[-1], df['macd'].iloc[-2]
-            if not triggered and prev>0 and macd<prev and macd>=11:
-                await bracket(0.15, latest_price, 'SELL'); triggered=True
-            if triggered and prev<0 and macd>prev and macd<=-11:
-                await bracket(0.15, latest_price, 'BUY'); triggered=False
+            if not trig and prev>0 and macd<prev and macd>=11:
+                await bracket(0.15, latest_price, 'SELL'); trig=True
+            if trig and prev<0 and macd>prev and macd<=-11:
+                await bracket(0.15, latest_price, 'BUY'); trig=False
 
-# ———— Child: RVGI ————
+# ——— Child: RVGI ———
 async def rvgi_strategy():
     cnt_l = cnt_s = 0
     while True:
         await asyncio.sleep(20)
         async with lock:
-            df=klines['15m']
+            df = klines['15m']
             if df.empty or 'rvgi' not in df or 'rvsig' not in df: continue
             rv, sig = df['rvgi'].iloc[-1], df['rvsig'].iloc[-1]
             if rv>sig and cnt_l*0.05<0.2:
@@ -196,7 +197,7 @@ async def rvgi_strategy():
             if rv<sig and cnt_s*0.05<0.2:
                 await bracket(0.05, latest_price, 'SELL'); cnt_s+=1
 
-# ———— Child: Triple SuperTrend ————
+# ——— Child: Triple SuperTrend ———
 async def triple_st_strategy():
     firing=False
     while True:
@@ -205,10 +206,10 @@ async def triple_st_strategy():
             df=klines['15m']
             if df.empty or 'st' not in df or len(df['st'])<3: continue
             p=latest_price; stv=df['st']
-            rising = stv.iloc[-3]<stv.iloc[-2]<stv.iloc[-1]<p
-            falling= stv.iloc[-3]>stv.iloc[-2]>stv.iloc[-1]>p
+            rising  = stv.iloc[-3]<stv.iloc[-2]<stv.iloc[-1]<p
+            falling = stv.iloc[-3]>stv.iloc[-2]>stv.iloc[-1]>p
             if rising and not firing:
-                await bracket(0.15,p,'BUY'); firing=True
+                await bracket(0.15,p,'BUY');  firing=True
             if falling and not firing:
                 await bracket(0.15,p,'SELL'); firing=True
             prev_st=stv.iloc[-2]
@@ -216,7 +217,7 @@ async def triple_st_strategy():
                 side='SELL' if rising else 'BUY'
                 await bracket(0.15,p,side); firing=False
 
-# ———— Entry point ————
+# ——— Entry point ———
 async def main():
     global session
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
