@@ -4,128 +4,65 @@
 import os
 import time
 import json
+import uuid
 import asyncio
 import logging
 import base64
-import sqlite3
 import math
-
-import uvloop                                       # High‑performance event loop
 import pandas as pd
+import uvloop
 from dotenv import load_dotenv
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
-import aiohttp
 import websockets
-from aiohttp_retry import RetryClient, ExponentialRetry
 from ta.volatility import BollingerBands
 from ta.trend import MACD
 
-# ————————— uvloop as default asyncio loop —————————
+# ————————— uvloop as default —————————
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 # ————————— Configuration —————————
-ENV_PATH    = '/root/zhibai/.env'
-DB_PATH     = '/root/zhibai/trade_state.db'
-FUT_WS_BASE = 'wss://fstream.binance.com/stream?streams'
-FUT_API     = 'https://fapi.binance.com'
-SYMBOL      = 'ETHUSDC'
-PAIR_LOWER  = SYMBOL.lower()
-
-# Load environment
+ENV_PATH     = '/root/zhibai/.env'
 load_dotenv(ENV_PATH)
-API_KEY     = os.getenv('BINANCE_API_KEY')
-PRIV_KEY    = os.getenv('ED25519_KEY_PATH')  # e.g. /root/zhibai/ed25519-prv.pem
-with open(PRIV_KEY, 'rb') as f:
-    priv_key = load_pem_private_key(f.read(), password=None)
+API_KEY      = os.getenv('API_KEY')
+PRIV_KEY_PATH= os.getenv('PRIVATE_KEY_PATH')
+SYMBOL       = 'ETHUSDC'
+PAIR_LOWER   = SYMBOL.lower()
+WS_DATA_URL  = (
+    f"wss://fstream.binance.com/stream?streams="
+    f"{PAIR_LOWER}@kline_3m/{PAIR_LOWER}@kline_15m/{PAIR_LOWER}@kline_1h/{PAIR_LOWER}@markPrice"
+)
+WS_ORDER_URL = 'wss://ws-fapi.binance.com/ws-fapi/v1'
+RECV_WINDOW  = 5000
 
-HEADERS     = {'X-MBX-APIKEY': API_KEY}
-rest_opts   = ExponentialRetry(attempts=3)
-rest_client = RetryClient(retry_options=rest_opts, raise_for_status=False)
-
-# ————————— Global queues & state —————————
-price_q     = asyncio.Queue(maxsize=1)
+# ————————— Global state —————————
 klines      = {'3m': pd.DataFrame(), '15m': pd.DataFrame(), '1h': pd.DataFrame()}
+price       = None
+price_ts    = None
+order_ws    = None
 last_side   = None
 lock        = asyncio.Lock()
 
-# ExchangeInfo filters & limits
-exchange_filters = {}
-max_orders       = max_algo_orders = None
-open_orders      = open_algo_orders = 0
+# ————————— Load private key & sign —————————
+with open(PRIV_KEY_PATH, 'rb') as f:
+    priv_key = load_pem_private_key(f.read(), password=None)
 
-# ————————— Persistence to SQLite —————————
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute('CREATE TABLE IF NOT EXISTS events(ts INTEGER, type TEXT, data TEXT)')
-    conn.commit()
-    conn.close()
-
-def _persist(ts, typ, data):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT INTO events VALUES (?,?,?)", (ts, typ, json.dumps(data)))
-    conn.commit()
-    conn.close()
-
-async def persist_worker():
-    # simple loop to persist market events (reusing price_q)
-    while True:
-        ts, typ, data = await price_q.get()
-        await asyncio.get_event_loop().run_in_executor(None, _persist, ts, typ, data)
-        price_q.task_done()
-
-# ————————— Signing helper —————————
-def sign(params: dict) -> str:
+def sign_payload(params: dict) -> str:
     payload = '&'.join(f"{k}={v}" for k, v in sorted(params.items()))
     sig = priv_key.sign(payload.encode('ascii'))
-    return base64.b64encode(sig).decode()
+    return base64.b64encode(sig).decode('ascii')
 
-# ————————— Rounding helpers —————————
-def round_down(val, step):
-    return math.floor(val/step) * step
-
-def round_up(val, step):
-    return math.ceil(val/step) * step
-
-# ————————— Load ExchangeInfo —————————
-async def load_contract_info():
-    global exchange_filters, max_orders, max_algo_orders
-    url = f"{FUT_API}/fapi/v1/exchangeInfo"
-    async with rest_client.get(url) as r:
-        info = await r.json()
-    for s in info['symbols']:
-        if s['symbol'] == SYMBOL:
-            assert s['marginAsset'] == 'USDC', "Contract not USDC‑margined"
-            for f in s['filters']:
-                exchange_filters[f['filterType']] = f
-            max_orders       = exchange_filters['MAX_NUM_ORDERS'     ]['limit']
-            max_algo_orders  = exchange_filters['MAX_NUM_ALGO_ORDERS']['limit']
-            break
-
-def apply_filters(price: float, qty: float):
-    pf = exchange_filters['PRICE_FILTER']
-    lf = exchange_filters['LOT_SIZE']
-    tsz = float(pf['tickSize'])
-    qsz = float(lf['stepSize'])
-    price = round_down(price, tsz)
-    qty   = round_down(qty,   qsz)
-    min_not = float(exchange_filters['MIN_NOTIONAL']['notional'])
-    if price * qty < min_not:
-        raise ValueError(f"Notional {price*qty:.2f} < min {min_not:.2f}")
-    return price, qty
-
-# ————————— Indicators update —————————
+# ————————— Indicators —————————
 def update_indicators():
     for tf, df in klines.items():
         if df.empty: continue
-        bb = BollingerBands(df['close'], window=20, window_dev=2)
-        df['bb_up']   = bb.bollinger_hband()
-        df['bb_dn']   = bb.bollinger_lband()
-        df['bb_pct']  = (df['close'] - df['bb_dn']) / (df['bb_up'] - df['bb_dn'])
-        df['bb_w']    = (df['bb_up'] - df['bb_dn']) / df['bb_dn']
+        bb = BollingerBands(df['close'], 20, 2)
+        df['bb_up'], df['bb_dn'] = bb.bollinger_hband(), bb.bollinger_lband()
+        df['bb_pct'] = (df['close'] - df['bb_dn']) / (df['bb_up'] - df['bb_dn'])
+        df['bb_w']   = (df['bb_up'] - df['bb_dn']) / df['bb_dn']
         if tf == '15m':
             hl2 = (df['high'] + df['low']) / 2
             atr = df['high'].rolling(10).max() - df['low'].rolling(10).min()
-            df['st'] = hl2 - 3 * atr
+            df['st']   = hl2 - 3 * atr
             df['macd'] = MACD(df['close'], 12, 26, 9).macd_diff()
         if tf == '3m':
             num = (df['close'] - df['open']).ewm(span=10).mean()
@@ -134,29 +71,25 @@ def update_indicators():
             df['rvsig'] = df['rvgi'].ewm(span=4).mean()
         klines[tf] = df
 
-# ————————— Market WebSocket listener —————————
-async def market_ws():
-    streams = ','.join(f"{PAIR_LOWER}@kline_{tf}" for tf in klines)
-    url     = f"{FUT_WS_BASE}={PAIR_LOWER}@markPrice/{streams}"
-    async with websockets.connect(url) as ws:
+# ————————— Market Data WS —————————
+async def market_data_ws():
+    global price, price_ts
+    async with websockets.connect(WS_DATA_URL) as ws:
         async for msg in ws:
             o = json.loads(msg)
-            # markPrice update
-            if o.get('stream','').endswith('@markPrice'):
-                price = float(o['data']['p'])
-                ts    = int(time.time()*1000)
-                if price_q.full(): _ = price_q.get_nowait()
-                await price_q.put((price, ts))
-                await _persist(ts, 'price', {'price': price})
-            # kline update
-            if 'kline' in o.get('stream',''):
-                tf = o['stream'].split('_')[1]
-                k  = o['data']['k']
+            stream = o.get('stream', '')
+            data   = o.get('data', {})
+            # markPrice
+            if stream.endswith('@markPrice'):
+                price     = float(data['p'])
+                price_ts  = int(time.time() * 1000)
+            # kline
+            if 'kline' in stream:
+                tf = stream.split('@')[1].split('_')[1]
+                k  = data['k']
                 rec = {
-                    'open':  float(k['o']),
-                    'high':  float(k['h']),
-                    'low':   float(k['l']),
-                    'close': float(k['c'])
+                    'open': float(k['o']), 'high': float(k['h']),
+                    'low':  float(k['l']), 'close': float(k['c'])
                 }
                 df = klines[tf]
                 if df.empty or int(k['t']) > df.index[-1]:
@@ -166,95 +99,172 @@ async def market_ws():
                 klines[tf] = df
                 update_indicators()
 
-# ————————— Order submission —————————
-async def send_order(params: dict):
-    url = f"{FUT_API}/fapi/v1/order"
-    params.update({'timestamp': int(time.time()*1000), 'recvWindow': 5000})
-    params['signature'] = sign(params)
-    async with rest_client.post(url, headers=HEADERS, data=params) as r:
-        res = await r.json()
-        logging.info("Order response: %s", res)
-        return res
+# ————————— Order WS —————————
+async def init_order_ws():
+    global order_ws
+    order_ws = await websockets.connect(WS_ORDER_URL)
+    # ping loop
+    async def ping():
+        while True:
+            await order_ws.ping()
+            await asyncio.sleep(60)
+    asyncio.create_task(ping())
 
-# ————————— Bracket trade (entry + TP + SL) —————————
-async def bracket_trade(side: str, qty: float, entry_price: float):
-    global open_orders, open_algo_orders
+async def place_order_rpc(params: dict):
+    req = {
+        'id': str(uuid.uuid4()),
+        'method': 'order.place',
+        'params': params
+    }
+    await order_ws.send(json.dumps(req))
+    resp = await order_ws.recv()
+    return json.loads(resp)
 
-    # Check rate‑limit compliance
-    if open_orders >= max_orders or open_algo_orders + 2 > max_algo_orders:
-        logging.warning("Order limit reached; skipping trade")
-        return
+# ————————— Order helpers & bracket —————————
+def quantize(x, step):
+    return math.floor(x / step) * step
 
-    # Adjust to filter
-    entry_price, qty = apply_filters(entry_price, qty)
-
-    # 1) Market entry
-    res1 = await send_order({
-        'symbol': SYMBOL, 'side': side, 'type': 'MARKET', 'quantity': f"{qty:.8f}"
-    })
-    open_orders += 1
-
-    # 2) Take profit market
-    tp_price = entry_price * (1.02 if side == 'BUY' else 0.98)
-    res2 = await send_order({
+async def bracket(side, qty, price_val):
+    ts = int(time.time() * 1000)
+    base = {
+        'apiKey': API_KEY,
         'symbol': SYMBOL,
-        'side': 'SELL' if side == 'BUY' else 'BUY',
+        'recvWindow': RECV_WINDOW,
+        'timestamp': ts
+    }
+    # entry LIMIT
+    p1 = {**base,
+        'side': side,
+        'type': 'LIMIT',
+        'timeInForce': 'GTC',
+        'quantity': f"{qty:.6f}",
+        'price':    f"{price_val:.2f}"
+    }
+    p1['signature'] = sign_payload(p1)
+    r1 = await place_order_rpc(p1)
+    # TP
+    tp_val = price_val * (1.02 if side=='BUY' else 0.98)
+    p2 = {**base,
+        'side': 'SELL' if side=='BUY' else 'BUY',
         'type': 'TAKE_PROFIT_MARKET',
-        'stopPrice': f"{tp_price:.8f}",
-        'closePosition': 'true'
-    })
-    open_algo_orders += 1
-
-    # 3) Stop market
-    sl_price = entry_price * (0.98 if side == 'BUY' else 1.02)
-    res3 = await send_order({
-        'symbol': SYMBOL,
-        'side': 'SELL' if side == 'BUY' else 'BUY',
+        'closePosition': 'true',
+        'stopPrice': f"{tp_val:.2f}"
+    }
+    p2['signature'] = sign_payload(p2)
+    r2 = await place_order_rpc(p2)
+    # SL
+    sl_val = price_val * (0.98 if side=='BUY' else 1.02)
+    p3 = {**base,
+        'side': 'SELL' if side=='BUY' else 'BUY',
         'type': 'STOP_MARKET',
-        'stopPrice': f"{sl_price:.8f}",
-        'closePosition': 'true'
-    })
-    open_algo_orders += 1
+        'closePosition': 'true',
+        'stopPrice': f"{sl_val:.2f}"
+    }
+    p3['signature'] = sign_payload(p3)
+    r3 = await place_order_rpc(p3)
+    logging.info("Bracket: %s / %s / %s", r1, r2, r3)
 
 # ————————— Main strategy —————————
 async def main_strategy():
     global last_side
-    # Preload exchange info
-    await load_contract_info()
-
     while True:
-        price, ts = await price_q.get()
+        await asyncio.sleep(0)  # yield
+        if price_ts is None:    # wait for data
+            await asyncio.sleep(1)
+            continue
         async with lock:
+            p    = price
             st   = klines['15m']['st'].iloc[-1]
             bb1h = klines['1h']['bb_pct'].iloc[-1]
             bb3m = klines['3m']['bb_pct'].iloc[-1]
-            up, down   = price > st, price < st
-            long_s     = bb1h < 0.2
-            short_s    = bb1h > 0.8
-
-            # Strong trend‑aligned signal
-            if up and long_s and bb3m <= 0 and last_side != 'LONG':
-                await bracket_trade('BUY', 0.12, price)
+            up   = p > st
+            down = p < st
+            long_s  = bb1h < 0.2
+            short_s = bb1h > 0.8
+            # Strong trend‑aligned
+            if up and long_s and bb3m <= 0 and last_side!='LONG':
+                await bracket('BUY', 0.12, p)
                 last_side = 'LONG'
-            elif down and short_s and bb3m >= 1 and last_side != 'SHORT':
-                await bracket_trade('SELL', 0.12, price)
+            elif down and short_s and bb3m >= 1 and last_side!='SHORT':
+                await bracket('SELL', 0.12, p)
                 last_side = 'SHORT'
+            # Weak trend‑aligned
+            elif up and not long_s and 0 < bb3m <= 0.5 and last_side!='LONG':
+                await bracket('BUY', 0.03, p); last_side='LONG'
+            elif down and not short_s and 0.5 <= bb3m < 1 and last_side!='SHORT':
+                await bracket('SELL',0.03, p); last_side='SHORT'
+            # Contrarian (strong)
+            elif up and short_s and bb3m >= 1 and last_side!='LONG':
+                await bracket('BUY', 0.07, p); last_side='LONG'
+            elif down and long_s and bb3m <= 0 and last_side!='SHORT':
+                await bracket('SELL',0.07, p); last_side='SHORT'
+        await asyncio.sleep(0.5)
 
-            # You can add weak/contrarian signals here...
+# ————————— Child: 15m MACD —————————
+async def macd_strategy():
+    triggered = False
+    while True:
+        await asyncio.sleep(15)
+        async with lock:
+            df = klines['15m']
+            if df.empty: continue
+            macd, prev = df['macd'].iloc[-1], df['macd'].iloc[-2]
+            if not triggered and prev>0 and macd<prev and macd>=11:
+                await bracket('SELL',0.15, price)
+                triggered = True
+            if triggered and prev<0 and macd>prev and macd<=-11:
+                await bracket('BUY',0.15, price)
+                triggered = False
 
-        price_q.task_done()
+# ————————— Child: 15m RVGI —————————
+async def rvgi_strategy():
+    long_cnt = short_cnt = 0
+    while True:
+        await asyncio.sleep(20)
+        async with lock:
+            df = klines['15m']
+            if df.empty: continue
+            rv, sig = df['rvgi'].iloc[-1], df['rvsig'].iloc[-1]
+            if rv>sig and long_cnt*0.05<0.2:
+                await bracket('BUY',0.05, price); long_cnt+=1
+            if rv<sig and short_cnt*0.05<0.2:
+                await bracket('SELL',0.05, price); short_cnt+=1
 
-# ————————— Entry point —————————
+# ————————— Child: Triple SuperTrend —————————
+async def triple_st_strategy():
+    firing = False
+    while True:
+        await asyncio.sleep(30)
+        async with lock:
+            df = klines['15m']
+            if df.empty: continue
+            p = price
+            f1,f2,f3 = df['st'].iloc[-1], df['st'].shift(1).iloc[-1], df['st'].shift(2).iloc[-1]
+            rising  = p>f1>f2>f3
+            falling = p<f1<f2<f3
+            if rising and not firing:
+                await bracket('BUY',0.15, p); firing=True
+            if falling and not firing:
+                await bracket('SELL',0.15, p); firing=True
+            # exit on one line flip
+            prevs = [df['st'].iloc[-2], df['st'].iloc[-3], df['st'].iloc[-4]]
+            if firing and ((rising and any(p<pv for pv in prevs)) or (falling and any(p>pv for pv in prevs))):
+                side = 'SELL' if rising else 'BUY'
+                await bracket(side, 0.15, p)
+                firing = False
+
+# ————————— Entry Point —————————
 async def main():
-    init_db()
-    logging.basicConfig(level=logging.INFO,
-                        format='%(asctime)s %(levelname)s %(message)s')
-
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
+    await init_order_ws()
     await asyncio.gather(
-        persist_worker(),
-        market_ws(),
+        market_data_ws(),
         main_strategy(),
+        macd_strategy(),
+        rvgi_strategy(),
+        triple_st_strategy(),
     )
 
 if __name__ == '__main__':
+    # initialize ws and then run
     asyncio.run(main())
