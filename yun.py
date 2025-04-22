@@ -134,26 +134,54 @@ async def market_ws():
 
 # ———— REST 下单 ————
 async def rest_order(side, otype, qty=None, price=None, stopPrice=None):
-    ts=int(time.time()*1000+time_offset)
-    params={'symbol':Config.SYMBOL,'side':side,'type':otype,
-            'timestamp':ts,'recvWindow':Config.RECV_WINDOW}
+    """
+    side: 'BUY' or 'SELL'
+    otype: 'LIMIT','MARKET','STOP_MARKET','TAKE_PROFIT_MARKET'
+    """
+    ts = int(time.time() * 1000 + time_offset)
+    # 构建参数字典
+    params = {
+        'symbol':       Config.SYMBOL,
+        'side':         side,
+        'type':         otype,
+        'timestamp':    ts,
+        'recvWindow':   Config.RECV_WINDOW,
+    }
+    # 双向持仓时指定 MULTI 或 HEDGE
     if is_hedge_mode and otype in ('LIMIT','MARKET'):
-        params['positionSide']='LONG' if side=='BUY' else 'SHORT'
-    if otype=='LIMIT':
-        params.update({'timeInForce':'GTC',
-                       'quantity':f"{qty:.6f}",'price':f"{price:.2f}"})
+        params['positionSide'] = 'LONG' if side=='BUY' else 'SHORT'
+    # 根据订单类型填充额外字段
+    if otype == 'LIMIT':
+        params.update({
+            'timeInForce': 'GTC',
+            'quantity':    f"{qty:.6f}",
+            'price':       f"{price:.2f}",
+        })
     elif otype in ('STOP_MARKET','TAKE_PROFIT_MARKET'):
-        params.update({'closePosition':'true','stopPrice':f"{stopPrice:.2f}"})
+        # closePosition=true 会自动平仓，不需要 quantity
+        params.update({
+            'closePosition': 'true',
+            'stopPrice':     f"{stopPrice:.2f}",
+        })
     else:  # MARKET
-        params.update({'quantity':f"{qty:.6f}"})
-    params['signature']=sign_hmac(params)
-    url=f"{Config.REST_BASE}/fapi/v1/order?"+urllib.parse.urlencode(params)
-    async with session.post(url,headers={'X-MBX-APIKEY':Config.API_KEY}) as r:
-        ret=await r.json()
-    if ret.get('code'):
-        logging.error("Order ERR %s %s: %s", otype, side, ret)
+        params['quantity'] = f"{qty:.6f}"
+
+    # 计算签名，直接放到 params
+    params['signature'] = sign_hmac(params)
+
+    # 关键：使用 params=params，让 aiohttp 帮我们正确编码
+    async with session.post(
+        f"{Config.REST_BASE}/fapi/v1/order",
+        params=params,
+        headers={'X-MBX-APIKEY': Config.API_KEY}
+    ) as resp:
+        res = await resp.json()
+
+    if res.get('code'):
+        logging.error("Order ERR %s %s: %s", otype, side, res)
         return False
-    logging.info("Order OK %s %s qty=%s", otype, side, qty or '')
+
+    logging.info("Order OK %s %s qty=%s", otype, side, qty or "")
     return True
 
 # ———— OCO 下单 ————
