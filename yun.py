@@ -132,58 +132,46 @@ async def market_ws():
             logging.error("Market WS error: %s", e)
             await asyncio.sleep(5)
 
-# ———— REST 下单 ————
-async def rest_order(side, otype, qty=None, price=None, stopPrice=None):
-    """
-    side: 'BUY' or 'SELL'
-    otype: 'LIMIT','MARKET','STOP_MARKET','TAKE_PROFIT_MARKET'
-    """
+# ———— 下单函数（动态 positionSide） ————
+async def rest_order(side: str, otype: str, qty: float=None, price: float=None, stopPrice: float=None):
     ts = int(time.time() * 1000 + time_offset)
-    # 构建参数字典
     params = {
-        'symbol':       Config.SYMBOL,
-        'side':         side,
-        'type':         otype,
-        'timestamp':    ts,
-        'recvWindow':   Config.RECV_WINDOW,
+        'symbol':     Config.SYMBOL,
+        'side':       side,
+        'type':       otype,
+        'timestamp':  ts,
+        'recvWindow': Config.RECV_WINDOW
     }
-    # 双向持仓时指定 MULTI 或 HEDGE
+    # Hedge 模式下指定 LONG/SHORT；One‑Way 模式不加此字段
     if is_hedge_mode and otype in ('LIMIT','MARKET'):
         params['positionSide'] = 'LONG' if side=='BUY' else 'SHORT'
-    # 根据订单类型填充额外字段
+
     if otype == 'LIMIT':
         params.update({
-            'timeInForce': 'GTC',
-            'quantity':    f"{qty:.6f}",
-            'price':       f"{price:.2f}",
+            'timeInForce':'GTC',
+            'quantity':   f"{qty:.6f}",
+            'price':      f"{price:.2f}"
         })
     elif otype in ('STOP_MARKET','TAKE_PROFIT_MARKET'):
-        # closePosition=true 会自动平仓，不需要 quantity
         params.update({
-            'closePosition': 'true',
-            'stopPrice':     f"{stopPrice:.2f}",
+            'closePosition':'true',
+            'stopPrice':    f"{stopPrice:.2f}"
         })
     else:  # MARKET
-        params['quantity'] = f"{qty:.6f}"
+        params.update({'quantity': f"{qty:.6f}"})
 
-    # 计算签名，直接放到 params
-    params['signature'] = sign_hmac(params)
-
-    # 关键：使用 params=params，让 aiohttp 帮我们正确编码
-    async with session.post(
-        f"{Config.REST_BASE}/fapi/v1/order",
-        params=params,
-        headers={'X-MBX-APIKEY': Config.API_KEY}
-    ) as resp:
-        res = await resp.json()
-
+    query = build_signed_query(params)
+    url   = f"{Config.REST_BASE}/fapi/v1/order?{query}"
+    async with session.post(url, headers={'X-MBX-APIKEY': Config.API_KEY}) as r:
+        res = await r.json()
     if res.get('code'):
         logging.error("Order ERR %s %s: %s", otype, side, res)
         return False
-
-    logging.info("Order OK %s %s qty=%s", otype, side, qty or "")
+    logging.info("Order OK %s %s qty=%.4f", otype, side, qty or 0)
+    if otype in ('LIMIT','MARKET'):
+        if side=='BUY':  position['long']  += qty or 0
+        else:            position['short'] += qty or 0
     return True
-
 # ———— OCO 下单 ————
 async def bracket(qty, entry, side):
     # 防止同方向重复
