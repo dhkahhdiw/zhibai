@@ -17,7 +17,6 @@ import aiohttp
 import pandas as pd
 import websockets
 
-from collections import deque
 from dotenv import load_dotenv
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from ta.volatility import BollingerBands
@@ -100,7 +99,7 @@ def update_indicators():
     for tf, df in klines.items():
         if df.shape[0] < 20:
             continue
-        bb = BollingerBands(df['close'], window=20, window_dev=2)
+        bb = BollingerBands(df['close'], 20, 2)
         df['bb_up']  = bb.bollinger_hband()
         df['bb_dn']  = bb.bollinger_lband()
         df['bb_pct'] = (df['close'] - df['bb_dn'])/(df['bb_up'] - df['bb_dn'])
@@ -108,7 +107,7 @@ def update_indicators():
             hl2 = (df['high'] + df['low'])/2
             atr = df['high'].rolling(10).max() - df['low'].rolling(10).min()
             df['st']   = hl2 - 3*atr
-            df['macd'] = MACD(df['close'],12,26,9).macd_diff()
+            df['macd']= MACD(df['close'],12,26,9).macd_diff()
         if tf == '3m':
             num = (df['close'] - df['open']).ewm(span=10).mean()
             den = (df['high'] - df['low']).ewm(span=10).mean()
@@ -128,10 +127,9 @@ async def market_ws():
                     s = o['stream']; d = o['data']
                     if s.endswith('@markPrice'):
                         latest_price = float(d['p'])
-                        price_ts     = int(time.time()*1000)
+                        price_ts = int(time.time()*1000)
                     if 'kline' in s:
-                        tf = s.split('@')[1].split('_')[1]
-                        k  = d['k']
+                        tf = s.split('@')[1].split('_')[1]; k=d['k']
                         rec = {
                             'open':  float(k['o']),
                             'high':  float(k['h']),
@@ -140,7 +138,7 @@ async def market_ws():
                         }
                         async with lock:
                             df = klines[tf]
-                            if df.empty or int(k['t']) > df.index[-1]:
+                            if df.empty or int(k['t'])>df.index[-1]:
                                 df = pd.concat([df, pd.DataFrame([rec])], ignore_index=True)
                             else:
                                 df.iloc[-1] = list(rec.values())
@@ -150,12 +148,13 @@ async def market_ws():
             logging.error("Market WS error: %s", e)
             await asyncio.sleep(5)
 
-# ———— REST 下单 —————
+# ———— REST 下单 ————
 async def rest_order(side, otype, qty, price=None, stopPrice=None):
     ts = int(time.time()*1000 + time_offset)
     params = {
         'symbol':Config.SYMBOL, 'side':side, 'type':otype,
-        'timestamp':ts, 'recvWindow':Config.RECV_WINDOW
+        'timestamp':ts, 'recvWindow':Config.RECV_WINDOW,
+        'positionSide': 'LONG' if side=='BUY' else 'SHORT'
     }
     if otype=='LIMIT':
         params.update({
@@ -180,7 +179,7 @@ async def rest_order(side, otype, qty, price=None, stopPrice=None):
     position['long' if side=='BUY' else 'short'] += qty
     return True
 
-# ———— OCO 挂单 —————
+# ———— OCO 挂单 ————
 async def bracket(qty, entry, side):
     total = position['long'] + position['short'] + qty
     if total > Config.MAX_POS_ETH:
@@ -192,10 +191,10 @@ async def bracket(qty, entry, side):
     ps = 'SELL' if side=='BUY' else 'BUY'
     await asyncio.gather(
         rest_order(ps,'TAKE_PROFIT_MARKET',qty,stopPrice=tp),
-        rest_order(ps,'STOP_MARKET',        qty,stopPrice=sl)
+        rest_order(ps,'STOP_MARKET',         qty,stopPrice=sl)
     )
 
-# ———— 主策略 —————
+# ———— 主策略 ————
 async def main_strategy():
     global last_side
     while price_ts is None:
@@ -209,93 +208,92 @@ async def main_strategy():
             bb1 = klines['1h']['bb_pct'].iloc[-1]
             bb3 = klines['3m']['bb_pct'].iloc[-1]
             up, down = p>st, p<st
-            strong_long  = up   and bb1<0.2
+            strong_long  = up and bb1<0.2
             strong_short = down and bb1>0.8
             # 顺势强
-            if strong_long  and bb3<=0   and last_side!='LONG':
+            if strong_long and bb3<=0 and last_side!='LONG':
                 await bracket(0.12,p,'BUY');  last_side='LONG'
-            elif strong_short and bb3>=1   and last_side!='SHORT':
+            elif strong_short and bb3>=1 and last_side!='SHORT':
                 await bracket(0.12,p,'SELL'); last_side='SHORT'
             # 顺势弱
-            elif up and not strong_long   and 0<bb3<=0.5  and last_side!='LONG':
+            elif up and not strong_long and 0<bb3<=0.5 and last_side!='LONG':
                 await bracket(0.03,p,'BUY');  last_side='LONG'
             elif down and not strong_short and 0.5<=bb3<1 and last_side!='SHORT':
                 await bracket(0.03,p,'SELL'); last_side='SHORT'
             # 逆势强
-            elif strong_long  and bb3>=1   and last_side!='SHORT':
+            elif strong_long and bb3>=1 and last_side!='SHORT':
                 await bracket(0.07,p,'SELL'); last_side='SHORT'
-            elif strong_short and bb3<=0   and last_side!='LONG':
+            elif strong_short and bb3<=0 and last_side!='LONG':
                 await bracket(0.07,p,'BUY');  last_side='LONG'
         await asyncio.sleep(0.2)
 
-# ———— 15m MACD 子策略 —————
+# ———— 15m MACD 子策略 ————
 async def macd_strategy():
     fired = False
     while True:
         await asyncio.sleep(15)
         async with lock:
             df = klines['15m']
-            if df.shape[0]<26 or 'macd' not in df.columns: continue
+            if df.shape[0]<26 or 'macd' not in df.columns:
+                continue
             cur, prev = df['macd'].iloc[-1], df['macd'].iloc[-2]
             if not fired and prev>0 and cur<prev:
                 await bracket(0.15, latest_price, 'SELL'); fired=True
             elif fired and prev<0 and cur>prev:
                 await bracket(0.15, latest_price, 'BUY');  fired=False
 
-# ———— 3m RVGI 子策略 —————
+# ———— 3m RVGI 子策略 ————
 async def rvgi_strategy():
     cnt_long = cnt_short = 0
     while True:
         await asyncio.sleep(10)
         async with lock:
             df = klines['3m']
-            if df.shape[0]<10 or 'rvgi' not in df.columns: continue
+            if df.shape[0]<10 or 'rvgi' not in df.columns:
+                continue
             rv, sg = df['rvgi'].iloc[-1], df['rvsig'].iloc[-1]
             if rv>sg and cnt_long*0.05<0.2:
                 await bracket(0.05, latest_price, 'BUY');  cnt_long+=1
             if rv<sg and cnt_short*0.05<0.2:
                 await bracket(0.05, latest_price, 'SELL'); cnt_short+=1
 
-# ———— 15m Triple SuperTrend 子策略 —————
+# ———— 15m Triple SuperTrend 子策略 ————
 async def triple_st_strategy():
     active = False
     while True:
         await asyncio.sleep(30)
         async with lock:
             df = klines['15m']
-            if df.shape[0]<3 or 'st' not in df.columns: continue
-            stv = df['st']
-            p   = latest_price
+            if df.shape[0]<3 or 'st' not in df.columns:
+                continue
+            stv = df['st']; p = latest_price
             rise = stv.iloc[-3]<stv.iloc[-2]<stv.iloc[-1]<p
             fall = stv.iloc[-3]>stv.iloc[-2]>stv.iloc[-1]>p
-            if rise  and not active:
+            if rise and not active:
                 await bracket(0.15,p,'BUY');  active=True
-            if fall  and not active:
+            if fall and not active:
                 await bracket(0.15,p,'SELL'); active=True
             prev = stv.iloc[-2]
             if active and ((rise and p<prev) or (fall and p>prev)):
-                side='SELL' if rise else 'BUY'
+                side = 'SELL' if rise else 'BUY'
                 await bracket(0.15,p,side); active=False
 
-# ———— Ed25519 用户流 (心跳 + order.status 示例) —————
+# ———— Ed25519 用户流 ——心跳 & status———
 async def user_ws():
     while True:
         try:
             async with websockets.connect(Config.WS_USER_URL) as ws:
                 logging.info("User WS connected")
-                # 登录
                 login_p = {'apiKey':Config.ED25519_API,'timestamp':int(time.time()*1000)}
                 login_p['signature'] = sign_ws(login_p)
                 await ws.send(json.dumps({'id':str(uuid.uuid4()),'method':'session.logon','params':login_p}))
-                # 心跳
                 async def hb():
                     while True:
                         await asyncio.sleep(10)
                         await ws.send(json.dumps({'id':str(uuid.uuid4()),'method':'session.status'}))
                 asyncio.create_task(hb())
-                # 接收
                 async for msg in ws:
-                    logging.info("User WS <- %s", msg)
+                    logging.debug("User WS <- %s", msg)
         except Exception as e:
             logging.error("User WS error: %s", e)
             await asyncio.sleep(5)
@@ -317,5 +315,5 @@ async def main():
     finally:
         await session.close()
 
-if __name__=='__main__':
+if __name__ == '__main__':
     asyncio.run(main())
