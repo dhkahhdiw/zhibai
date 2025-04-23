@@ -205,34 +205,54 @@ async def trend_watcher():
 
 # ———— 主策略：3m BB%B 分批挂单/止盈/止损 ————
 async def main_strategy():
-    levels=[(0.0025,0.2),(0.0040,0.2),(0.0060,0.2),(0.0080,0.2),(0.0160,0.2)]
-    tp_levels=[(0.0102,0.2),(0.0123,0.2),(0.0150,0.2),(0.0180,0.2),(0.0220,0.2)]
+    global last_signal  # 新增：声明全局变量
+    levels = [(0.0025,0.2),(0.0040,0.2),(0.0060,0.2),(0.0080,0.2),(0.0160,0.2)]
+    tp_levels = [(0.0102,0.2),(0.0123,0.2),(0.0150,0.2),(0.0180,0.2),(0.0220,0.2)]
     sl_mul_up, sl_mul_dn = 0.98, 1.02
-    while price_ts is None: await asyncio.sleep(0.1)
+
+    # 等待首个价格
+    while price_ts is None:
+        await asyncio.sleep(0.1)
+
     while True:
         await asyncio.sleep(0.2)
         async with lock:
-            if any(klines[tf].shape[0]<20 for tf in ('3m','15m','1h')): continue
-            p=latest_price
-            bb1=klines['1h']['bb_pct'].iloc[-1]
-            bb3=klines['3m']['bb_pct'].iloc[-1]
-            st=klines['15m']['st'].iloc[-1]
-            trend='UP' if p>st else 'DOWN'
-            strong = (trend=='UP' and bb1<0.2) or (trend=='DOWN' and bb1>0.8)
-            if (bb3<=0 or bb3>=1) and last_signal!=trend:
+            # 数据齐全检查
+            if any(klines[tf].shape[0] < 20 for tf in ('3m','15m','1h')):
+                continue
+
+            p   = latest_price
+            bb1 = klines['1h']['bb_pct'].iloc[-1]
+            bb3 = klines['3m']['bb_pct'].iloc[-1]
+            st  = klines['15m']['st'].iloc[-1]
+            trend = 'UP' if p > st else 'DOWN'
+            strong = (trend == 'UP' and bb1 < 0.2) or (trend == 'DOWN' and bb1 > 0.8)
+
+            # 只在 BB%B ≤0 或 ≥1，并且与上次趋势不同的时候下单
+            if (bb3 <= 0 or bb3 >= 1) and last_signal != trend:
+                # 按强弱和方向设置仓位
                 qty = 0.12 if strong else 0.03
-                if trend=='DOWN': qty = 0.07 if strong else 0.015
-                side = 'BUY' if trend=='UP' else 'SELL'
-                for off,ratio in levels:
-                    price_off = p*(1+off if side=='BUY' else 1-off)
-                    await order(side,'LIMIT',qty=qty,price=price_off)
-                rev = 'SELL' if side=='BUY' else 'BUY'
-                for off,ratio in tp_levels:
-                    price_tp = p*(1+off if rev=='BUY' else 1-off)
-                    await order(rev,'LIMIT',qty=qty*ratio,price=price_tp)
-                sl_price = p*(sl_mul_up if trend=='UP' else sl_mul_dn)
-                await order(rev,'STOP_MARKET',stopPrice=sl_price)
-                last_signal=trend
+                if trend == 'DOWN':
+                    qty = 0.07 if strong else 0.015
+                side = 'BUY' if trend == 'UP' else 'SELL'
+                rev  = 'SELL' if side == 'BUY' else 'BUY'
+
+                # 分批限价挂单
+                for off, ratio in levels:
+                    price_off = p * (1 + off if side == 'BUY' else 1 - off)
+                    await order(side, 'LIMIT', qty=qty, price=price_off)
+
+                # 分批止盈限价挂单
+                for off, ratio in tp_levels:
+                    price_tp = p * (1 + off if rev == 'BUY' else 1 - off)
+                    await order(rev, 'LIMIT', qty=qty * ratio, price=price_tp)
+
+                # 初始固定止损委托
+                sl_price = p * (sl_mul_up if trend == 'UP' else sl_mul_dn)
+                await order(rev, 'STOP_MARKET', stopPrice=sl_price)
+
+                # 记录当前信号，防止重复
+                last_signal = trend
 
 # ———— 15m MACD 子策略 ————
 async def macd_strategy():
