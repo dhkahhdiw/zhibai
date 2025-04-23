@@ -250,12 +250,12 @@ async def macd_strategy():
             # 空头银叉 / 加速空单
             if prev>0 and cur<prev and osc>=11 and macd_cycle!='DOWN':
                 if last_signal!='DOWN':
-                    await order('SELL','MARKET',qty=0.15); last_signal='DOWN'
+                    await order('SELL','MARKET',qty=0.017); last_signal='DOWN'
                 macd_cycle='DOWN'
             # 多头金叉 / 加速多单
             if prev<0 and cur>prev and osc>=11 and macd_cycle!='UP':
                 if last_signal!='UP':
-                    await order('BUY','MARKET',qty=0.15); last_signal='UP'
+                    await order('BUY','MARKET',qty=0.017); last_signal='UP'
                 macd_cycle='UP'
 
 # —— RVGI 子策略 ——
@@ -270,15 +270,15 @@ async def rvgi_strategy():
             # 多头
             if rv>sg and rvgi_cycle!='UP':
                 if last_signal!='UP':
-                    await order('BUY','MARKET',qty=0.05); last_signal='UP'
-                await order('SELL','LIMIT',qty=0.05,price=latest_price*1.06,reduceOnly=True)
+                    await order('BUY','MARKET',qty=0.016); last_signal='UP'
+                await order('SELL','LIMIT',qty=0.016,price=latest_price*1.06,reduceOnly=True)
                 await order('SELL','STOP_MARKET',stopPrice=latest_price*0.98)
                 rvgi_cycle='UP'
             # 空头
             if rv<sg and rvgi_cycle!='DOWN':
                 if last_signal!='DOWN':
-                    await order('SELL','MARKET',qty=0.05); last_signal='DOWN'
-                await order('BUY','LIMIT',qty=0.05,price=latest_price*0.94,reduceOnly=True)
+                    await order('SELL','MARKET',qty=0.016); last_signal='DOWN'
+                await order('BUY','LIMIT',qty=0.016,price=latest_price*0.94,reduceOnly=True)
                 await order('BUY','TAKE_PROFIT_MARKET',stopPrice=latest_price*1.02)
                 rvgi_cycle='DOWN'
 
@@ -290,25 +290,25 @@ async def triple_st_strategy():
         async with lock:
             df=klines['15m']
             if len(df)<12: continue
-            s1,d1=supertrend(df,10,3)
-            s2,d2=supertrend(df,11,3)
+            s1,d1=supertrend(df,10,1)
+            s2,d2=supertrend(df,11,2)
             s3,d3=supertrend(df,12,3)
             up = d1.iat[-1] and d2.iat[-1] and d3.iat[-1]
             dn = not (d1.iat[-1] or d2.iat[-1] or d3.iat[-1])
             # 新周期开仓
             if up and triple_cycle!='UP':
                 if last_signal!='UP':
-                    await order('BUY','MARKET',qty=0.15); last_signal='UP'
+                    await order('BUY','MARKET',qty=0.015); last_signal='UP'
                 triple_cycle='UP'
             if dn and triple_cycle!='DOWN':
                 if last_signal!='DOWN':
-                    await order('SELL','MARKET',qty=0.15); last_signal='DOWN'
+                    await order('SELL','MARKET',qty=0.015); last_signal='DOWN'
                 triple_cycle='DOWN'
             # 止盈：不改 last_signal
             if triple_cycle=='UP' and not up:
-                await order('SELL','MARKET',qty=0.15)
+                await order('SELL','MARKET',qty=0.015)
             if triple_cycle=='DOWN' and not dn:
-                await order('BUY','MARKET',qty=0.15)
+                await order('BUY','MARKET',qty=0.015)
 
 # —— 启动 ——
 async def main():
