@@ -72,12 +72,11 @@ class DataManager:
             df = self.klines[tf]
             # rec['t'] 是当前 K 线的起始时间（毫秒）
             if rec['t'] > self.last_ts[tf]:
-                # 新周期：追加新行，确保列对齐
+                # 新周期：追加新行，显式对齐列
                 new_row = pd.DataFrame(
                     [[rec['o'], rec['h'], rec['l'], rec['c']]],
                     columns=df.columns
                 )
-                # 这里用 concat，不会丢列也不会触发行类型不匹配
                 self.klines[tf] = pd.concat([df, new_row], ignore_index=True)
                 self.last_ts[tf] = rec['t']
             else:
