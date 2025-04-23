@@ -70,13 +70,12 @@ async def detect_mode():
     is_hedge_mode = j.get('dualSidePosition', False)
     logging.info("Hedge mode: %s", is_hedge_mode)
 
-# ———— HMAC 签名 ————
+# ———— 签名工具 ————
 def sign_params(p:dict)->str:
     qs = urllib.parse.urlencode(sorted(p.items()))
     sig = hmac.new(Config.SECRET_KEY, qs.encode(), hashlib.sha256).hexdigest()
     return f"{qs}&signature={sig}"
 
-# ———— Ed25519 WS 签名 ————
 def sign_ws(params:dict)->str:
     payload='&'.join(f"{k}={v}" for k,v in sorted(params.items()))
     sig=ed_priv.sign(payload.encode())
@@ -103,7 +102,7 @@ async def order(side, otype, qty=None, price=None, stopPrice=None):
     logging.info("Order OK %s %s qty=%s", otype, side, qty or '')
     return True
 
-# ———— 更新指标 ————
+# ———— 指标更新 ————
 def update_indicators():
     for tf,df in klines.items():
         if len(df)<20: continue
@@ -119,10 +118,9 @@ def update_indicators():
         if tf=='3m':
             num=(df['close']-df['open']).ewm(span=10).mean()
             den=(df['high']-df['low']).ewm(span=10).mean()
-            df['rvgi']=num/den
-            df['rvsig']=df['rvgi'].ewm(span=4).mean()
+            df['rvgi']=num/den; df['rvsig']=df['rvgi'].ewm(span=4).mean()
 
-# ———— SuperTrend 计算函数 ————
+# ———— SuperTrend 计算 ————
 def supertrend(df, period=10, multiplier=3.0):
     hl2 = (df['high'] + df['low']) / 2
     atr = df['high'].rolling(period).max() - df['low'].rolling(period).min()
@@ -138,14 +136,12 @@ def supertrend(df, period=10, multiplier=3.0):
         ub, lb = upperband.iloc[i], lowerband.iloc[i]
         price = df['close'].iloc[i]
         if price > prev:
-            st.iloc[i] = max(lb, prev)
-            direction.iloc[i] = True
+            st.iloc[i] = max(lb, prev); direction.iloc[i] = True
         else:
-            st.iloc[i] = min(ub, prev)
-            direction.iloc[i] = False
+            st.iloc[i] = min(ub, prev); direction.iloc[i] = False
     return st, direction
 
-# ———— 市场 WS ————
+# ———— Market WS ————
 async def market_ws():
     global latest_price, price_ts
     while True:
@@ -171,7 +167,7 @@ async def market_ws():
             logging.error("Market WS error: %s",e)
             await asyncio.sleep(2)
 
-# ———— 用户 WS ————
+# ———— User WS ————
 async def user_ws():
     while True:
         try:
@@ -211,42 +207,28 @@ async def main_strategy():
 
     while price_ts is None:
         await asyncio.sleep(0.1)
-
     while True:
         await asyncio.sleep(0.2)
         async with lock:
-            if any(klines[tf].shape[0] < 20 for tf in ('3m','15m','1h')):
-                continue
-
-            p   = latest_price
-            bb1 = klines['1h']['bb_pct'].iloc[-1]
-            bb3 = klines['3m']['bb_pct'].iloc[-1]
-            st  = klines['15m']['st'].iloc[-1]
-            trend = 'UP' if p > st else 'DOWN'
-            strong = (trend == 'UP' and bb1 < 0.2) or (trend == 'DOWN' and bb1 > 0.8)
-
-            # === 仅在信号首次触发时下单 ===
-            if (bb3 <= 0 or bb3 >= 1) and last_signal != trend:
+            if any(len(klines[tf])<20 for tf in ('3m','15m','1h')): continue
+            p = latest_price
+            bb1=klines['1h']['bb_pct'].iloc[-1]
+            bb3=klines['3m']['bb_pct'].iloc[-1]
+            st = klines['15m']['st'].iloc[-1]
+            trend = 'UP' if p>st else 'DOWN'
+            strong = (trend=='UP' and bb1<0.2) or (trend=='DOWN' and bb1>0.8)
+            if (bb3<=0 or bb3>=1) and last_signal!=trend:
                 qty = 0.12 if strong else 0.03
-                if trend == 'DOWN':
-                    qty = 0.07 if strong else 0.015
-                side = 'BUY' if trend == 'UP' else 'SELL'
-                rev  = 'SELL' if side == 'BUY' else 'BUY'
-
-                # 分批限价挂单
-                for off, ratio in levels:
-                    price_off = p * (1 + off if side == 'BUY' else 1 - off)
-                    await order(side, 'LIMIT', qty=qty, price=price_off)
-
-                # 分批止盈限价挂单
-                for off, ratio in tp_levels:
-                    price_tp = p * (1 + off if rev == 'BUY' else 1 - off)
-                    await order(rev, 'LIMIT', qty=qty * ratio, price=price_tp)
-
-                # 初始固定止损
-                sl_price = p * (sl_mul_up if trend == 'UP' else sl_mul_dn)
-                await order(rev, 'STOP_MARKET', stopPrice=sl_price)
-
+                if trend=='DOWN': qty = 0.07 if strong else 0.015
+                side, rev = ('BUY','SELL') if trend=='UP' else ('SELL','BUY')
+                for off,ratio in levels:
+                    price_off = p*(1+off if side=='BUY' else 1-off)
+                    await order(side,'LIMIT',qty=qty,price=price_off)
+                for off,ratio in tp_levels:
+                    price_tp = p*(1+off if rev=='BUY' else 1-off)
+                    await order(rev,'LIMIT',qty=qty*ratio,price=price_tp)
+                sl_price = p*(sl_mul_up if trend=='UP' else sl_mul_dn)
+                await order(rev,'STOP_MARKET',stopPrice=sl_price)
                 last_signal = trend
 
 # ———— 15m MACD 子策略 ————
@@ -256,8 +238,8 @@ async def macd_strategy():
         await asyncio.sleep(15)
         async with lock:
             df=klines['15m']
-            if df.shape[0]<26 or 'macd' not in df: continue
-            prev,cur = df['macd'].iloc[-2],df['macd'].iloc[-1]
+            if len(df)<26 or 'macd' not in df: continue
+            prev,cur=df['macd'].iloc[-2:], df['macd'].iloc[-1]
             osc=abs(cur)
             if fired!='SILVER' and prev>0 and cur<prev and 11<=osc<20:
                 await order('SELL','MARKET',qty=0.15); fired='SILVER'
@@ -275,8 +257,8 @@ async def rvgi_strategy():
         await asyncio.sleep(10)
         async with lock:
             df=klines['15m']
-            if df.shape[0]<10 or 'rvgi' not in df: continue
-            rv,sg = df['rvgi'].iloc[-1],df['rvsig'].iloc[-1]
+            if len(df)<10 or 'rvgi' not in df: continue
+            rv,sg = df['rvgi'].iloc[-1], df['rvsig'].iloc[-1]
             if rv>sg and bought<maxpos:
                 await order('BUY','MARKET',qty=0.05); bought+=0.05
                 await order('SELL','LIMIT',qty=0.05,price=latest_price*1.06)
@@ -291,9 +273,9 @@ async def triple_st_strategy():
     state=None
     while True:
         await asyncio.sleep(30)
-        async with lock():
+        async with lock:
             df=klines['15m']
-            if df.shape[0]<12: continue
+            if len(df)<12: continue
             st1,dir1 = supertrend(df,10,3)
             st2,dir2 = supertrend(df,11,3)
             st3,dir3 = supertrend(df,12,3)
