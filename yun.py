@@ -15,6 +15,7 @@ import base64
 import uvloop
 import aiohttp
 import pandas as pd
+import numpy as np
 import websockets
 import watchfiles
 from dotenv import load_dotenv
@@ -60,8 +61,8 @@ with open(Config.ED25519_KEY_PATH, 'rb') as f:
 # —— 时间同步 ——
 async def sync_time():
     global time_offset
-    # 使用微秒级时间戳
     srv = (await (await session.get(f"{Config.REST_BASE}/fapi/v1/time")).json())['serverTime']
+    # 转成微秒
     local_micro = int(time.time() * 1e6)
     time_offset = srv*1000 - local_micro
     logging.info("Time offset: %dμs", time_offset)
@@ -113,9 +114,8 @@ class OrderBatcher:
         self.rate_limit = 10  # 每秒最大订单数
         self.last_sent = 0
 
-    async def add(self, params, is_rest=True):
-        # REST 批量下单走单条 API；这里只做速率控制
-        self.batch.append((params, is_rest))
+    async def add(self, params):
+        self.batch.append(params)
         await self.flush()
 
     async def flush(self):
@@ -125,24 +125,22 @@ class OrderBatcher:
             await asyncio.sleep(1/self.rate_limit - elapsed)
         if not self.batch:
             return
-        # 逐条下单
-        for params, is_rest in self.batch:
-            await _do_order(params, is_rest)
+        for params in self.batch:
+            await _do_order(params)
         self.batch.clear()
         self.last_sent = time.time()
 
 order_batcher = OrderBatcher()
 
-# 底层下单调用，处理错误重试
-async def _do_order(params, is_rest):
+# —— 底层下单调用，处理错误重试 ——
+async def _do_order(params):
     url = params.pop('url')
-    headers = params.pop('headers', None)
+    headers = params.pop('headers', {})
     for attempt in range(3):
         try:
-            res = await (await session.request('POST', url, headers=headers, data=params)).json()
+            res = await (await session.post(url, headers=headers, data=params)).json()
             if res.get('code'):
                 code = res['code']
-                # 特殊错误码重试
                 if code in (-2039, -2038):
                     logging.warning("Order conflict %s, retry %d...", code, attempt)
                     await asyncio.sleep(1)
@@ -154,9 +152,8 @@ async def _do_order(params, is_rest):
             if e.status == 418:
                 logging.critical("IP Banned! Exiting.")
                 os._exit(1)
-            else:
-                logging.error("HTTP ERR %s: %s", e.status, e)
-                await asyncio.sleep(1)
+            logging.error("HTTP ERR %s: %s", e.status, e)
+            await asyncio.sleep(1)
     return None
 
 # —— OrderManager：集中管理 ——
@@ -185,15 +182,13 @@ class OrderManager:
             params['quantity'] = f"{qty:.6f}"
         qs_sig = self._sign(params)
         url = f"{Config.REST_BASE}/fapi/v1/order?{qs_sig}"
-        # 速率控制批量下单
-        out = await order_batcher.add({'url':url,'headers':{'X-MBX-APIKEY':Config.API_KEY}})
-        if not out: return None
-        oid = out['orderId']
+        res = await order_batcher.add({'url':url,'headers':{'X-MBX-APIKEY':Config.API_KEY}})
+        if not res: return None
+        oid = res['orderId']
         async with self.lock:
-            self.active[oid] = out
-        # 名义值检查
+            self.active[oid] = res
         if otype=='LIMIT':
-            notional = float(out['origQty']) * float(out['price'])
+            notional = float(res['origQty']) * float(res['price'])
             if notional < Config.MIN_NOTIONAL_USD:
                 logging.warning("Notional too small, cancel %s", oid)
                 await self.cancel(oid)
@@ -219,7 +214,7 @@ class OrderManager:
         url = f"{Config.REST_BASE}/fapi/v1/openOrders?{qs_sig}"
         res = await (await session.get(url, headers={'X-MBX-APIKEY':Config.API_KEY})).json()
         async with self.lock:
-            self.active = {o['orderId']:o for o in res}
+            self.active = {o['orderId']: o for o in res}
         logging.info("Synced %d orders", len(self.active))
 
 order_mgr = OrderManager()
@@ -261,7 +256,7 @@ router = SignalRouter()
 
 # —— SignalArbiter：多策略仲裁 ——
 class SignalArbiter:
-    PRIOR = {'main':3,'triple':2,'macd':1,'rvgi':1}
+    PRI = {'main':3,'triple':2,'macd':1,'rvgi':1}
     def __init__(self):
         self.signals = {}
         self.lock = asyncio.Lock()
@@ -269,11 +264,12 @@ class SignalArbiter:
     async def register(self, strat, side):
         async with self.lock:
             self.signals[strat] = (side, time.time())
+
     async def decide(self):
         async with self.lock:
             score = {'BUY':0,'SELL':0}
             for strat,(side,ts) in self.signals.items():
-                w = self.PRIOR.get(strat,1)
+                w = self.PRI.get(strat,1)
                 decay = max(0,1-(time.time()-ts)/60)
                 score[side] += w*decay
             return max(score, key=score.get)
@@ -285,6 +281,7 @@ class DynamicParameters:
     def __init__(self):
         self.base = [0.0025,0.0040,0.0060,0.0080,0.0160]
         self.vol = 1.0
+
     def update(self, atr):
         self.vol = atr/50
         return [x*self.vol for x in self.base]
@@ -296,6 +293,7 @@ class BollingerBandsInc:
     def __init__(self,window=20,dev=2):
         self.win, self.dev = window, dev
         self.prices = []
+
     def update(self,p):
         self.prices.append(p)
         if len(self.prices)>self.win: self.prices.pop(0)
@@ -308,42 +306,56 @@ class BollingerBandsInc:
 class DataManager:
     def __init__(self):
         cols=['open','high','low','close']
-        self.klines={'3m':pd.DataFrame(columns=cols),'15m':pd.DataFrame(columns=cols),'1h':pd.DataFrame(columns=cols)}
-        self.last_ts={'3m':0,'15m':0,'1h':0}
-        self.lock=asyncio.Lock()
+        self.klines = {
+            '3m':  pd.DataFrame(columns=cols),
+            '15m': pd.DataFrame(columns=cols),
+            '1h':  pd.DataFrame(columns=cols),
+        }
+        self.last_ts = {'3m':0,'15m':0,'1h':0}
+        self.lock = asyncio.Lock()
         self.bb3 = BollingerBandsInc()
-    async def update_kline(self,tf,rec):
+
+    async def update_kline(self, tf, rec):
         async with self.lock:
-            df=self.klines[tf]
-            if rec['t']>self.last_ts[tf]:
-                nr=pd.DataFrame([[rec['o'],rec['h'],rec['l'],rec['c']]],columns=df.columns)
-                self.klines[tf]=pd.concat([df,nr],ignore_index=True)
-                self.last_ts[tf]=rec['t']
+            df = self.klines[tf]
+            if rec['t'] > self.last_ts[tf]:
+                # 构造一行，确保包含所有列
+                data = {col: np.nan for col in df.columns}
+                data.update({'open': rec['o'], 'high': rec['h'], 'low': rec['l'], 'close': rec['c']})
+                new_row = pd.DataFrame([data], columns=df.columns)
+                self.klines[tf] = pd.concat([df, new_row], ignore_index=True)
+                self.last_ts[tf] = rec['t']
             else:
-                self.klines[tf].iloc[-1]=[rec['o'],rec['h'],rec['l'],rec['c']]
-            self._upd(tf)
-    def _upd(self,tf):
-        df=self.klines[tf]
-        if len(df)<20: return
-        if tf=='3m':
-            up,dn=self.bb3.update(df['close'].iat[-1])
-            if up:
-                df.at[len(df)-1,'bb_up']=up
-                df.at[len(df)-1,'bb_dn']=dn
-            df['bb_pct']=(df['close']-df['bb_dn'])/(df['bb_up']-df['bb_dn'])
+                # 同周期更新最后一行
+                self.klines[tf].iloc[-1] = [rec['o'], rec['h'], rec['l'], rec['c']] + \
+                    [self.klines[tf].iloc[-1][col] for col in df.columns[4:]]
+            self._update(tf)
+
+    def _update(self, tf):
+        df = self.klines[tf]
+        if len(df) < 20:
+            return
+        if tf == '3m':
+            up, dn = self.bb3.update(df['close'].iat[-1])
+            if up is not None:
+                df.at[len(df)-1, 'bb_up'] = up
+                df.at[len(df)-1, 'bb_dn'] = dn
+            df['bb_pct'] = (df['close'] - df['bb_dn']) / (df['bb_up'] - df['bb_dn'])
         else:
-            bb=BollingerBands(df['close'],20,2)
-            df['bb_up']=bb.bollinger_hband(); df['bb_dn']=bb.bollinger_lband()
-            df['bb_pct']=(df['close']-df['bb_dn'])/(df['bb_up']-df['bb_dn'])
-        if tf=='15m':
-            hl2=(df['high']+df['low'])/2
-            atr=df['high'].rolling(10).max()-df['low'].rolling(10).min()
-            df['st']=hl2-3*atr
-            df['macd']=MACD(df['close'],12,26,9).macd_diff()
-    async def get(self,tf,col):
+            bb = BollingerBands(df['close'], 20, 2)
+            df['bb_up']  = bb.bollinger_hband()
+            df['bb_dn']  = bb.bollinger_lband()
+            df['bb_pct'] = (df['close'] - df['bb_dn']) / (df['bb_up'] - df['bb_dn'])
+        if tf == '15m':
+            hl2 = (df['high'] + df['low'])/2
+            atr = df['high'].rolling(10).max() - df['low'].rolling(10).min()
+            df['st']   = hl2 - 3 * atr
+            df['macd'] = MACD(df['close'], 12, 26, 9).macd_diff()
+
+    async def get(self, tf, col):
         async with self.lock:
-            df=self.klines[tf]
-            if col in df and len(df)>0:
+            df = self.klines[tf]
+            if col in df.columns and len(df):
                 return df[col].iat[-1]
         return None
 
@@ -352,7 +364,7 @@ data_mgr = DataManager()
 # —— WebSocket 重连退避 ——
 async def market_ws():
     global latest_price, price_ts
-    retry=0
+    retry = 0
     while True:
         try:
             async with websockets.connect(Config.WS_MARKET_URL,
@@ -360,29 +372,34 @@ async def market_ws():
                                           ping_timeout=10,
                                           close_timeout=5) as ws:
                 logging.info("Market WS connected")
-                retry=0
+                retry = 0
                 async for msg in ws:
-                    o=json.loads(msg); s,d=o['stream'],o['data']
+                    o = json.loads(msg)
+                    s, d = o['stream'], o['data']
                     if s.endswith('@markPrice'):
                         latest_price, price_ts = float(d['p']), time.time()
                     if 'kline' in s:
-                        tf=s.split('@')[1].split('_')[1]; k=d['k']
-                        rec={'t':k['t'],'o':float(k['o']),'h':float(k['h']),'l':float(k['l']),'c':float(k['c'])}
+                        tf = s.split('@')[1].split('_')[1]
+                        k  = d['k']
+                        rec = {'t': k['t'], 'o': float(k['o']),
+                               'h': float(k['h']), 'l': float(k['l']),
+                               'c': float(k['c'])}
                         await data_mgr.update_kline(tf, rec)
         except Exception as e:
-            delay=min(2**retry,30)
+            delay = min(2**retry, 30)
             logging.error("Market WS err %s, retry in %ds", e, delay)
-            await asyncio.sleep(delay); retry+=1
+            await asyncio.sleep(delay)
+            retry += 1
 
 async def user_ws():
     while True:
         try:
             async with websockets.connect(Config.WS_USER_URL) as ws:
                 logging.info("User WS connected")
-                params={'apiKey':Config.ED25519_API,'timestamp':int(time.time()*1e6+time_offset)}
-                payload='&'.join(f"{k}={v}" for k,v in sorted(params.items()))
-                sig=base64.b64encode(ed_priv.sign(payload.encode())).decode()
-                params['signature']=sig
+                params = {'apiKey':Config.ED25519_API, 'timestamp':int(time.time()*1e6+time_offset)}
+                payload = '&'.join(f"{k}={v}" for k,v in sorted(params.items()))
+                sig = base64.b64encode(ed_priv.sign(payload.encode())).decode()
+                params['signature'] = sig
                 await ws.send(json.dumps({'id':str(uuid.uuid4()),'method':'session.logon','params':params}))
                 async def hb():
                     while True:
@@ -394,7 +411,14 @@ async def user_ws():
             logging.error("User WS err %s", e)
             await asyncio.sleep(5)
 
-# —— 周期任务 ——
+# —— 周期任务 + 配置热加载 ——
+async def config_watcher():
+    async for _ in watchfiles.awatch('/root/zhibai/'):
+        logging.info("Config changed, reloading...")
+        load_dotenv('/root/zhibai/.env')
+        await pos_tracker.sync()
+        await order_mgr.sync()
+
 async def maintenance():
     asyncio.create_task(config_watcher())
     while True:
@@ -405,14 +429,6 @@ async def maintenance():
         await order_mgr.sync()
         await order_cleaner.check()
 
-# —— 配置热加载 ——
-async def config_watcher():
-    async for _ in watchfiles.awatch('/root/zhibai/'):
-        logging.info("Config changed, reloading...")
-        load_dotenv('/root/zhibai/.env')
-        await pos_tracker.sync()
-        await order_mgr.sync()
-
 # —— 趋势监控 ——
 async def trend_watcher():
     while True:
@@ -420,25 +436,24 @@ async def trend_watcher():
         if latest_price is None: continue
         st = await data_mgr.get('15m','st')
         if st is None: continue
-        trend = 'UP' if latest_price>st else 'DOWN'
-        router.reset(trend)
+        router.reset('UP' if latest_price>st else 'DOWN')
 
 # —— 主策略 ——
 async def main_strategy():
-    levels = dyn_params.base
     tp_offs = [0.0102,0.0123,0.0150,0.0180,0.0220]
     while price_ts is None: await asyncio.sleep(0.1)
     while True:
         await asyncio.sleep(0.5)
-        p=latest_price
-        bb1=await data_mgr.get('1h','bb_pct'); bb3=await data_mgr.get('3m','bb_pct')
-        st =await data_mgr.get('15m','st')
+        p   = latest_price
+        bb1 = await data_mgr.get('1h','bb_pct')
+        bb3 = await data_mgr.get('3m','bb_pct')
+        st  = await data_mgr.get('15m','st')
         if None in (bb1,bb3,st): continue
         if (bb3<=0 or bb3>=1) and router.allow():
-            strong = (p>st and bb1<0.2) or (p<st and bb1>0.8)
-            atr_val = (await data_mgr.get('15m','st'))  # reuse st as proxy for atr here
-            levels = dyn_params.update(atr_val)
-            qty = 0.12 if p>st and strong else 0.03
+            strong  = (p>st and bb1<0.2) or (p<st and bb1>0.8)
+            atr_val = st  # 简化：用 st 代表波动
+            levels  = dyn_params.update(atr_val)
+            qty      = 0.12 if p>st and strong else 0.03
             if p<st: qty = 0.07 if strong else 0.015
             side, rev = ('BUY','SELL') if p>st else ('SELL','BUY')
             for off in levels:
@@ -447,7 +462,7 @@ async def main_strategy():
             for off in tp_offs:
                 price_tp = p*(1+off if rev=='BUY' else 1-off)
                 await order_mgr.place(rev,'LIMIT',qty=qty*0.2,price=price_tp,reduceOnly=True)
-            slp = p*(0.98 if p>st else 1.02)
+            slp   = p*(0.98 if p>st else 1.02)
             ttype = 'STOP_MARKET' if p>st else 'TAKE_PROFIT_MARKET'
             await order_mgr.place(rev,ttype,stopPrice=slp)
             await arbiter.register('main', side)
@@ -458,10 +473,10 @@ async def macd_strategy():
     global macd_cycle
     while True:
         await asyncio.sleep(15)
-        df=data_mgr.klines['15m']
+        df = data_mgr.klines['15m']
         if len(df)<27 or 'macd' not in df: continue
         prev, cur = df['macd'].iat[-2], df['macd'].iat[-1]
-        osc=abs(cur)
+        osc = abs(cur)
         if prev>0 and cur<prev and osc>=11 and macd_cycle!='DOWN':
             macd_cycle='DOWN'
             await order_mgr.place('SELL','MARKET',qty=0.017)
@@ -477,9 +492,9 @@ async def rvgi_strategy():
     global rvgi_cycle
     while True:
         await asyncio.sleep(10)
-        df=data_mgr.klines['15m']
+        df = data_mgr.klines['15m']
         if len(df)<11 or 'rvgi' not in df: continue
-        rv,sg = df['rvgi'].iat[-1], df['rvsig'].iat[-1]
+        rv, sg = df['rvgi'].iat[-1], df['rvsig'].iat[-1]
         if rv>sg and rvgi_cycle!='UP':
             rvgi_cycle='UP'
             await order_mgr.place('BUY','MARKET',qty=0.016)
@@ -499,30 +514,39 @@ def supertrend(df,period,mult):
     hl2=(df['high']+df['low'])/2
     atr=df['high'].rolling(period).max()-df['low'].rolling(period).min()
     up, dn = hl2+mult*atr, hl2-mult*atr
-    st = pd.Series(index=df.index); dirc=pd.Series(True, index=df.index)
+    st = pd.Series(index=df.index); dirc = pd.Series(True, index=df.index)
     for i in range(len(df)):
-        if i==0: st.iat[0]=up.iat[0]
+        if i==0:
+            st.iat[0] = up.iat[0]
         else:
-            prev=st.iat[i-1]; price=df['close'].iat[i]
+            prev = st.iat[i-1]; price=df['close'].iat[i]
             if price>prev:
-                st.iat[i]=max(dn.iat[i],prev); dirc.iat[i]=True
+                st.iat[i]     = max(dn.iat[i], prev)
+                dirc.iat[i]   = True
             else:
-                st.iat[i]=min(up.iat[i],prev); dirc.iat[i]=False
-    return st,dirc
+                st.iat[i]     = min(up.iat[i], prev)
+                dirc.iat[i]   = False
+    return st, dirc
 
 async def triple_st_strategy():
     global triple_cycle
     while True:
         await asyncio.sleep(30)
-        df=data_mgr.klines['15m']
+        df = data_mgr.klines['15m']
         if len(df)<12: continue
-        s1,d1=supertrend(df,10,1); s2,d2=supertrend(df,11,2); s3,d3=supertrend(df,12,3)
+        s1,d1 = supertrend(df,10,1)
+        s2,d2 = supertrend(df,11,2)
+        s3,d3 = supertrend(df,12,3)
         up = d1.iat[-1] and d2.iat[-1] and d3.iat[-1]
         dn = not (d1.iat[-1] or d2.iat[-1] or d3.iat[-1])
         if up and triple_cycle!='UP':
-            triple_cycle='UP'; await order_mgr.place('BUY','MARKET',qty=0.015); await arbiter.register('triple','BUY')
+            triple_cycle='UP'
+            await order_mgr.place('BUY','MARKET',qty=0.015)
+            await arbiter.register('triple','BUY')
         if dn and triple_cycle!='DOWN':
-            triple_cycle='DOWN'; await order_mgr.place('SELL','MARKET',qty=0.015); await arbiter.register('triple','SELL')
+            triple_cycle='DOWN'
+            await order_mgr.place('SELL','MARKET',qty=0.015)
+            await arbiter.register('triple','SELL')
         if triple_cycle=='UP' and not up:
             await order_mgr.place('SELL','MARKET',qty=0.015)
         if triple_cycle=='DOWN' and not dn:
@@ -532,7 +556,8 @@ async def triple_st_strategy():
 async def main():
     global session
     session = aiohttp.ClientSession()
-    await sync_time(); await detect_mode()
+    await sync_time()
+    await detect_mode()
     try:
         await asyncio.gather(
             market_ws(),
