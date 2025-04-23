@@ -124,7 +124,6 @@ def update_indicators():
 
 # ———— SuperTrend 计算函数 ————
 def supertrend(df, period=10, multiplier=3.0):
-    """返回一条 SuperTrend 线"""
     hl2 = (df['high'] + df['low']) / 2
     atr = df['high'].rolling(period).max() - df['low'].rolling(period).min()
     upperband = hl2 + multiplier * atr
@@ -136,7 +135,7 @@ def supertrend(df, period=10, multiplier=3.0):
             st.iloc[i] = upperband.iloc[i]
             continue
         prev = st.iloc[i-1]
-        ub = upperband.iloc[i]; lb = lowerband.iloc[i]
+        ub, lb = upperband.iloc[i], lowerband.iloc[i]
         price = df['close'].iloc[i]
         if price > prev:
             st.iloc[i] = max(lb, prev)
@@ -205,19 +204,17 @@ async def trend_watcher():
 
 # ———— 主策略：3m BB%B 分批挂单/止盈/止损 ————
 async def main_strategy():
-    global last_signal  # 新增：声明全局变量
+    global last_signal
     levels = [(0.0025,0.2),(0.0040,0.2),(0.0060,0.2),(0.0080,0.2),(0.0160,0.2)]
     tp_levels = [(0.0102,0.2),(0.0123,0.2),(0.0150,0.2),(0.0180,0.2),(0.0220,0.2)]
     sl_mul_up, sl_mul_dn = 0.98, 1.02
 
-    # 等待首个价格
     while price_ts is None:
         await asyncio.sleep(0.1)
 
     while True:
         await asyncio.sleep(0.2)
         async with lock:
-            # 数据齐全检查
             if any(klines[tf].shape[0] < 20 for tf in ('3m','15m','1h')):
                 continue
 
@@ -228,9 +225,8 @@ async def main_strategy():
             trend = 'UP' if p > st else 'DOWN'
             strong = (trend == 'UP' and bb1 < 0.2) or (trend == 'DOWN' and bb1 > 0.8)
 
-            # 只在 BB%B ≤0 或 ≥1，并且与上次趋势不同的时候下单
+            # === 仅在信号首次触发时下单 ===
             if (bb3 <= 0 or bb3 >= 1) and last_signal != trend:
-                # 按强弱和方向设置仓位
                 qty = 0.12 if strong else 0.03
                 if trend == 'DOWN':
                     qty = 0.07 if strong else 0.015
@@ -247,11 +243,10 @@ async def main_strategy():
                     price_tp = p * (1 + off if rev == 'BUY' else 1 - off)
                     await order(rev, 'LIMIT', qty=qty * ratio, price=price_tp)
 
-                # 初始固定止损委托
+                # 初始固定止损
                 sl_price = p * (sl_mul_up if trend == 'UP' else sl_mul_dn)
                 await order(rev, 'STOP_MARKET', stopPrice=sl_price)
 
-                # 记录当前信号，防止重复
                 last_signal = trend
 
 # ———— 15m MACD 子策略 ————
@@ -296,7 +291,7 @@ async def triple_st_strategy():
     state=None
     while True:
         await asyncio.sleep(30)
-        async with lock:
+        async with lock():
             df=klines['15m']
             if df.shape[0]<12: continue
             st1,dir1 = supertrend(df,10,3)
@@ -308,7 +303,6 @@ async def triple_st_strategy():
                 await order('BUY','MARKET',qty=0.15); state='UP'
             if dn and state!='DN':
                 await order('SELL','MARKET',qty=0.15); state='DN'
-            # 止盈：任一转向
             if state=='UP' and (not dir1.iloc[-1] or not dir2.iloc[-1] or not dir3.iloc[-1]):
                 await order('SELL','MARKET',qty=0.15); state=None
             if state=='DN' and (dir1.iloc[-1] or dir2.iloc[-1] or dir3.iloc[-1]):
