@@ -8,9 +8,8 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from ta.volatility import BollingerBands
 from ta.trend import MACD
 
-# ———— 高性能事件循环 ————
+# —— 高性能事件循环 ——
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-
 load_dotenv('/root/zhibai/.env')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
@@ -30,7 +29,7 @@ class Config:
     RECV_WINDOW      = 5000
     MIN_NOTIONAL_USD = 20.0  # 最小名义价值
 
-# 全局状态
+# —— 全局状态 ——
 session: aiohttp.ClientSession
 time_offset = 0
 is_hedge_mode = False
@@ -39,18 +38,20 @@ price_ts = None
 klines = {'3m': pd.DataFrame(), '15m': pd.DataFrame(), '1h': pd.DataFrame()}
 lock = asyncio.Lock()
 
-# 策略状态
-last_trend = None       # 'UP'/'DOWN'
-last_signal = None      # 主策略上次趋势
-macd_state = None       # 'SILVER','SILVER20','GOLD','GOLD20'
-rvgi_state = {'long':0.0,'short':0.0}
-triple_st_state = None  # 'UP'/'DN'
+# —— 策略全局信号 ——
+last_trend = None        # 'UP'/'DOWN'
+last_signal = None       # 上次下单方向 'UP' 或 'DOWN'
 
-# 加载 Ed25519 私钥
+# —— 子策略状态 ——
+macd_state = None        # 'SILVER','SILVER20','GOLD','GOLD20'
+rvgi_pos = {'long':0.0,'short':0.0}
+triple_st_state = None   # 'UP'/'DOWN'
+
+# —— 加载 Ed25519 私钥 ——
 with open(Config.ED25519_KEY_PATH,'rb') as f:
     ed_priv = load_pem_private_key(f.read(), password=None)
 
-# —— 时间同步 & 模式检测 ——
+# —— 时间 & 模式 ——
 async def sync_time():
     global time_offset
     r = await session.get(f"{Config.REST_BASE}/fapi/v1/time")
@@ -76,48 +77,37 @@ def sign_params(p:dict)->str:
 
 def sign_ws(params:dict)->str:
     payload='&'.join(f"{k}={v}" for k,v in sorted(params.items()))
-    sig=ed_priv.sign(payload.encode())
-    return base64.b64encode(sig).decode()
+    return base64.b64encode(ed_priv.sign(payload.encode())).decode()
 
 async def order(side, otype, qty=None, price=None, stopPrice=None, reduceOnly=False):
-    """通用下单。reduceOnly 仅用于平仓限价止盈单。"""
     ts = int(time.time()*1000 + time_offset)
-    p = {
-        'symbol':Config.SYMBOL,'side':side,'type':otype,
-        'timestamp':ts,'recvWindow':Config.RECV_WINDOW
-    }
-    # 双向模式下标明方向
+    p = {'symbol':Config.SYMBOL,'side':side,'type':otype,'timestamp':ts,'recvWindow':Config.RECV_WINDOW}
     if is_hedge_mode and otype in ('LIMIT','MARKET'):
         p['positionSide'] = 'LONG' if side=='BUY' else 'SHORT'
     if otype=='LIMIT':
         p.update({'timeInForce':'GTC','quantity':f"{qty:.6f}",'price':f"{price:.2f}"})
-        if reduceOnly:
-            p['reduceOnly']='true'
+        if reduceOnly: p['reduceOnly']='true'
     elif otype in ('STOP_MARKET','TAKE_PROFIT_MARKET'):
-        # 空单止损改 TAKE_PROFIT_MARKET
         p.update({'closePosition':'true','stopPrice':f"{stopPrice:.2f}"})
     else:
         p['quantity']=f"{qty:.6f}"
     qs = sign_params(p)
-    url = f"{Config.REST_BASE}/fapi/v1/order?{qs}"
-    res = await (await session.post(url, headers={'X-MBX-APIKEY':Config.API_KEY})).json()
+    res = await (await session.post(f"{Config.REST_BASE}/fapi/v1/order?{qs}",
+                headers={'X-MBX-APIKEY':Config.API_KEY})).json()
     if res.get('code'):
-        logging.error("Order ERR %s %s: %s", otype, side, res)
-        return False
-    # 校验名义 >= 20 USDC
+        logging.error("Order ERR %s %s: %s", otype, side, res); return False
+    # 不足名义价值跳过
     if otype=='LIMIT' and float(res.get('origQty',0))*float(res.get('price',0))<Config.MIN_NOTIONAL_USD:
-        logging.warning("Order notional < %.1f, skipped", Config.MIN_NOTIONAL_USD)
-        return False
+        logging.warning("Notional<%.1f, skip",Config.MIN_NOTIONAL_USD); return False
     logging.info("Order OK %s %s qty=%s", otype, side, qty or '')
     return True
 
-# —— 指标计算 ——
+# —— 指标更新 ——
 def update_indicators():
-    for tf, df in klines.items():
+    for tf,df in klines.items():
         if len(df)<20: continue
-        bb = BollingerBands(df['close'],20,2)
-        df['bb_up']=bb.bollinger_hband()
-        df['bb_dn']=bb.bollinger_lband()
+        bb=BollingerBands(df['close'],20,2)
+        df['bb_up'],df['bb_dn']=bb.bollinger_hband(),bb.bollinger_lband()
         df['bb_pct']=(df['close']-df['bb_dn'])/(df['bb_up']-df['bb_dn'])
         if tf=='15m':
             hl2=(df['high']+df['low'])/2
@@ -127,39 +117,34 @@ def update_indicators():
         if tf=='3m':
             num=(df['close']-df['open']).ewm(span=10).mean()
             den=(df['high']-df['low']).ewm(span=10).mean()
-            df['rvgi']=num/den
-            df['rvsig']=df['rvgi'].ewm(span=4).mean()
+            df['rvgi']=num/den; df['rvsig']=df['rvgi'].ewm(span=4).mean()
 
-# —— SuperTrend 计算 ——
+# —— SuperTrend ——
 def supertrend(df, period=10, multiplier=3.0):
     hl2=(df['high']+df['low'])/2
     atr=df['high'].rolling(period).max()-df['low'].rolling(period).min()
     up=hl2+multiplier*atr; dn=hl2-multiplier*atr
-    st = pd.Series(index=df.index); dirc=pd.Series(True, index=df.index)
+    st=pd.Series(index=df.index); dirc=pd.Series(True,index=df.index)
     for i in range(len(df)):
-        if i==0:
-            st.iat[0]=up.iat[0]
+        if i==0: st.iat[0]=up.iat[0]
         else:
             prev=st.iat[i-1]; price=df['close'].iat[i]
-            if price>prev:
-                st.iat[i]=max(dn.iat[i],prev); dirc.iat[i]=True
-            else:
-                st.iat[i]=min(up.iat[i],prev); dirc.iat[i]=False
+            if price>prev: st.iat[i]=max(dn.iat[i],prev); dirc.iat[i]=True
+            else:           st.iat[i]=min(up.iat[i],prev); dirc.iat[i]=False
     return st, dirc
 
-# —— WS 订阅 ——
+# —— Market WS ——
 async def market_ws():
     global latest_price, price_ts
     while True:
         try:
             async with websockets.connect(Config.WS_MARKET_URL) as ws:
-                logging.info("Market WS connected")
                 async for msg in ws:
-                    o=json.loads(msg); s=o['stream']; d=o['data']
+                    o=json.loads(msg); s,o2=o['stream'],o['data']
                     if s.endswith('@markPrice'):
-                        latest_price=float(d['p']); price_ts=time.time()
+                        latest_price=float(o2['p']); price_ts=time.time()
                     if 'kline' in s:
-                        tf=s.split('@')[1].split('_')[1]; k=d['k']
+                        tf=s.split('@')[1].split('_')[1]; k=o2['k']
                         rec={'open':float(k['o']),'high':float(k['h']),
                              'low':float(k['l']),'close':float(k['c'])}
                         async with lock:
@@ -170,32 +155,26 @@ async def market_ws():
                                 df.iloc[-1]=list(rec.values())
                             update_indicators()
         except Exception as e:
-            logging.error("Market WS error: %s",e)
-            await asyncio.sleep(2)
+            logging.error("Market WS error: %s",e); await asyncio.sleep(2)
 
+# —— User WS ——
 async def user_ws():
     while True:
         try:
             async with websockets.connect(Config.WS_USER_URL) as ws:
-                logging.info("User WS connected")
                 params={'apiKey':Config.ED25519_API,'timestamp':int(time.time()*1000)}
                 params['signature']=sign_ws(params)
-                await ws.send(json.dumps({
-                    'id':str(uuid.uuid4()),
-                    'method':'session.logon','params':params
-                }))
+                await ws.send(json.dumps({'id':str(uuid.uuid4()),
+                                          'method':'session.logon','params':params}))
                 async def hb():
                     while True:
                         await asyncio.sleep(10)
-                        await ws.send(json.dumps({
-                            'id':str(uuid.uuid4()),
-                            'method':'session.status'
-                        }))
+                        await ws.send(json.dumps({'id':str(uuid.uuid4()),
+                                                  'method':'session.status'}))
                 asyncio.create_task(hb())
                 async for _ in ws: pass
         except Exception as e:
-            logging.error("User WS error: %s",e)
-            await asyncio.sleep(5)
+            logging.error("User WS error: %s",e); await asyncio.sleep(5)
 
 # —— 趋势监控 ——
 async def trend_watcher():
@@ -209,93 +188,88 @@ async def trend_watcher():
             if trend!=last_trend:
                 last_trend, last_signal = trend, None
 
-# —— 主策略：3m BB%B 分批挂单/止盈/止损 ——
+# —— 主策略 ——
 async def main_strategy():
     global last_signal
     levels    = [0.0025,0.0040,0.0060,0.0080,0.0160]
-    tp_levels = [0.0102,0.0123,0.0150,0.0180,0.0220]
-    sl_up, sl_dn = 0.98, 1.02
+    tp_offsets= [0.0102,0.0123,0.0150,0.0180,0.0220]
+    sl_up,sl_dn = 0.98,1.02
 
     while price_ts is None: await asyncio.sleep(0.1)
     while True:
         await asyncio.sleep(0.2)
         async with lock:
             if any(len(klines[tf])<20 for tf in ('3m','15m','1h')): continue
-            p   = latest_price
-            bb1 = klines['1h']['bb_pct'].iat[-1]
-            bb3 = klines['3m']['bb_pct'].iat[-1]
-            stv = klines['15m']['st'].iat[-1]
-            trend  = 'UP' if p>stv else 'DOWN'
-            strong = (trend=='UP' and bb1<0.2) or (trend=='DOWN' and bb1>0.8)
+            p=latest_price
+            bb1=klines['1h']['bb_pct'].iat[-1]
+            bb3=klines['3m']['bb_pct'].iat[-1]
+            stv=klines['15m']['st'].iat[-1]
+            trend='UP' if p>stv else 'DOWN'
             if (bb3<=0 or bb3>=1) and last_signal!=trend:
-                qty = 0.12 if strong else 0.03
-                if trend=='DOWN': qty = 0.07 if strong else 0.015
-                side, rev = ('BUY','SELL') if trend=='UP' else ('SELL','BUY')
-                # 分批挂单
+                strong=(trend=='UP' and bb1<0.2) or (trend=='DOWN' and bb1>0.8)
+                qty=0.12 if strong else 0.03
+                if trend=='DOWN': qty=0.07 if strong else 0.015
+                side,rev=('BUY','SELL') if trend=='UP' else ('SELL','BUY')
+                # 挂单
                 for off in levels:
-                    price_off = p*(1+off if side=='BUY' else 1-off)
+                    price_off=p*(1+off if side=='BUY' else 1-off)
                     await order(side,'LIMIT',qty=qty,price=price_off)
-                # 止盈：reduceOnly
-                for off,ratio in zip(tp_levels,[0.2]*5):
-                    price_tp = p*(1+off if rev=='BUY' else 1-off)
-                    await order(
-                        rev,'LIMIT',
-                        qty=qty*ratio,
-                        price=price_tp,
-                        reduceOnly=True
-                    )
-                # 初始止损
-                slp = p*(sl_up if trend=='UP' else sl_dn)
-                await order(
-                    rev,
-                    'TAKE_PROFIT_MARKET' if trend=='DOWN' else 'STOP_MARKET',
-                    stopPrice=slp
-                )
+                # 止盈 reduceOnly
+                for off in tp_offsets:
+                    price_tp=p*(1+off if rev=='BUY' else 1-off)
+                    await order(rev,'LIMIT',qty=qty*0.2,price=price_tp,reduceOnly=True)
+                # 止损
+                slp=p*(sl_up if trend=='UP' else sl_dn)
+                tp_type='STOP_MARKET' if trend=='UP' else 'TAKE_PROFIT_MARKET'
+                await order(rev,tp_type,stopPrice=slp)
                 last_signal=trend
 
-# —— 15m MACD 子策略 ——
+# —— MACD 子策略 ——
 async def macd_strategy():
-    global macd_state
+    global macd_state, last_signal
     while True:
         await asyncio.sleep(15)
         async with lock:
             df=klines['15m']
             if len(df)<26 or 'macd' not in df: continue
-            prev=float(df['macd'].iloc[-2]); cur=float(df['macd'].iloc[-1])
+            prev,cur=float(df['macd'].iat[-2]),float(df['macd'].iat[-1])
             osc=abs(cur)
-            if macd_state!='SILVER' and prev>0 and cur<prev and 11<=osc<20:
-                await order('SELL','MARKET',qty=0.15); macd_state='SILVER'
-            if macd_state!='SILVER20' and prev>0 and cur<prev and osc>=20:
-                await order('SELL','MARKET',qty=0.15); macd_state='SILVER20'
-            if macd_state!='GOLD' and prev<0 and cur>prev and 11<=osc<20:
-                await order('BUY','MARKET',qty=0.15); macd_state='GOLD'
-            if macd_state!='GOLD20' and prev<0 and cur>prev and osc>=20:
-                await order('BUY','MARKET',qty=0.15); macd_state='GOLD20'
+            # 空头银叉
+            if prev>0 and cur<prev and 11<=osc<20 and last_signal!='DOWN':
+                await order('SELL','MARKET',qty=0.15); last_signal='DOWN'
+            # 空头加速
+            if prev>0 and cur<prev and osc>=20  and last_signal!='DOWN':
+                await order('SELL','MARKET',qty=0.15); last_signal='DOWN'
+            # 多头金叉
+            if prev<0 and cur>prev and 11<=osc<20 and last_signal!='UP':
+                await order('BUY','MARKET',qty=0.15); last_signal='UP'
+            # 多头加速
+            if prev<0 and cur>prev and osc>=20  and last_signal!='UP':
+                await order('BUY','MARKET',qty=0.15); last_signal='UP'
 
-# —— 15m RVGI 子策略 ——
+# —— RVGI 子策略 ——
 async def rvgi_strategy():
+    global rvgi_pos, last_signal
     while True:
         await asyncio.sleep(10)
         async with lock:
             df=klines['15m']
             if len(df)<10 or 'rvgi' not in df: continue
-            rv,sg = float(df['rvgi'].iat[-1]), float(df['rvsig'].iat[-1])
-            # 多头
-            if rv>sg and rvgi_state['long']<0.2:
-                await order('BUY','MARKET',qty=0.05)
-                rvgi_state['long']+=0.05
+            rv,sg=float(df['rvgi'].iat[-1]),float(df['rvsig'].iat[-1])
+            # 多
+            if rv>sg and rvgi_pos['long']<0.2 and last_signal!='UP':
+                await order('BUY','MARKET',qty=0.05); rvgi_pos['long']+=0.05; last_signal='UP'
                 await order('SELL','LIMIT',qty=0.05,price=latest_price*1.06,reduceOnly=True)
                 await order('SELL','STOP_MARKET',stopPrice=latest_price*0.98)
-            # 空头
-            if rv<sg and rvgi_state['short']<0.2:
-                await order('SELL','MARKET',qty=0.05)
-                rvgi_state['short']+=0.05
+            # 空
+            if rv<sg and rvgi_pos['short']<0.2 and last_signal!='DOWN':
+                await order('SELL','MARKET',qty=0.05); rvgi_pos['short']+=0.05; last_signal='DOWN'
                 await order('BUY','LIMIT',qty=0.05,price=latest_price*0.94,reduceOnly=True)
                 await order('BUY','TAKE_PROFIT_MARKET',stopPrice=latest_price*1.02)
 
-# —— 15m 三重 SuperTrend 子策略 ——
+# —— 三重 SuperTrend 子策略 ——
 async def triple_st_strategy():
-    global triple_st_state
+    global triple_st_state, last_signal
     while True:
         await asyncio.sleep(30)
         async with lock:
@@ -306,15 +280,16 @@ async def triple_st_strategy():
             st3,d3=supertrend(df,12,3)
             up = d1.iat[-1] and d2.iat[-1] and d3.iat[-1]
             dn = not (d1.iat[-1] or d2.iat[-1] or d3.iat[-1])
-            if up and triple_st_state!='UP':
-                await order('BUY','MARKET',qty=0.15); triple_st_state='UP'
-            if dn and triple_st_state!='DN':
-                await order('SELL','MARKET',qty=0.15); triple_st_state='DN'
-            # 止盈
+            if up and last_signal!='UP':
+                await order('BUY','MARKET',qty=0.15); last_signal='UP'
+            if dn and last_signal!='DOWN':
+                await order('SELL','MARKET',qty=0.15); last_signal='DOWN'
+            # 止盈不改 last_signal
             if triple_st_state=='UP' and not up:
-                await order('SELL','MARKET',qty=0.15); triple_st_state=None
-            if triple_st_state=='DN' and not dn:
-                await order('BUY','MARKET',qty=0.15); triple_st_state=None
+                await order('SELL','MARKET',qty=0.15)
+            if triple_st_state=='DOWN' and not dn:
+                await order('BUY','MARKET',qty=0.15)
+            triple_st_state = 'UP' if up else 'DOWN' if dn else triple_st_state
 
 # —— 启动 ——
 async def main():
