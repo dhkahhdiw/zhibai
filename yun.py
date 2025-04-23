@@ -70,15 +70,20 @@ class DataManager:
     async def update_kline(self, tf, rec):
         async with self.lock:
             df = self.klines[tf]
+            # rec['t'] 是当前 K 线的起始时间（毫秒）
             if rec['t'] > self.last_ts[tf]:
-                new_row = pd.DataFrame([{
-                    'open': rec['o'], 'high': rec['h'],
-                    'low': rec['l'],   'close': rec['c']
-                }])
+                # 新周期：追加新行，确保列对齐
+                new_row = pd.DataFrame(
+                    [[rec['o'], rec['h'], rec['l'], rec['c']]],
+                    columns=df.columns
+                )
+                # 这里用 concat，不会丢列也不会触发行类型不匹配
                 self.klines[tf] = pd.concat([df, new_row], ignore_index=True)
                 self.last_ts[tf] = rec['t']
             else:
+                # 同周期更新最后一行
                 self.klines[tf].iloc[-1] = [rec['o'], rec['h'], rec['l'], rec['c']]
+            # 计算指标
             self._update_indicators(tf)
 
     def _update_indicators(self, tf):
