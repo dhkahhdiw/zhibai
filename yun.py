@@ -21,7 +21,6 @@ class Config:
     SECRET_KEY       = os.getenv('BINANCE_SECRET_KEY').encode('ascii')
     ED25519_API      = os.getenv('ED25519_API_KEY')
     ED25519_KEY_PATH = os.getenv('ED25519_KEY_PATH')
-    # 合约账户模式: ONE_WAY(单向双向同时持仓) 下使用 BOTH；HEDGE(双向持仓) 下可指定 LONG/SHORT
     POSITION_SIDE    = os.getenv('POSITION_SIDE', 'BOTH')
     WS_MARKET_URL    = (
         'wss://fstream.binance.com/stream?streams='
@@ -106,7 +105,7 @@ async def rest_order(side, otype, qty=None, price=None, stopPrice=None):
     logging.info("Order OK %s %s qty=%s", otype, side, qty or '')
     return True
 
-# —— 挂单＋止盈＋止损 ——
+# —— 下单封装：多级挂单＋止盈＋止损 ——
 async def bracket(entry, direction, strength):
     global last_side, last_trend
     if last_side == direction:
@@ -121,11 +120,13 @@ async def bracket(entry, direction, strength):
     for lvl in levels:
         price = entry*(1 + (lvl if direction=='BUY' else -lvl))
         await rest_order(direction,'LIMIT',qty,price=price)
+
     tp_lv = ([0.0102,0.0123,0.015,0.018,0.022] if strength=='strong' else [0.0123,0.018])
     pct = (0.2 if strength=='strong' else 0.5)
     for tp in tp_lv:
         side2 = 'SELL' if direction=='BUY' else 'BUY'
         await rest_order(side2,'LIMIT',qty*pct,price=entry*(1+(tp if direction=='BUY' else -tp)))
+
     sl = entry*(0.98 if direction=='BUY' else 1.02)
     await rest_order('SELL' if direction=='BUY' else 'BUY','STOP_MARKET',stopPrice=sl)
 
@@ -137,15 +138,15 @@ def update_indicators():
         df['bb_up'],df['bb_dn'] = bb.bollinger_hband(),bb.bollinger_lband()
         df['bb_pct'] = (df['close']-df['bb_dn'])/(df['bb_up']-df['bb_dn'])
         if tf=='15m':
-            hl2=(df['high']+df['low'])/2
-            atr=df['high'].rolling(10).max()-df['low'].rolling(10).min()
+            hl2 = (df['high']+df['low'])/2
+            atr = df['high'].rolling(10).max() - df['low'].rolling(10).min()
             df['st'],df['macd'] = hl2-3*atr, MACD(df['close'],12,26,9).macd_diff()
         if tf=='3m':
-            num=(df['close']-df['open']).ewm(span=10).mean()
-            den=(df['high']-df['low']).ewm(span=10).mean()
+            num = (df['close']-df['open']).ewm(span=10).mean()
+            den = (df['high']-df['low']).ewm(span=10).mean()
             df['rvgi'],df['rvsig'] = num/den, (num/den).ewm(span=4).mean()
 
-# —— 市场 WS ——
+# —— 市场 WebSocket ——
 async def market_ws():
     global latest_price
     while True:
@@ -158,23 +159,25 @@ async def market_ws():
                         latest_price = float(o2['p'])
                     if 'kline' in s:
                         tf = s.split('@')[1].split('_')[1]
-                        k = o2['k']; rec = {'open':float(k['o']),'high':float(k['h']),'low':float(k['l']),'close':float(k['c'])}
+                        k = o2['k']
+                        rec = {'open':float(k['o']),'high':float(k['h']),'low':float(k['l']),'close':float(k['c'])}
                         async with lock:
-                            df=klines[tf]
+                            df = klines[tf]
                             if df.empty or int(k['t'])>df.index[-1]:
                                 klines[tf] = pd.concat([df,pd.DataFrame([rec])],ignore_index=True)
                             else:
                                 df.iloc[-1] = list(rec.values())
                             update_indicators()
         except Exception as e:
-            logging.error("Market WS error: %s", e); await asyncio.sleep(5)
+            logging.error("Market WS error: %s", e)
+            await asyncio.sleep(5)
 
-# —— 用户 WS ——
+# —— 用户 WebSocket ——
 async def user_ws():
     while True:
         try:
             async with websockets.connect(Config.WS_USER_URL) as ws:
-                params={'apiKey':Config.ED25519_API,'timestamp':int(time.time()*1000+time_offset),'recvWindow':Config.RECV_WINDOW}
+                params = {'apiKey':Config.ED25519_API,'timestamp':int(time.time()*1000+time_offset),'recvWindow':Config.RECV_WINDOW}
                 params['signature'] = sign_ws(params)
                 await ws.send(json.dumps({'id':str(uuid.uuid4()),'method':'session.logon','params':params}))
                 async def hb():
@@ -182,9 +185,11 @@ async def user_ws():
                         await asyncio.sleep(10)
                         await ws.send(json.dumps({'id':str(uuid.uuid4()),'method':'session.status'}))
                 asyncio.create_task(hb())
-                async for _ in ws: pass
+                async for _ in ws:
+                    pass
         except Exception as e:
-            logging.error("User WS error: %s", e); await asyncio.sleep(5)
+            logging.error("User WS error: %s", e)
+            await asyncio.sleep(5)
 
 # —— 趋势监控 ——
 async def trend_watcher():
@@ -197,55 +202,66 @@ async def trend_watcher():
             if trend != last_trend:
                 last_trend, last_side = trend, None
 
-# —— 主策略与子策略 ——
+# —— 主策略 ——
 async def main_strategy():
     while latest_price is None: await asyncio.sleep(0.2)
     while True:
         await asyncio.sleep(0.2)
         async with lock:
             if any(klines[tf].shape[0]<20 for tf in klines): continue
-            p=latest_price; bb1=klines['1h']['bb_pct'].iloc[-1]; bb3=klines['3m']['bb_pct'].iloc[-1]
+            p = latest_price
+            bb1 = klines['1h']['bb_pct'].iloc[-1]
+            bb3 = klines['3m']['bb_pct'].iloc[-1]
             strength = 'strong' if ((last_trend=='BUY' and bb1<0.2) or (last_trend=='SELL' and bb1>0.8)) else 'weak'
             if (bb3<=0 and last_trend=='BUY') or (bb3>=1 and last_trend=='SELL'):
                 await bracket(p,last_trend,strength)
 
+# —— 子策略：MACD ——
 async def macd_strategy():
-    fired=False
+    fired = False
     while True:
         await asyncio.sleep(15)
         async with lock:
-            df=klines['15m']
+            df = klines['15m']
             if df.shape[0]<26 or 'macd' not in df: continue
-            prev,cur = df['macd'].iloc[-2], df['macd'].iloc[-1]
-            if not fired and prev>0>cur: await bracket(latest_price,'SELL','weak'); fired=True
-            elif fired and prev<cur: await bracket(latest_price,'BUY','weak'); fired=False
+            prev,cur = df['macd'].iloc[-2],df['macd'].iloc[-1]
+            if not fired and prev>0>cur:
+                await bracket(latest_price,'SELL','weak'); fired=True
+            elif fired and prev<cur:
+                await bracket(latest_price,'BUY','weak'); fired=False
 
+# —— 子策略：RVGI ——
 async def rvgi_strategy():
-    cnt_l=cnt_s=0
+    cnt_l = cnt_s = 0
     while True:
         await asyncio.sleep(10)
-        async with lock():
-            df=klines['3m']
+        async with lock:  # 修正：移除错误的 lock() 调用
+            df = klines['3m']
             if df.shape[0]<10 or 'rvgi' not in df: continue
-            rv,sg = df['rvgi'].iloc[-1], df['rvsig'].iloc[-1]
-            if rv>sg and cnt_l<4: await bracket(latest_price,'BUY','weak'); cnt_l+=1
-            if rv<sg and cnt_s<4: await bracket(latest_price,'SELL','weak'); cnt_s+=1
+            rv,sg = df['rvgi'].iloc[-1],df['rvsig'].iloc[-1]
+            if rv>sg and cnt_l<4:
+                await bracket(latest_price,'BUY','weak'); cnt_l+=1
+            if rv<sg and cnt_s<4:
+                await bracket(latest_price,'SELL','weak'); cnt_s+=1
 
+# —— 子策略：Triple ST ——
 async def triple_st_strategy():
-    active=False
+    active = False
     while True:
         await asyncio.sleep(30)
-        async with lock():
-            df=klines['15m']
+        async with lock:  # 修正：移除错误的 lock() 调用
+            df = klines['15m']
             if df.shape[0]<3 or 'st' not in df: continue
             stv, p = df['st'], latest_price
             rise = stv.iloc[-3]<stv.iloc[-2]<stv.iloc[-1]<p
             fall = stv.iloc[-3]>stv.iloc[-2]>stv.iloc[-1]>p
-            if rise and not active: await bracket(p,'BUY','weak'); active=True
-            elif fall and not active: await bracket(p,'SELL','weak'); active=True
-            prev=stv.iloc[-2]
+            if rise and not active:
+                await bracket(p,'BUY','weak'); active=True
+            elif fall and not active:
+                await bracket(p,'SELL','weak'); active=True
+            prev = stv.iloc[-2]
             if active and ((rise and p<prev) or (fall and p>prev)):
-                side='SELL' if rise else 'BUY'
+                side = 'SELL' if rise else 'BUY'
                 await bracket(p,side,'weak'); active=False
 
 # —— 启动 ——
@@ -264,5 +280,5 @@ async def main():
     )
     await session.close()
 
-if __name__=='__main__':
+if __name__ == '__main__':
     asyncio.run(main())
