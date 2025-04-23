@@ -46,6 +46,7 @@ klines = {'3m': pd.DataFrame(), '15m': pd.DataFrame(), '1h': pd.DataFrame()}
 lock = asyncio.Lock()
 last_trend = None       # 'UP'/'DOWN'
 last_signal = None      # 上次趋势方向，用于防重入
+
 # ———— 加载 Ed25519 私钥 ————
 with open(Config.ED25519_KEY_PATH,'rb') as f:
     ed_priv = load_pem_private_key(f.read(), password=None)
@@ -121,6 +122,30 @@ def update_indicators():
             df['rvgi']=num/den
             df['rvsig']=df['rvgi'].ewm(span=4).mean()
 
+# ———— SuperTrend 计算函数 ————
+def supertrend(df, period=10, multiplier=3.0):
+    """返回一条 SuperTrend 线"""
+    hl2 = (df['high'] + df['low']) / 2
+    atr = df['high'].rolling(period).max() - df['low'].rolling(period).min()
+    upperband = hl2 + multiplier * atr
+    lowerband = hl2 - multiplier * atr
+    st = pd.Series(index=df.index)
+    direction = pd.Series(True, index=df.index)
+    for i in range(len(df)):
+        if i == 0:
+            st.iloc[i] = upperband.iloc[i]
+            continue
+        prev = st.iloc[i-1]
+        ub = upperband.iloc[i]; lb = lowerband.iloc[i]
+        price = df['close'].iloc[i]
+        if price > prev:
+            st.iloc[i] = max(lb, prev)
+            direction.iloc[i] = True
+        else:
+            st.iloc[i] = min(ub, prev)
+            direction.iloc[i] = False
+    return st, direction
+
 # ———— 市场 WS ————
 async def market_ws():
     global latest_price, price_ts
@@ -193,24 +218,19 @@ async def main_strategy():
             bb3=klines['3m']['bb_pct'].iloc[-1]
             st=klines['15m']['st'].iloc[-1]
             trend='UP' if p>st else 'DOWN'
-            # 是否强信号
             strong = (trend=='UP' and bb1<0.2) or (trend=='DOWN' and bb1>0.8)
-            # 触发条件
             if (bb3<=0 or bb3>=1) and last_signal!=trend:
                 qty = 0.12 if strong else 0.03
                 if trend=='DOWN': qty = 0.07 if strong else 0.015
                 side = 'BUY' if trend=='UP' else 'SELL'
-                # 分批挂单
                 for off,ratio in levels:
                     price_off = p*(1+off if side=='BUY' else 1-off)
                     await order(side,'LIMIT',qty=qty,price=price_off)
-                # 分批止盈
                 rev = 'SELL' if side=='BUY' else 'BUY'
                 for off,ratio in tp_levels:
                     price_tp = p*(1+off if rev=='BUY' else 1-off)
                     await order(rev,'LIMIT',qty=qty*ratio,price=price_tp)
-                # 初始止损
-                sl_price = p* (sl_mul_up if trend=='UP' else sl_mul_dn)
+                sl_price = p*(sl_mul_up if trend=='UP' else sl_mul_dn)
                 await order(rev,'STOP_MARKET',stopPrice=sl_price)
                 last_signal=trend
 
@@ -224,12 +244,10 @@ async def macd_strategy():
             if df.shape[0]<26 or 'macd' not in df: continue
             prev,cur = df['macd'].iloc[-2],df['macd'].iloc[-1]
             osc=abs(cur)
-            # 银叉空单
             if fired!='SILVER' and prev>0 and cur<prev and 11<=osc<20:
                 await order('SELL','MARKET',qty=0.15); fired='SILVER'
             if fired!='SILVER20' and prev>0 and cur<prev and osc>=20:
                 await order('SELL','MARKET',qty=0.15); fired='SILVER20'
-            # 金叉多单
             if fired!='GOLD' and prev<0 and cur>prev and -20<cur<=-11:
                 await order('BUY','MARKET',qty=0.15); fired='GOLD'
             if fired!='GOLD20' and prev<0 and cur>prev and cur<=-20:
@@ -254,7 +272,6 @@ async def rvgi_strategy():
                 await order('BUY','STOP_MARKET',stopPrice=latest_price*1.02)
 
 # ———— 15m 三重 SuperTrend 子策略 ————
-from ta.trend import STC
 async def triple_st_strategy():
     state=None
     while True:
@@ -262,21 +279,19 @@ async def triple_st_strategy():
         async with lock:
             df=klines['15m']
             if df.shape[0]<12: continue
-            # 计算三条 ST
-            st1 = STC(df['close'],10,3).stc()
-            st2 = STC(df['close'],11,3).stc()
-            st3 = STC(df['close'],12,3).stc()
-            up = st1.iloc[-1]>st1.iloc[-2] and st2.iloc[-1]>st2.iloc[-2] and st3.iloc[-1]>st3.iloc[-2]
-            dn = st1.iloc[-1]<st1.iloc[-2] and st2.iloc[-1]<st2.iloc[-2] and st3.iloc[-1]<st3.iloc[-2]
-            # 同向只触发一次
+            st1,dir1 = supertrend(df,10,3)
+            st2,dir2 = supertrend(df,11,3)
+            st3,dir3 = supertrend(df,12,3)
+            up = dir1.iloc[-1] and dir2.iloc[-1] and dir3.iloc[-1]
+            dn = not dir1.iloc[-1] and not dir2.iloc[-1] and not dir3.iloc[-1]
             if up and state!='UP':
                 await order('BUY','MARKET',qty=0.15); state='UP'
             if dn and state!='DN':
                 await order('SELL','MARKET',qty=0.15); state='DN'
             # 止盈：任一转向
-            if state=='UP' and (st1.iloc[-1]<st1.iloc[-2] or st2.iloc[-1]<st2.iloc[-2] or st3.iloc[-1]<st3.iloc[-2]):
+            if state=='UP' and (not dir1.iloc[-1] or not dir2.iloc[-1] or not dir3.iloc[-1]):
                 await order('SELL','MARKET',qty=0.15); state=None
-            if state=='DN' and (st1.iloc[-1]>st1.iloc[-2] or st2.iloc[-1]>st2.iloc[-2] or st3.iloc[-1]>st3.iloc[-2]):
+            if state=='DN' and (dir1.iloc[-1] or dir2.iloc[-1] or dir3.iloc[-1]):
                 await order('BUY','MARKET',qty=0.15); state=None
 
 # ———— 启动 ————
