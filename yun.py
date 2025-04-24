@@ -412,11 +412,11 @@ async def macd_strategy():
         osc = abs(cur)
         if prev>0 and cur<prev and osc>=11 and macd_cycle!='DOWN':
             macd_cycle='DOWN'
-            await order_mgr.place('SELL','MARKET',qty=0.017)
+            await order_mgr.place('SELL','MARKET',qty=0.15)
             await arbiter.register('macd','SELL')
         if prev<0 and cur>prev and osc>=11 and macd_cycle!='UP':
             macd_cycle='UP'
-            await order_mgr.place('BUY','MARKET',qty=0.017)
+            await order_mgr.place('BUY','MARKET',qty=0.15)
             await arbiter.register('macd','BUY')
 
 # —— 子策略：RVGI ——
@@ -431,14 +431,14 @@ async def rvgi_strategy():
         rv, sg = df['rvgi'].iat[-1], df['rvsig'].iat[-1]
         if rv>sg and rvgi_cycle!='UP':
             rvgi_cycle='UP'
-            await order_mgr.place('BUY','MARKET',qty=0.016)
-            await order_mgr.place('SELL','LIMIT',qty=0.016,price=latest_price*1.06,reduceOnly=True)
+            await order_mgr.place('BUY','MARKET',qty=0.05)
+            await order_mgr.place('SELL','LIMIT',qty=0.05,price=latest_price*1.06,reduceOnly=True)
             await order_mgr.place('SELL','STOP_MARKET',stopPrice=latest_price*0.98)
             await arbiter.register('rvgi','BUY')
         if rv<sg and rvgi_cycle!='DOWN':
             rvgi_cycle='DOWN'
-            await order_mgr.place('SELL','MARKET',qty=0.016)
-            await order_mgr.place('BUY','LIMIT',qty=0.016,price=latest_price*0.94,reduceOnly=True)
+            await order_mgr.place('SELL','MARKET',qty=0.05)
+            await order_mgr.place('BUY','LIMIT',qty=0.05,price=latest_price*0.94,reduceOnly=True)
             await order_mgr.place('BUY','TAKE_PROFIT_MARKET',stopPrice=latest_price*1.02)
             await arbiter.register('rvgi','SELL')
 
@@ -459,17 +459,17 @@ async def triple_st_strategy():
         dn = not (d1[-1] or d2[-1] or d3[-1])
         if up and triple_cycle!='UP':
             triple_cycle='UP'
-            await order_mgr.place('BUY','MARKET',qty=0.015)
+            await order_mgr.place('BUY','MARKET',qty=0.15)
             await arbiter.register('triple','BUY')
         if dn and triple_cycle!='DOWN':
             triple_cycle='DOWN'
-            await order_mgr.place('SELL','MARKET',qty=0.015)
+            await order_mgr.place('SELL','MARKET',qty=0.15)
             await arbiter.register('triple','SELL')
         # 反向平仓
         if triple_cycle=='UP' and not up:
-            await order_mgr.place('SELL','MARKET',qty=0.015)
+            await order_mgr.place('SELL','MARKET',qty=0.15)
         if triple_cycle=='DOWN' and not dn:
-            await order_mgr.place('BUY','MARKET',qty=0.015)
+            await order_mgr.place('BUY','MARKET',qty=0.15)
 
 # —— 启动 ——
 async def main():
