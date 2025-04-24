@@ -19,7 +19,6 @@ import websockets
 import watchfiles
 from dotenv import load_dotenv
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
-from ta.volatility import BollingerBands
 from ta.trend import MACD
 from numba import jit
 
@@ -56,24 +55,24 @@ price_ts = None
 with open(Config.ED25519_KEY_PATH, 'rb') as f:
     ed_priv = load_pem_private_key(f.read(), password=None)
 
-# —— 时间同步 & 模式检测 ——
+
+# —— 时间同步 & 持仓模式检测 ——
 async def sync_time():
     global time_offset
     js = await (await session.get(f"{Config.REST_BASE}/fapi/v1/time")).json()
-    srv_ms = js['serverTime']
-    local_ms = int(time.time() * 1000)
-    time_offset = srv_ms - local_ms
+    time_offset = js['serverTime'] - int(time.time()*1000)
     logging.info("Time offset: %dms", time_offset)
 
 async def detect_mode():
     global is_hedge_mode
-    ts = int(time.time() * 1000 + time_offset)
+    ts = int(time.time()*1000 + time_offset)
     qs = urllib.parse.urlencode({'timestamp': ts, 'recvWindow': Config.RECV_WINDOW})
     sig = hmac.new(Config.SECRET_KEY, qs.encode(), hashlib.sha256).hexdigest()
     url = f"{Config.REST_BASE}/fapi/v1/positionSide/dual?{qs}&signature={sig}"
-    res = await (await session.get(url, headers={'X-MBX-APIKEY': Config.API_KEY})).json()
+    res = await (await session.get(url, headers={'X-MBX-APIKEY':Config.API_KEY})).json()
     is_hedge_mode = res.get('dualSidePosition', False)
     logging.info("Hedge mode: %s", is_hedge_mode)
+
 
 # —— PositionTracker ——
 class PositionTracker:
@@ -82,100 +81,141 @@ class PositionTracker:
         self.lock = asyncio.Lock()
 
     async def sync(self):
-        ts = int(time.time() * 1000 + time_offset)
+        ts = int(time.time()*1000 + time_offset)
         qs = urllib.parse.urlencode({'timestamp': ts, 'recvWindow': Config.RECV_WINDOW})
         sig = hmac.new(Config.SECRET_KEY, qs.encode(), hashlib.sha256).hexdigest()
         url = f"{Config.REST_BASE}/fapi/v2/positionRisk?{qs}&signature={sig}"
-        res = await (await session.get(url, headers={'X-MBX-APIKEY': Config.API_KEY})).json()
+        res = await (await session.get(url, headers={'X-MBX-APIKEY':Config.API_KEY})).json()
         async with self.lock:
             for pos in res:
-                if pos['symbol'] == Config.SYMBOL:
+                if pos['symbol']==Config.SYMBOL:
                     amt = abs(float(pos['positionAmt']))
-                    if pos['positionSide'] == 'LONG':
+                    if pos['positionSide']=='LONG':
                         self.long = amt
                     else:
                         self.short = amt
 
-    async def get_available(self, side: str) -> float:
+    async def get_available(self, side:str)->float:
         async with self.lock:
-            if side == 'BUY':
+            if side=='BUY':
                 return max(0.0, Config.MAX_POSITION - (self.long - self.short))
-            else:
-                return max(0.0, Config.MAX_POSITION - (self.short - self.long))
+            return max(0.0, Config.MAX_POSITION - (self.short - self.long))
 
 pos_tracker = PositionTracker()
+
+
+# —— 令牌桶限流 ——
+class RateLimiter:
+    def __init__(self, rate, per):
+        self._tokens = rate
+        self._rate = rate
+        self._per = per
+        self._last = time.time()
+    async def acquire(self):
+        now = time.time()
+        self._tokens = min(self._rate,
+            self._tokens + (now-self._last)*(self._rate/self._per))
+        self._last = now
+        if self._tokens < 1:
+            await asyncio.sleep((1-self._tokens)*(self._per/self._rate))
+        self._tokens -= 1
+
+batch_rate = RateLimiter(rate=1, per=1)  # 每秒最多1次批量下单
+
 
 # —— 批量下单管理 ——
 class BatchOrderManager:
     BATCH_SIZE = 5
     def __init__(self):
         self.batch = []
+        self.lock = asyncio.Lock()
 
-    async def add(self, order_params):
-        self.batch.append(order_params)
-        if len(self.batch) >= self.BATCH_SIZE:
-            await self.flush()
+    async def add(self, order):
+        async with self.lock:
+            self.batch.append(order)
+            if len(self.batch)>=self.BATCH_SIZE:
+                await self.flush()
 
     async def flush(self):
-        if not self.batch:
-            return
-        payload = {'batchOrders': json.dumps(self.batch)}
-        await session.post(
-            f"{Config.REST_BASE}/fapi/v1/batchOrders",
-            headers={'X-MBX-APIKEY': Config.API_KEY},
-            data=payload
-        )
-        self.batch.clear()
+        async with self.lock:
+            if not self.batch:
+                return
+            await batch_rate.acquire()
+            payload = {'batchOrders': json.dumps(self.batch)}
+            try:
+                resp = await session.post(
+                    f"{Config.REST_BASE}/fapi/v1/batchOrders",
+                    headers={'X-MBX-APIKEY':Config.API_KEY},
+                    data=payload
+                )
+                resp.raise_for_status()
+            except aiohttp.ClientResponseError as e:
+                logging.error("BatchOrder flush failed %s %s", e, self.batch)
+                # TODO: 持久化 self.batch 或 发告警
+            except Exception as e:
+                logging.error("BatchOrder flush error %s %s", e, self.batch)
+            else:
+                self.batch.clear()
 
 batch_mgr = BatchOrderManager()
+
 
 # —— OrderManager ——
 class OrderManager:
     def __init__(self):
-        self.lock = asyncio.Lock()
+        pass
 
     def _sign(self, params):
         qs = urllib.parse.urlencode(sorted(params.items()))
         sig = hmac.new(Config.SECRET_KEY, qs.encode(), hashlib.sha256).hexdigest()
-        return qs + "&signature=" + sig
+        return sig
 
-    async def place(self, side, otype, qty=None, price=None, stopPrice=None, reduceOnly=False):
-        # 实时仓位检查
-        avail = await pos_tracker.get_available(side)
-        if qty and qty > avail:
-            logging.warning(f"仓位不足: 需{qty:.6f}, 可用{avail:.6f}")
-            return
-        ts = int(time.time() * 1000 + time_offset)
-        params = {
-            'symbol': Config.SYMBOL,
-            'side': side, 'type': otype,
-            'timestamp': ts, 'recvWindow': Config.RECV_WINDOW
+    def _build_order(self, side, otype, qty=None, price=None, stop=None):
+        ts = int(time.time()*1000 + time_offset)
+        base = {
+            "symbol": Config.SYMBOL,
+            "side": side,
+            "type": otype,
+            "recvWindow": Config.RECV_WINDOW,
+            "timestamp": ts
         }
-        if is_hedge_mode and otype in ('LIMIT', 'MARKET'):
-            params['positionSide'] = 'LONG' if side == 'BUY' else 'SHORT'
-        if otype == 'LIMIT':
-            params.update({
-                'timeInForce': 'GTC',
-                'quantity': f"{qty:.6f}",
-                'price': f"{price:.2f}"
+        if is_hedge_mode and otype in ("LIMIT","MARKET"):
+            base["positionSide"] = "LONG" if side=="BUY" else "SHORT"
+        if otype=="LIMIT":
+            base.update({
+                "timeInForce":"GTC",
+                "quantity": f"{qty:.6f}",
+                "price":    f"{price:.2f}"
             })
-            if reduceOnly:
-                params['reduceOnly'] = 'true'
-        elif otype in ('STOP_MARKET', 'TAKE_PROFIT_MARKET'):
-            params.update({'closePosition': 'true', 'stopPrice': f"{stopPrice:.2f}"})
+        elif otype in ("STOP_MARKET","TAKE_PROFIT_MARKET"):
+            base.update({
+                "closePosition":"true",
+                "stopPrice": f"{stop:.2f}"
+            })
         else:
-            params['quantity'] = f"{qty:.6f}"
-        # 加入批量下单
-        async with self.lock:
-            await batch_mgr.add(params)
+            base["quantity"] = f"{qty:.6f}"
+        # 签名放最后
+        base["signature"] = self._sign(base)
+        return base
+
+    async def place(self, side, otype, qty=None, price=None, stop=None, reduceOnly=False):
+        avail = await pos_tracker.get_available(side)
+        if qty and qty>avail:
+            logging.warning("仓位不足 需%.6f 可用%.6f", qty, avail)
+            return
+        order = self._build_order(side, otype, qty, price, stop)
+        if reduceOnly:
+            order["reduceOnly"] = "true"
+        await batch_mgr.add(order)
 
 order_mgr = OrderManager()
 
+
 # —— 信号熔断与仲裁 ——
 class SignalArbiter:
-    PRIOR = {'main': 3, 'triple': 2, 'macd': 1, 'rvgi': 1}
+    PRIOR = {"main":3,"triple":2,"macd":1,"rvgi":1}
     def __init__(self):
-        self.signals = {}  # strat -> (side, ts)
+        self.signals = {}  # strat->(side,ts)
         self.lock = asyncio.Lock()
 
     async def register(self, strat, side):
@@ -184,88 +224,73 @@ class SignalArbiter:
 
     async def decide(self):
         async with self.lock:
-            score = {'BUY': 0.0, 'SELL': 0.0}
-            for s, (side, ts) in self.signals.items():
-                w = self.PRIOR.get(s, 1)
-                decay = max(0.0, 1 - (time.time() - ts) / 60)
-                score[side] += w * decay
-            # 熔断：分数差过小则不交易
-            if abs(score['BUY'] - score['SELL']) < 1.0:
+            score = {"BUY":0.0,"SELL":0.0}
+            now = time.time()
+            for s,(side,ts) in self.signals.items():
+                w = self.PRIOR.get(s,1)
+                decay = max(0.0,1-(now-ts)/60)
+                score[side] += w*decay
+            if abs(score["BUY"]-score["SELL"])<1.0:
                 return None
-            return 'BUY' if score['BUY'] > score['SELL'] else 'SELL'
+            return "BUY" if score["BUY"]>score["SELL"] else "SELL"
 
 arbiter = SignalArbiter()
 
-# —— 动态参数 ——
+
+# —— DynamicParameters ——
 class DynamicParameters:
     def __init__(self):
-        self.base = [0.0025, 0.0040, 0.0060, 0.0080, 0.0160]
+        self.base = [0.0025,0.0040,0.0060,0.0080,0.0160]
+
     def update(self, atr):
-        vol = atr / 50
-        return [x * vol for x in self.base]
+        vol = atr/50
+        return [x*vol for x in self.base]
 
 dyn_params = DynamicParameters()
+
 
 # —— DataManager ——
 class DataManager:
     def __init__(self):
-        self.klines = {
-            tf: pd.DataFrame(columns=['open', 'high', 'low', 'close'])
-            for tf in ('3m', '15m', '1h')
-        }
-        self.last_ts = {tf: 0 for tf in ('3m', '15m', '1h')}
+        self.klines = {tf:pd.DataFrame(columns=["open","high","low","close"])
+                       for tf in ("3m","15m","1h")}
+        self.last_ts = {tf:0 for tf in ("3m","15m","1h")}
         self.lock = asyncio.Lock()
 
     async def update_kline(self, tf, rec):
         async with self.lock:
             df = self.klines[tf]
-            new_row = {
-                'open': rec['o'],
-                'high': rec['h'],
-                'low':  rec['l'],
-                'close':rec['c']
-            }
-            # —— 修正：避免空 DataFrame 直接 concat ——
-            if df.empty or rec['t'] > self.last_ts[tf]:
-                df2 = pd.DataFrame([new_row])
-                self.klines[tf] = pd.concat([df, df2], ignore_index=True)
+            new = {"open":rec["o"],"high":rec["h"],"low":rec["l"],"close":rec["c"]}
+            if df.empty or rec["t"]>self.last_ts[tf]:
+                self.klines[tf] = pd.concat([df, pd.DataFrame([new])], ignore_index=True)
             else:
-                # 更新末行
-                self.klines[tf].iloc[-1] = [rec['o'], rec['h'], rec['l'], rec['c']]
-            self.last_ts[tf] = rec['t']
+                self.klines[tf].iloc[-1] = [rec["o"],rec["h"],rec["l"],rec["c"]]
+            self.last_ts[tf] = rec["t"]
             self._update(tf)
 
     def _update(self, tf):
         df = self.klines[tf]
-        if len(df) < 20:
-            return
-        # 3m 用简单移动 + std 计算
-        if tf == '3m':
-            sma = df['close'].rolling(20).mean().iat[-1]
-            std = df['close'].rolling(20).std().iat[-1]
-            up, dn = sma + 2*std, sma - 2*std
-            df.at[len(df)-1, 'bb_up'] = up
-            df.at[len(df)-1, 'bb_dn'] = dn
-            df['bb_pct'] = (df['close'] - df['bb_dn']) / (df['bb_up'] - df['bb_dn'])
-        else:
-            bb = BollingerBands(df['close'], 20, 2)
-            df['bb_up'] = bb.bollinger_hband()
-            df['bb_dn'] = bb.bollinger_lband()
-            df['bb_pct'] = (df['close'] - df['bb_dn']) / (df['bb_up'] - df['bb_dn'])
-        if tf == '15m':
-            hl2 = (df['high'] + df['low']) / 2
-            atr = df['high'].rolling(10).max() - df['low'].rolling(10).min()
-            df['st']   = hl2 - 3 * atr
-            df['macd'] = MACD(df['close'], 12, 26, 9).macd_diff()
+        if len(df)<20: return
+        #统一使用 pandas rolling
+        bb_up = df["close"].rolling(20).mean() + 2*df["close"].rolling(20).std()
+        bb_dn = df["close"].rolling(20).mean() - 2*df["close"].rolling(20).std()
+        df["bb_up"], df["bb_dn"] = bb_up, bb_dn
+        df["bb_pct"] = (df["close"]-bb_dn)/(bb_up-bb_dn)
+        if tf=="15m":
+            hl2 = (df["high"]+df["low"])/2
+            atr = df["high"].rolling(10).max() - df["low"].rolling(10).min()
+            df["st"] = hl2 - 3*atr
+            df["macd"] = MACD(df["close"],12,26,9).macd_diff()
 
     async def get(self, tf, col):
         async with self.lock:
             df = self.klines[tf]
-            if col in df.columns and len(df) > 0:
+            if col in df.columns and len(df)>0:
                 return df[col].iat[-1]
         return None
 
 data_mgr = DataManager()
+
 
 # —— Numba 加速 SuperTrend ——
 @jit(nopython=True)
@@ -275,77 +300,97 @@ def numba_supertrend(high, low, close, period, mult):
     dirc = [True]*n
     hl2 = [(high[i]+low[i])/2 for i in range(n)]
     atr = [max(high[i-period+1:i+1]) - min(low[i-period+1:i+1]) for i in range(n)]
-    up = [hl2[i] + mult*atr[i] for i in range(n)]
-    dn = [hl2[i] - mult*atr[i] for i in range(n)]
+    up = [hl2[i]+mult*atr[i] for i in range(n)]
+    dn = [hl2[i]-mult*atr[i] for i in range(n)]
     st[0] = up[0]
-    for i in range(1, n):
-        if close[i] > st[i-1]:
-            st[i] = max(dn[i], st[i-1])
-            dirc[i] = True
+    for i in range(1,n):
+        if close[i]>st[i-1]:
+            st[i] = max(dn[i],st[i-1]); dirc[i]=True
         else:
-            st[i] = min(up[i], st[i-1])
-            dirc[i] = False
+            st[i] = min(up[i],st[i-1]); dirc[i]=False
     return st, dirc
 
-# —— 市场数据 WS ——
+
+# —— WebSocket：市场数据 ——
 async def market_ws():
     global latest_price, price_ts
     retry = 0
     while True:
         try:
-            async with websockets.connect(Config.WS_MARKET_URL,
-                                          ping_interval=15, ping_timeout=10, close_timeout=5) as ws:
+            async with websockets.connect(
+                Config.WS_MARKET_URL,
+                ping_interval=15, ping_timeout=10, close_timeout=5
+            ) as ws:
                 logging.info("Market WS connected")
                 retry = 0
                 async for msg in ws:
                     o = json.loads(msg)
-                    s, d = o['stream'], o['data']
-                    if s.endswith('@markPrice'):
-                        latest_price, price_ts = float(d['p']), time.time()
-                    if 'kline' in s:
-                        tf = s.split('@')[1].split('_')[1]
-                        k = d['k']
-                        rec = {'t': k['t'], 'o': float(k['o']),
-                               'h': float(k['h']), 'l': float(k['l']),
-                               'c': float(k['c'])}
-                        await data_mgr.update_kline(tf, rec)
-        except Exception as e:
-            delay = min(2**retry, 30)
-            logging.error("Market WS err %s, retry in %ds", e, delay)
+                    s,d = o["stream"], o["data"]
+                    if s.endswith("@markPrice"):
+                        latest_price, price_ts = float(d["p"]), time.time()
+                    if "kline" in s:
+                        tf = s.split("@")[1].split("_")[1]
+                        k = d["k"]
+                        rec = {
+                            "t":k["t"],"o":float(k["o"]),
+                            "h":float(k["h"]),"l":float(k["l"]),
+                            "c":float(k["c"])
+                        }
+                        await data_mgr.update_kline(tf,rec)
+        except aiohttp.ClientResponseError as e:
+            # 分级退避
+            if e.status in (429,418):
+                await asyncio.sleep(60)
+            elif e.status==403:
+                await asyncio.sleep(120)
+            else:
+                await asyncio.sleep(5)
+        except Exception:
+            delay = min(2**retry,30)
+            logging.error("Market WS err, retry in %ds", delay)
             await asyncio.sleep(delay)
-            retry += 1
+            retry+=1
 
-# —— 用户流 WS ——
+
+# —— WebSocket：用户流 ——
 async def user_ws():
     while True:
         try:
             async with websockets.connect(Config.WS_USER_URL) as ws:
                 logging.info("User WS connected")
                 params = {
-                    'apiKey': Config.ED25519_API,
-                    'timestamp': int(time.time()*1000 + time_offset)
+                    "apiKey":Config.ED25519_API,
+                    "timestamp":int(time.time()*1000+time_offset)
                 }
-                payload = '&'.join(f"{k}={v}" for k, v in sorted(params.items()))
+                payload = "&".join(f"{k}={v}" for k,v in sorted(params.items()))
                 sig = base64.b64encode(ed_priv.sign(payload.encode())).decode()
-                params['signature'] = sig
+                params["signature"] = sig
                 await ws.send(json.dumps({
-                    'id': str(uuid.uuid4()),
-                    'method': 'session.logon',
-                    'params': params
+                    "id":str(uuid.uuid4()),
+                    "method":"session.logon",
+                    "params":params
                 }))
                 async def hb():
                     while True:
                         await asyncio.sleep(10)
                         await ws.send(json.dumps({
-                            'id': str(uuid.uuid4()),
-                            'method': 'session.status'
+                            "id":str(uuid.uuid4()),
+                            "method":"session.status"
                         }))
                 asyncio.create_task(hb())
                 async for _ in ws:
                     pass
-        except Exception as e:
-            logging.error("User WS err %s", e)
+        except aiohttp.ClientResponseError as e:
+            if e.status in (429,418):
+                await asyncio.sleep(60)
+            elif e.status==403:
+                await asyncio.sleep(120)
+            else:
+                await asyncio.sleep(5)
+        except Exception:
+            logging.error("User WS connection error, retry in 5s")
             await asyncio.sleep(5)
+
 
 # —— 配置热加载 & 定时维护 ——
 async def config_watcher():
@@ -363,113 +408,114 @@ async def maintenance():
         await pos_tracker.sync()
         await batch_mgr.flush()
 
+
 # —— 主策略 ——
 async def main_strategy():
-    tp_offs = [0.0102, 0.0123, 0.0150, 0.0180, 0.0220]
+    tp_offs = [0.0102,0.0123,0.0150,0.0180,0.0220]
     while price_ts is None:
         await asyncio.sleep(0.1)
     while True:
         await asyncio.sleep(0.5)
-        p = latest_price
-        bb1 = await data_mgr.get('1h', 'bb_pct')
-        bb3 = await data_mgr.get('3m', 'bb_pct')
-        st  = await data_mgr.get('15m','st')
-        if None in (bb1, bb3, st):
+        p   = latest_price
+        bb1 = await data_mgr.get("1h","bb_pct")
+        bb3 = await data_mgr.get("3m","bb_pct")
+        st  = await data_mgr.get("15m","st")
+        if None in (bb1,bb3,st):
             continue
-        if bb3 <= 0 or bb3 >= 1:
-            side = 'BUY' if p>st else 'SELL'
-            await arbiter.register('main', side)
-            if await arbiter.decide() == side:
+        if bb3<=0 or bb3>=1:
+            side = "BUY" if p>st else "SELL"
+            await arbiter.register("main", side)
+            if await arbiter.decide()==side:
                 strong = (p>st and bb1<0.2) or (p<st and bb1>0.8)
                 levels = dyn_params.update(st)
                 qty = 0.12 if (p>st and strong) else 0.03
                 if p<st:
                     qty = 0.07 if strong else 0.015
-                rev = 'SELL' if side=='BUY' else 'BUY'
-                # 分级挂单
+                rev = "SELL" if side=="BUY" else "BUY"
                 for off in levels:
-                    price_off = p*(1 + off if side=='BUY' else 1 - off)
-                    await order_mgr.place(side, 'LIMIT', qty=qty, price=price_off)
-                # 止盈单
+                    price_off = p*(1+off if side=="BUY" else 1-off)
+                    await order_mgr.place(side,"LIMIT",qty=qty,price=price_off)
                 for off in tp_offs:
-                    pt = p*(1 + off if rev=='BUY' else 1 - off)
-                    await order_mgr.place(rev, 'LIMIT', qty=qty*0.2, price=pt, reduceOnly=True)
-                # 止损止盈市价
-                slp = p*(0.98 if side=='BUY' else 1.02)
-                ttype = 'STOP_MARKET' if side=='BUY' else 'TAKE_PROFIT_MARKET'
-                await order_mgr.place(rev, ttype, stopPrice=slp)
+                    pt = p*(1+off if rev=="BUY" else 1-off)
+                    await order_mgr.place(rev,"LIMIT",qty=qty*0.2,price=pt,reduceOnly=True)
+                slp = p*(0.98 if side=="BUY" else 1.02)
+                ttype = "STOP_MARKET" if side=="BUY" else "TAKE_PROFIT_MARKET"
+                await order_mgr.place(rev,ttype,stop=slp)
+
 
 # —— 子策略：MACD ——
-macd_cycle = None
+macd_cycle=None
 async def macd_strategy():
     global macd_cycle
     while True:
         await asyncio.sleep(15)
-        df = data_mgr.klines['15m']
-        if len(df)<27 or 'macd' not in df:
+        df = data_mgr.klines["15m"]
+        if len(df)<27 or "macd" not in df:
             continue
-        prev, cur = df['macd'].iat[-2], df['macd'].iat[-1]
+        prev,cur = df["macd"].iat[-2], df["macd"].iat[-1]
         osc = abs(cur)
-        if prev>0 and cur<prev and osc>=11 and macd_cycle!='DOWN':
-            macd_cycle='DOWN'
-            await order_mgr.place('SELL','MARKET',qty=0.017)
-            await arbiter.register('macd','SELL')
-        if prev<0 and cur>prev and osc>=11 and macd_cycle!='UP':
-            macd_cycle='UP'
-            await order_mgr.place('BUY','MARKET',qty=0.017)
-            await arbiter.register('macd','BUY')
+        if prev>0 and cur<prev and osc>=11 and macd_cycle!="DOWN":
+            macd_cycle="DOWN"
+            await order_mgr.place("SELL","MARKET",qty=0.017)
+            await arbiter.register("macd","SELL")
+        if prev<0 and cur>prev and osc>=11 and macd_cycle!="UP":
+            macd_cycle="UP"
+            await order_mgr.place("BUY","MARKET",qty=0.017)
+            await arbiter.register("macd","BUY")
+
 
 # —— 子策略：RVGI ——
-rvgi_cycle = None
+rvgi_cycle=None
 async def rvgi_strategy():
     global rvgi_cycle
     while True:
         await asyncio.sleep(10)
-        df = data_mgr.klines['15m']
-        if len(df)<11 or not all(c in df.columns for c in ('rvgi','rvsig')):
+        df = data_mgr.klines["15m"]
+        if len(df)<11 or not all(c in df.columns for c in ("rvgi","rvsig")):
             continue
-        rv, sg = df['rvgi'].iat[-1], df['rvsig'].iat[-1]
-        if rv>sg and rvgi_cycle!='UP':
-            rvgi_cycle='UP'
-            await order_mgr.place('BUY','MARKET',qty=0.016)
-            await order_mgr.place('SELL','LIMIT',qty=0.016,price=latest_price*1.06,reduceOnly=True)
-            await order_mgr.place('SELL','STOP_MARKET',stopPrice=latest_price*0.98)
-            await arbiter.register('rvgi','BUY')
-        if rv<sg and rvgi_cycle!='DOWN':
-            rvgi_cycle='DOWN'
-            await order_mgr.place('SELL','MARKET',qty=0.016)
-            await order_mgr.place('BUY','LIMIT',qty=0.016,price=latest_price*0.94,reduceOnly=True)
-            await order_mgr.place('BUY','TAKE_PROFIT_MARKET',stopPrice=latest_price*1.02)
-            await arbiter.register('rvgi','SELL')
+        rv,sg = df["rvgi"].iat[-1], df["rvsig"].iat[-1]
+        if rv>sg and rvgi_cycle!="UP":
+            rvgi_cycle="UP"
+            await order_mgr.place("BUY","MARKET",qty=0.016)
+            await order_mgr.place("SELL","LIMIT",qty=0.016,price=latest_price*1.06,reduceOnly=True)
+            await order_mgr.place("SELL","STOP_MARKET",stop=latest_price*0.98)
+            await arbiter.register("rvgi","BUY")
+        if rv<sg and rvgi_cycle!="DOWN":
+            rvgi_cycle="DOWN"
+            await order_mgr.place("SELL","MARKET",qty=0.016)
+            await order_mgr.place("BUY","LIMIT",qty=0.016,price=latest_price*0.94,reduceOnly=True)
+            await order_mgr.place("BUY","TAKE_PROFIT_MARKET",stop=latest_price*1.02)
+            await arbiter.register("rvgi","SELL")
+
 
 # —— 子策略：三重 SuperTrend ——
-triple_cycle = None
+triple_cycle=None
 async def triple_st_strategy():
     global triple_cycle
     while True:
         await asyncio.sleep(30)
-        df = data_mgr.klines['15m']
+        df = data_mgr.klines["15m"]
         if len(df)<12:
             continue
-        high, low, close = df['high'].values, df['low'].values, df['close'].values
-        s1, d1 = numba_supertrend(high, low, close, 10, 1)
-        s2, d2 = numba_supertrend(high, low, close, 11, 2)
-        s3, d3 = numba_supertrend(high, low, close, 12, 3)
+        high,low,close = df["high"].values, df["low"].values, df["close"].values
+        s1,d1 = numba_supertrend(high,low,close,10,1)
+        s2,d2 = numba_supertrend(high,low,close,11,2)
+        s3,d3 = numba_supertrend(high,low,close,12,3)
         up = d1[-1] and d2[-1] and d3[-1]
         dn = not (d1[-1] or d2[-1] or d3[-1])
-        if up and triple_cycle!='UP':
-            triple_cycle='UP'
-            await order_mgr.place('BUY','MARKET',qty=0.015)
-            await arbiter.register('triple','BUY')
-        if dn and triple_cycle!='DOWN':
-            triple_cycle='DOWN'
-            await order_mgr.place('SELL','MARKET',qty=0.015)
-            await arbiter.register('triple','SELL')
-        # 反向平仓
-        if triple_cycle=='UP' and not up:
-            await order_mgr.place('SELL','MARKET',qty=0.015)
-        if triple_cycle=='DOWN' and not dn:
-            await order_mgr.place('BUY','MARKET',qty=0.015)
+        if up and triple_cycle!="UP":
+            triple_cycle="UP"
+            await order_mgr.place("BUY","MARKET",qty=0.015)
+            await arbiter.register("triple","BUY")
+        if dn and triple_cycle!="DOWN":
+            triple_cycle="DOWN"
+            await order_mgr.place("SELL","MARKET",qty=0.015)
+            await arbiter.register("triple","SELL")
+        if triple_cycle=="UP" and not up:
+            await order_mgr.place("SELL","MARKET",qty=0.015)
+        if triple_cycle=="DOWN" and not dn:
+            await order_mgr.place("BUY","MARKET",qty=0.015)
+
 
 # —— 启动 ——
 async def main():
@@ -490,5 +536,5 @@ async def main():
     finally:
         await session.close()
 
-if __name__ == '__main__':
+if __name__=='__main__':
     asyncio.run(main())
