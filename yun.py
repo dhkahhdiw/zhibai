@@ -91,8 +91,10 @@ class PositionTracker:
             for pos in res:
                 if pos['symbol'] == Config.SYMBOL:
                     amt = abs(float(pos['positionAmt']))
-                    if pos['positionSide']=='LONG': self.long = amt
-                    else: self.short = amt
+                    if pos['positionSide']=='LONG':
+                        self.long = amt
+                    else:
+                        self.short = amt
 
     async def get_available(self, side: str) -> float:
         async with self.lock:
@@ -102,7 +104,7 @@ class PositionTracker:
 
 pos_tracker = PositionTracker()
 
-# —— 批量下单器 & 单笔下单器 ——
+# —— 批量下单器 ——
 class BatchOrderManager:
     BATCH_SIZE = 5
     def __init__(self):
@@ -110,19 +112,23 @@ class BatchOrderManager:
 
     async def add(self, order):
         self.batch.append(order)
-        if len(self.batch)>=self.BATCH_SIZE:
+        if len(self.batch) >= self.BATCH_SIZE:
             await self.flush()
 
     async def flush(self):
-        if not self.batch: return
+        if not self.batch:
+            return
         payload = {'batchOrders': json.dumps(self.batch)}
-        await session.post(f"{Config.REST_BASE}/fapi/v1/batchOrders",
-                           headers={'X-MBX-APIKEY':Config.API_KEY},
-                           data=payload)
+        await session.post(
+            f"{Config.REST_BASE}/fapi/v1/batchOrders",
+            headers={'X-MBX-APIKEY': Config.API_KEY},
+            data=payload
+        )
         self.batch.clear()
 
 batch_mgr = BatchOrderManager()
 
+# —— 单笔下单管理 ——
 class OrderManager:
     def __init__(self):
         self.lock = asyncio.Lock()
@@ -135,24 +141,34 @@ class OrderManager:
     async def place(self, side, otype, qty=None, price=None, stopPrice=None, reduceOnly=False):
         # 仓位检查
         avail = await pos_tracker.get_available(side)
-        if qty and qty>avail:
+        if qty and qty > avail:
             logging.warning(f"仓位不足: 需 {qty:.6f}, 可用 {avail:.6f}")
             return
-        ts = int(time.time()*1000 + time_offset)
-        params = {'symbol':Config.SYMBOL,'side':side,'type':otype,
-                  'timestamp':ts,'recvWindow':Config.RECV_WINDOW}
+        ts = int(time.time() * 1000 + time_offset)
+        params = {
+            'symbol': Config.SYMBOL, 'side': side, 'type': otype,
+            'timestamp': ts, 'recvWindow': Config.RECV_WINDOW
+        }
         if is_hedge_mode and otype in ('LIMIT','MARKET'):
-            params['positionSide']='LONG' if side=='BUY' else 'SHORT'
-        if otype=='LIMIT':
-            params.update({'timeInForce':'GTC','quantity':f"{qty:.6f}",'price':f"{price:.2f}"})
-            if reduceOnly: params['reduceOnly']='true'
+            params['positionSide'] = 'LONG' if side=='BUY' else 'SHORT'
+        if otype == 'LIMIT':
+            params.update({
+                'timeInForce':'GTC',
+                'quantity':f"{qty:.6f}",
+                'price':f"{price:.2f}"
+            })
+            if reduceOnly:
+                params['reduceOnly'] = 'true'
         elif otype in ('STOP_MARKET','TAKE_PROFIT_MARKET'):
-            params.update({'closePosition':'true','stopPrice':f"{stopPrice:.2f}"})
+            params.update({
+                'closePosition':'true',
+                'stopPrice':f"{stopPrice:.2f}"
+            })
         else:
-            params['quantity']=f"{qty:.6f}"
-        # 转成批量下单格式
+            params['quantity'] = f"{qty:.6f}"
+
         async with self.lock:
-            batch_mgr.add({'method':'POST','params':params})
+            batch_mgr.add({'method':'POST','params': params})
 
 order_mgr = OrderManager()
 
@@ -169,53 +185,47 @@ class SignalArbiter:
 
     async def decide(self):
         async with self.lock:
-            score={'BUY':0.0,'SELL':0.0}
-            for s,(side,ts) in self.signals.items():
-                w=self.PRIOR.get(s,1)
-                decay=max(0.0,1-(time.time()-ts)/60)
-                score[side]+=w*decay
-            if abs(score['BUY']-score['SELL'])<1.0:
+            score = {'BUY':0.0,'SELL':0.0}
+            for strat, (side, ts) in self.signals.items():
+                w = self.PRIOR.get(strat, 1)
+                decay = max(0.0, 1 - (time.time() - ts) / 60)
+                score[side] += w * decay
+            if abs(score['BUY'] - score['SELL']) < 1.0:
                 return None
-            return 'BUY' if score['BUY']>score['SELL'] else 'SELL'
+            return 'BUY' if score['BUY'] > score['SELL'] else 'SELL'
 
 arbiter = SignalArbiter()
 
 # —— 动态参数 ——
 class DynamicParameters:
     def __init__(self):
-        self.base=[0.0025,0.0040,0.0060,0.0080,0.0160]
+        self.base = [0.0025, 0.0040, 0.0060, 0.0080, 0.0160]
     def update(self, atr):
-        vol=atr/50
-        return [x*vol for x in self.base]
+        vol = atr / 50
+        return [x * vol for x in self.base]
 
 dyn_params = DynamicParameters()
 
 # —— DataManager ——
 class DataManager:
     def __init__(self):
-        # 初始只包含 OHLC
-        self.klines={tf:pd.DataFrame(columns=['open','high','low','close'])
-                     for tf in ('3m','15m','1h')}
-        self.last_ts={tf:0 for tf in ('3m','15m','1h')}
-        self.lock=asyncio.Lock()
-        self.bb3=BollingerBands(close=pd.Series([0]*20),window=20,window_dev=2)  # 用于 3m
+        self.klines = {
+            tf: pd.DataFrame(columns=['open','high','low','close'])
+            for tf in ('3m','15m','1h')
+        }
+        self.last_ts = {tf: 0 for tf in ('3m','15m','1h')}
+        self.lock = asyncio.Lock()
 
     async def update_kline(self, tf, rec):
-        """按字典追加新行，避免列数不匹配"""
         async with self.lock:
             df = self.klines[tf]
-            new_row = {
-                'open': rec['o'],
-                'high': rec['h'],
-                'low':  rec['l'],
-                'close':rec['c']
-            }
-            # 新周期
+            new_row = {'open':rec['o'],'high':rec['h'],'low':rec['l'],'close':rec['c']}
+            # 如果是新周期或空 DataFrame，则直接 concat
             if df.empty or rec['t'] > self.last_ts[tf]:
                 df2 = pd.DataFrame([new_row])
                 self.klines[tf] = pd.concat([df, df2], ignore_index=True)
             else:
-                # 更新末行
+                # 否则更新最后一行
                 for k,v in new_row.items():
                     df.at[len(df)-1, k] = v
             self.last_ts[tf] = rec['t']
@@ -225,32 +235,31 @@ class DataManager:
         df = self.klines[tf]
         if len(df) < 20:
             return
-        # 根据不同周期计算指标
-        if tf=='3m':
-            # 用自定义 Bollinger
-            series = df['close']
-            sma = series.rolling(20).mean().iat[-1]
-            std = series.rolling(20).std().iat[-1]
+        # 3m 自定义布林带
+        if tf == '3m':
+            s = df['close']
+            sma = s.rolling(20).mean().iat[-1]
+            std = s.rolling(20).std().iat[-1]
             up = sma + 2*std
             dn = sma - 2*std
             df.at[len(df)-1,'bb_up'] = up
             df.at[len(df)-1,'bb_dn'] = dn
-            df['bb_pct'] = (df['close']-df['bb_dn'])/(df['bb_up']-df['bb_dn'])
+            df['bb_pct'] = (df['close'] - df['bb_dn'])/(df['bb_up']-df['bb_dn'])
         else:
             bb = BollingerBands(df['close'],20,2)
-            df['bb_up'] = bb.bollinger_hband()
-            df['bb_dn'] = bb.bollinger_lband()
-            df['bb_pct'] = (df['close']-df['bb_dn'])/(df['bb_up']-df['bb_dn'])
-        if tf=='15m':
-            hl2 = (df['high']+df['low'])/2
+            df['bb_up']  = bb.bollinger_hband()
+            df['bb_dn']  = bb.bollinger_lband()
+            df['bb_pct'] = (df['close'] - df['bb_dn'])/(df['bb_up']-df['bb_dn'])
+        if tf == '15m':
+            hl2 = (df['high'] + df['low'])/2
             atr = df['high'].rolling(10).max() - df['low'].rolling(10).min()
-            df['st'] = hl2 - 3*atr
+            df['st']   = hl2 - 3*atr
             df['macd'] = MACD(df['close'],12,26,9).macd_diff()
 
     async def get(self, tf, col):
         async with self.lock:
             df = self.klines[tf]
-            if col in df.columns and len(df)>0:
+            if col in df.columns and len(df) > 0:
                 return df[col].iat[-1]
         return None
 
@@ -260,18 +269,18 @@ data_mgr = DataManager()
 @jit(nopython=True)
 def numba_supertrend(high, low, close, period, mult):
     n = len(close)
-    st = [0.0]*n
+    st   = [0.0]*n
     dirc = [True]*n
-    hl2 = [(high[i]+low[i])/2 for i in range(n)]
-    atr = [max(high[i-period+1:i+1]) - min(low[i-period+1:i+1]) for i in range(n)]
-    up = [hl2[i] + mult*atr[i] for i in range(n)]
-    dn = [hl2[i] - mult*atr[i] for i in range(n)]
+    hl2  = [(high[i]+low[i])/2 for i in range(n)]
+    atr  = [max(high[i-period+1:i+1]) - min(low[i-period+1:i+1]) for i in range(n)]
+    up   = [hl2[i] + mult*atr[i] for i in range(n)]
+    dn   = [hl2[i] - mult*atr[i] for i in range(n)]
     st[0] = up[0]
     for i in range(1,n):
         if close[i] > st[i-1]:
-            st[i] = max(dn[i], st[i-1]); dirc[i]=True
+            st[i]   = max(dn[i], st[i-1]); dirc[i] = True
         else:
-            st[i] = min(up[i], st[i-1]);   dirc[i]=False
+            st[i]   = min(up[i], st[i-1]); dirc[i] = False
     return st, dirc
 
 # —— 市场数据 WS ——
@@ -293,7 +302,7 @@ async def market_ws():
                         latest_price, price_ts = float(d['p']), time.time()
                     if 'kline' in s:
                         tf = s.split('@')[1].split('_')[1]
-                        k = d['k']
+                        k  = d['k']
                         rec = {
                             't': k['t'],
                             'o': float(k['o']),
@@ -315,7 +324,7 @@ async def user_ws():
             async with websockets.connect(Config.WS_USER_URL) as ws:
                 logging.info("User WS connected")
                 params = {
-                    'apiKey': Config.ED25519_API,
+                    'apiKey':   Config.ED25519_API,
                     'timestamp': int(time.time()*1000 + time_offset)
                 }
                 payload = '&'.join(f"{k}={v}" for k,v in sorted(params.items()))
@@ -364,13 +373,13 @@ async def main_strategy():
         await asyncio.sleep(0.1)
     while True:
         await asyncio.sleep(0.5)
-        p = latest_price
+        p   = latest_price
         bb1 = await data_mgr.get('1h','bb_pct')
         bb3 = await data_mgr.get('3m','bb_pct')
         st  = await data_mgr.get('15m','st')
-        if None in (bb1,bb3,st):
+        if None in (bb1, bb3, st):
             continue
-        if bb3<=0 or bb3>=1:
+        if bb3 <= 0 or bb3 >= 1:
             side = 'BUY' if p>st else 'SELL'
             await arbiter.register('main', side)
             if await arbiter.decide() == side:
@@ -379,17 +388,17 @@ async def main_strategy():
                 qty    = 0.12 if (p>st and strong) else 0.03
                 if p<st:
                     qty = 0.07 if strong else 0.015
-                rev = 'SELL' if side=='BUY' else 'BUY'
-                # 逐级挂单
+                rev    = 'SELL' if side=='BUY' else 'BUY'
+                # 分级挂单
                 for off in levels:
                     price_off = p*(1+off if side=='BUY' else 1-off)
                     await order_mgr.place(side,'LIMIT',qty=qty,price=price_off)
-                # 止盈
+                # 止盈挂单
                 for off in tp_offs:
                     pt = p*(1+off if rev=='BUY' else 1-off)
                     await order_mgr.place(rev,'LIMIT',qty=qty*0.2,price=pt,reduceOnly=True)
-                # 止损/止盈市价单
-                slp = p*(0.98 if side=='BUY' else 1.02)
+                # 止损/止盈市价
+                slp   = p*(0.98 if side=='BUY' else 1.02)
                 ttype = 'STOP_MARKET' if side=='BUY' else 'TAKE_PROFIT_MARKET'
                 await order_mgr.place(rev, ttype, stopPrice=slp)
 
@@ -443,7 +452,7 @@ async def triple_st_strategy():
     while True:
         await asyncio.sleep(30)
         df = data_mgr.klines['15m']
-        if len(df)<12:
+        if len(df) < 12:
             continue
         high, low, close = df['high'].values, df['low'].values, df['close'].values
         s1, d1 = numba_supertrend(high,low,close,10,1)
