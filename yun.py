@@ -1,23 +1,10 @@
 #!/usr/bin/env python3
 # coding: utf-8
 
-import os
-import time
-import json
-import hmac
-import hashlib
-import asyncio
-import logging
-import uuid
-import urllib.parse
-import base64
+import os, time, json, hmac, hashlib, asyncio, logging, uuid, urllib.parse, base64
 from collections import defaultdict
 
-import uvloop
-import aiohttp
-import pandas as pd
-import websockets
-import watchfiles
+import uvloop, aiohttp, pandas as pd, websockets, watchfiles
 from dotenv import load_dotenv
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from ta.trend import MACD
@@ -43,10 +30,10 @@ class Config:
     WS_USER_URL      = 'wss://ws-fapi.binance.com/ws-fapi/v1'
     REST_BASE        = 'https://fapi.binance.com'
     RECV_WINDOW      = 5000
-    SYNC_INTERVAL    = 300   # 5分钟
-    MAX_POSITION     = 2.0   # 每策略最大持仓量上限
+    SYNC_INTERVAL    = 300   # seconds
+    MAX_POSITION     = 2.0   # per-strategy max
 
-# 全局状态
+# —— 全局状态 ——
 session: aiohttp.ClientSession
 time_offset = 0
 is_hedge_mode = False
@@ -57,16 +44,16 @@ price_ts = None
 with open(Config.ED25519_KEY_PATH, 'rb') as f:
     ed_priv = load_pem_private_key(f.read(), password=None)
 
-# —— 时间同步 & 持仓模式检测 ——
+# —— 时间同步 & 模式检测 ——
 async def sync_time():
     global time_offset
     js = await (await session.get(f"{Config.REST_BASE}/fapi/v1/time")).json()
-    time_offset = js['serverTime'] - int(time.time() * 1000)
+    time_offset = js['serverTime'] - int(time.time()*1000)
     logging.info("Time offset: %dms", time_offset)
 
 async def detect_mode():
     global is_hedge_mode
-    ts = int(time.time() * 1000 + time_offset)
+    ts = int(time.time()*1000 + time_offset)
     qs = urllib.parse.urlencode({'timestamp': ts, 'recvWindow': Config.RECV_WINDOW})
     sig = hmac.new(Config.SECRET_KEY, qs.encode(), hashlib.sha256).hexdigest()
     url = f"{Config.REST_BASE}/fapi/v1/positionSide/dual?{qs}&signature={sig}"
@@ -74,7 +61,7 @@ async def detect_mode():
     is_hedge_mode = res.get('dualSidePosition', False)
     logging.info("Hedge mode: %s", is_hedge_mode)
 
-# —— PositionTracker ——
+# —— 持仓追踪 ——
 class PositionTracker:
     def __init__(self):
         self.long = self.short = 0.0
@@ -82,20 +69,20 @@ class PositionTracker:
 
     async def sync(self):
         ts = int(time.time()*1000 + time_offset)
-        qs = urllib.parse.urlencode({'timestamp': ts,'recvWindow':Config.RECV_WINDOW})
+        qs = urllib.parse.urlencode({'timestamp': ts, 'recvWindow': Config.RECV_WINDOW})
         sig = hmac.new(Config.SECRET_KEY, qs.encode(), hashlib.sha256).hexdigest()
         url = f"{Config.REST_BASE}/fapi/v2/positionRisk?{qs}&signature={sig}"
         res = await (await session.get(url, headers={'X-MBX-APIKEY':Config.API_KEY})).json()
         async with self.lock:
-            for pos in res:
-                if pos['symbol']==Config.SYMBOL:
-                    amt = abs(float(pos['positionAmt']))
-                    if pos['positionSide']=='LONG':
+            for p in res:
+                if p['symbol']==Config.SYMBOL:
+                    amt = abs(float(p['positionAmt']))
+                    if p.get('positionSide','BOTH')=='LONG':
                         self.long = amt
                     else:
                         self.short = amt
 
-    async def get_available(self, side:str)->float:
+    async def get_available(self, side:str) -> float:
         async with self.lock:
             if side=='BUY':
                 return max(0.0, Config.MAX_POSITION - (self.long - self.short))
@@ -103,7 +90,7 @@ class PositionTracker:
 
 pos_tracker = PositionTracker()
 
-# —— RateLimiter（令牌桶） ——
+# —— 令牌桶限流 ——
 class RateLimiter:
     def __init__(self, rate, per):
         self._tokens = rate
@@ -119,204 +106,229 @@ class RateLimiter:
             await asyncio.sleep((1-self._tokens)*(self._per/self._rate))
         self._tokens -= 1
 
-batch_rate = RateLimiter(rate=1, per=1)  # 每秒最多 1 次批量下单
+batch_rate = RateLimiter(rate=1, per=1)
 
-# —— BatchOrderManager ——
+# —— 批量下单管理 ——
 class BatchOrderManager:
-    BATCH_SIZE = 1   # 一条订单即刻下单
     def __init__(self):
         self.batch = []
         self.lock = asyncio.Lock()
-
     async def add(self, order):
         async with self.lock:
             self.batch.append(order)
             await self.flush()
-
     async def flush(self):
         async with self.lock:
-            if not self.batch:
-                return
+            if not self.batch: return
             await batch_rate.acquire()
             payload = {'batchOrders': json.dumps(self.batch)}
             try:
-                resp = await session.post(
+                r = await session.post(
                     f"{Config.REST_BASE}/fapi/v1/batchOrders",
                     headers={'X-MBX-APIKEY':Config.API_KEY},
                     data=payload
                 )
-                resp.raise_for_status()
+                r.raise_for_status()
                 logging.info("Batch flush success: %s", self.batch)
                 self.batch.clear()
             except Exception as e:
-                logging.error("Batch flush failed: %s, batch=%s", e, self.batch)
-                # TODO: 持久化 self.batch 或 报警
+                logging.error("Batch flush failed: %s batch=%s", e, self.batch)
 
 batch_mgr = BatchOrderManager()
 
-# —— OrderManager ——
+# —— 基础下单管理 ——
 class OrderManager:
-    def __init__(self):
-        pass
-
-    def _sign(self, params: dict) -> str:
+    def _sign(self, params):
         qs = urllib.parse.urlencode(sorted(params.items()))
         return hmac.new(Config.SECRET_KEY, qs.encode(), hashlib.sha256).hexdigest()
 
-    def _build_order(self, side, otype, qty=None, price=None, stopPrice=None, reduceOnly=False):
+    def _build(self, side, otype, qty=None, price=None, stop=None, reduceOnly=False):
         ts = int(time.time()*1000 + time_offset)
-        base = {
-            "symbol":Config.SYMBOL,
-            "side":side, "type":otype,
-            "recvWindow":Config.RECV_WINDOW,
-            "timestamp":ts
+        p = {
+            "symbol": Config.SYMBOL,
+            "side": side,
+            "type": otype,
+            "recvWindow": Config.RECV_WINDOW,
+            "timestamp": ts
         }
         if is_hedge_mode and otype in ("LIMIT","MARKET"):
-            base["positionSide"] = "LONG" if side=="BUY" else "SHORT"
+            p["positionSide"] = "LONG" if side=="BUY" else "SHORT"
         if otype=="LIMIT":
-            base.update({
-                "timeInForce":"GTC",
-                "quantity":f"{qty:.6f}",
-                "price":   f"{price:.2f}"
-            })
+            p.update({"timeInForce":"GTC",
+                      "quantity":f"{qty:.6f}","price":f"{price:.2f}"})
         elif otype in ("STOP_MARKET","TAKE_PROFIT_MARKET"):
-            base.update({
-                "closePosition":"true",
-                "stopPrice":    f"{stopPrice:.2f}"
-            })
+            p.update({"closePosition":"true","stopPrice":f"{stop:.2f}"})
         else:
-            base["quantity"] = f"{qty:.6f}"
+            p["quantity"] = f"{qty:.6f}"
         if reduceOnly:
-            base["reduceOnly"] = "true"
-        base["signature"] = self._sign(base)
-        return base
+            p["reduceOnly"] = "true"
+        p["signature"] = self._sign(p)
+        return p
 
-    async def place(self, side, otype, qty=None, price=None, stopPrice=None, reduceOnly=False):
+    async def place(self, side, otype, qty=None, price=None, stop=None, reduceOnly=False):
         avail = await pos_tracker.get_available(side)
-        if qty and qty>avail:
-            logging.warning("仓位不足: 需 %.6f, 可用 %.6f", qty, avail)
+        if qty and qty > avail:
+            logging.warning("Insufficient free position: need %.6f, avail %.6f", qty, avail)
             return
-        order = self._build_order(side, otype, qty, price, stopPrice, reduceOnly)
-        logging.info("Enqueue order: %s", order)
-        await batch_mgr.add(order)
+        o = self._build(side, otype, qty, price, stop, reduceOnly)
+        logging.info("Enqueue order: %s", o)
+        await batch_mgr.add(o)
 
 order_mgr = OrderManager()
 
-# —— OrderGuard & EnhancedOrderManager ——
+# —— 订单防护 ——
 class OrderGuard:
     def __init__(self):
-        self.strategy_states = defaultdict(dict)
-        self.position_tracking = defaultdict(lambda: {'long':0.0,'short':0.0})
-        self.lock = asyncio.Lock()
+        self.states = defaultdict(lambda: {'last_dir':None,'last_ts':0,'waiting_cross':False})
+        self.pos    = defaultdict(lambda:{'long':0.0,'short':0.0})
+        self.lock   = asyncio.Lock()
 
-    async def check_strategy_state(self, strategy: str, direction: str) -> bool:
+    def _cooldown(self, strat):
+        return {"main":60,"macd":30,"rvgi":10,"triple":300}.get(strat,0)
+
+    async def check(self, strat, direction):
         async with self.lock:
-            state = self.strategy_states.get(strategy, {})
+            s = self.states[strat]
             now = time.time()
-            # 主策略：同方向冷却60s
-            if strategy=="main":
-                if direction==state.get('last_direction'): return False
-                if now-state.get('last_ts',0)<60:              return False
+            if now - s['last_ts'] < self._cooldown(strat):
+                return False
+            if strat=="main" and direction==s['last_dir']:
+                return False
+            if strat=="macd" and s['waiting_cross']:
+                return False
+            if strat=="triple":
+                st = await self.get_triple_status()
+                if direction=="BUY" and not st['up']: return False
+                if direction=="SELL" and not st['down']: return False
             return True
 
-    async def check_position_limit(self, strategy: str, direction: str, qty: float) -> bool:
-        limits = {"main":1.0,"macd":0.3,"rvgi":0.3,"triple":0.3}
+    async def limit(self, strat, direction, qty):
+        limits={"main":2.0,"macd":0.2,"rvgi":0.2,"triple":0.3}
         async with self.lock:
-            pos = self.position_tracking[strategy]
+            p = self.pos[strat]
             if direction=="BUY":
-                return pos['long']+qty<=limits[strategy]
-            return pos['short']+qty<=limits[strategy]
+                return p['long']+qty<=limits[strat]
+            return p['short']+qty<=limits[strat]
 
-    async def update_position(self, strategy: str, direction: str, qty: float):
+    async def update(self, strat, direction, qty):
         async with self.lock:
-            if direction=="BUY":
-                self.position_tracking[strategy]['long'] += qty
-            else:
-                self.position_tracking[strategy]['short'] += qty
+            p = self.pos[strat]
+            if direction=="BUY": p['long']+=qty
+            else:                p['short']+=qty
 
-    async def update_strategy_state(self, strategy: str, direction: str):
+    async def stamp(self, strat, direction):
         async with self.lock:
-            self.strategy_states[strategy] = {
-                'last_ts': time.time(),
-                'last_direction': direction
-            }
+            self.states[strat].update({
+                'last_ts':time.time(),
+                'last_dir':direction,
+                'waiting_cross': strat in ("macd",)
+            })
+
+    @jit(nopython=True)
+    def _st_dirs(self, high, low, close):
+        n=len(close)
+        d1=[True]*n; d2=[True]*n; d3=[True]*n
+        # reuse numba_supertrend logic externally
+        return d1, d2, d3  # placeholder
+
+    async def get_triple_status(self):
+        df = data_mgr.klines["15m"]
+        if len(df)<12: return {'up':False,'down':False}
+        h,l,c = df["high"].values, df["low"].values, df["close"].values
+        _,d1 = numba_supertrend(h,l,c,10,1)
+        _,d2 = numba_supertrend(h,l,c,11,2)
+        _,d3 = numba_supertrend(h,l,c,12,3)
+        up = d1[-1] and d2[-1] and d3[-1]
+        dn = not (d1[-1] or d2[-1] or d3[-1])
+        return {'up':up,'down':dn}
+
+order_guard = OrderGuard()
 
 class EnhancedOrderManager(OrderManager):
     def __init__(self, guard: OrderGuard):
-        super().__init__()
-        self.guard = guard
+        super().__init__(); self.guard = guard
 
-    async def safe_place(self, strategy: str, side: str, otype: str,
-                         qty=None, price=None, stopPrice=None, reduceOnly=False):
-        if not await self.guard.check_strategy_state(strategy, side):
-            logging.warning("策略 %s: 状态冲突，中止下单", strategy)
-            return
-        if qty and not await self.guard.check_position_limit(strategy, side, qty):
-            logging.warning("策略 %s: 仓位超限，中止下单", strategy)
-            return
-        await super().place(side, otype, qty, price, stopPrice, reduceOnly)
-        await self.guard.update_position(strategy, side, qty or 0)
-        await self.guard.update_strategy_state(strategy, side)
+    async def safe_place(self, strat, side, otype, qty=None, price=None, stop=None, reduceOnly=False):
+        if not await self.guard.check(strat, side): return
+        if qty and not await self.guard.limit(strat, side, qty): return
+        if strat=="rvgi" and not await self._rvgi_ma(side): return
+        await super().place(side, otype, qty, price, stop, reduceOnly)
+        await self.guard.update(strat, side, qty or 0)
+        await self.guard.stamp(strat, side)
 
-order_guard = OrderGuard()
+    async def _rvgi_ma(self, side):
+        df = data_mgr.klines["15m"]
+        if len(df)<100: return False
+        ma7  = df["close"].rolling(7).mean().iat[-1]
+        ma25 = df["close"].rolling(25).mean().iat[-1]
+        ma99 = df["close"].rolling(99).mean().iat[-1]
+        if side=="SELL": return latest_price>ma7>ma25>ma99
+        else:            return latest_price<ma7<ma25<ma99
+
 mgr = EnhancedOrderManager(order_guard)
 
-# —— DataManager ——
+# —— 数据管理 ——
 class DataManager:
     def __init__(self):
-        self.klines = {
-            tf: pd.DataFrame(columns=["open","high","low","close"])
-            for tf in ("3m","15m","1h")
-        }
+        self.klines  = {tf:pd.DataFrame(columns=["open","high","low","close"])
+                        for tf in ("3m","15m","1h")}
         self.last_ts = {tf:0 for tf in ("3m","15m","1h")}
-        self.lock = asyncio.Lock()
+        self.lock    = asyncio.Lock()
+        self._evt    = asyncio.Event()
+        self.realtime= {'price':None,'ts':0,'lock':asyncio.Lock()}
 
     async def update_kline(self, tf, rec):
         async with self.lock:
             df = self.klines[tf]
-            new = [rec["o"], rec["h"], rec["l"], rec["c"]]
+            row = {"open":rec["o"],"high":rec["h"],"low":rec["l"],"close":rec["c"]}
             if df.empty or rec["t"]>self.last_ts[tf]:
-                # 新行直接 loc
-                df.loc[len(df)] = new
+                df.loc[len(df)] = row
             else:
-                df.iloc[-1] = new
-            self.last_ts[tf] = rec["t"]
+                df.iloc[-1] = list(row.values())
+            self.last_ts[tf]=rec["t"]
             self._update(tf)
+            self._evt.set()
 
     def _update(self, tf):
-        df = self.klines[tf]
+        df=self.klines[tf]
         if len(df)<20: return
-        m = df["close"].rolling(20).mean()
-        s = df["close"].rolling(20).std()
-        df["bb_up"]  = m + 2*s
-        df["bb_dn"]  = m - 2*s
-        df["bb_pct"] = (df["close"] - df["bb_dn"]) / (df["bb_up"] - df["bb_dn"])
+        m=df["close"].rolling(20).mean(); s=df["close"].rolling(20).std()
+        df["bb_up"]=m+2*s; df["bb_dn"]=m-2*s
+        df["bb_pct"]=(df["close"]-df["bb_dn"])/(df["bb_up"]-df["bb_dn"])
         if tf=="15m":
-            hl2 = (df["high"] + df["low"])/2
-            atr = df["high"].rolling(10).max() - df["low"].rolling(10).min()
-            df["st"]   = hl2 - 3*atr
-            df["macd"] = MACD(df["close"],12,26,9).macd_diff()
-            df["rvgi"] = ROCIndicator(close=df["close"]-df["open"], window=10).roc()
-            df["rvsig"]= df["rvgi"].rolling(4).mean()
+            hl2=(df["high"]+df["low"])/2
+            atr=df["high"].rolling(10).max()-df["low"].rolling(10).min()
+            df["st"]=hl2-3*atr
+            df["macd"]=MACD(df["close"],12,26,9).macd_diff()
+            df["rvgi"]=ROCIndicator(close=(df["close"]-df["open"]),window=10).roc()
+            df["rvsig"]=df["rvgi"].rolling(4).mean()
 
     async def get(self, tf, col):
         async with self.lock:
-            df = self.klines[tf]
+            df=self.klines[tf]
             if col in df.columns and not df.empty:
                 return df[col].iat[-1]
         return None
 
+    async def wait_update(self):
+        await self._evt.wait()
+        self._evt.clear()
+
+    async def track_price(self, price, ts):
+        async with self.realtime['lock']:
+            self.realtime['price']=price
+            self.realtime['ts']=ts
+
 data_mgr = DataManager()
 
-# —— Numba SuperTrend ——
 @jit(nopython=True)
 def numba_supertrend(high, low, close, period, mult):
     n=len(close)
     st=[0.0]*n; dirc=[True]*n
     hl2=[(high[i]+low[i])/2 for i in range(n)]
     atr=[max(high[i-period+1:i+1]) - min(low[i-period+1:i+1]) for i in range(n)]
-    up=[hl2[i] + mult*atr[i] for i in range(n)]
-    dn=[hl2[i] - mult*atr[i] for i in range(n)]
+    up=[hl2[i]+mult*atr[i] for i in range(n)]
+    dn=[hl2[i]-mult*atr[i] for i in range(n)]
     st[0]=up[0]
     for i in range(1,n):
         if close[i]>st[i-1]:
@@ -332,23 +344,23 @@ async def market_ws():
     while True:
         try:
             async with websockets.connect(Config.WS_MARKET_URL,
-                                          ping_interval=15, ping_timeout=10, close_timeout=5) as ws:
+                                          ping_interval=15, ping_timeout=10) as ws:
                 logging.info("Market WS connected")
                 retry=0
                 async for msg in ws:
                     o=json.loads(msg); s,d=o["stream"],o["data"]
                     if s.endswith("@markPrice"):
                         latest_price, price_ts = float(d["p"]), time.time()
+                        await data_mgr.track_price(latest_price, price_ts)
                     if "kline" in s:
-                        tf=s.split("@")[1].split("_")[1]
-                        k=d["k"]
+                        tf=s.split("@")[1].split("_")[1]; k=d["k"]
                         rec={"t":k["t"],"o":float(k["o"]),
                              "h":float(k["h"]),"l":float(k["l"]),
                              "c":float(k["c"])}
                         await data_mgr.update_kline(tf, rec)
         except Exception as e:
             delay=min(2**retry,30)
-            logging.error("Market WS err %s, retry in %ds", e, delay)
+            logging.error("Market WS err %s, retry %ds", e, delay)
             await asyncio.sleep(delay); retry+=1
 
 # —— WebSocket: 用户流 ——
@@ -360,7 +372,7 @@ async def user_ws():
                 params={"apiKey":Config.ED25519_API,
                         "timestamp":int(time.time()*1000+time_offset)}
                 payload="&".join(f"{k}={v}" for k,v in sorted(params.items()))
-                sig=base64.b64encode(ed_priv.sign(payload.encode())).decode()
+                sig = base64.b64encode(ed_priv.sign(payload.encode())).decode()
                 params["signature"]=sig
                 await ws.send(json.dumps({
                     "id":str(uuid.uuid4()),
@@ -394,99 +406,136 @@ async def maintenance():
         await sync_time(); await detect_mode()
         await pos_tracker.sync(); await batch_mgr.flush()
 
+# —— 事件驱动策略引擎 ——
+class StrategyEngine:
+    def __init__(self):
+        self.strategies = []
+    def register(self, strat):
+        self.strategies.append(strat)
+    async def run(self):
+        while True:
+            await data_mgr.wait_update()
+            price = await self._price()
+            for strat in self.strategies:
+                await strat.check_signal(price)
+    async def _price(self):
+        async with data_mgr.realtime['lock']:
+            return data_mgr.realtime['price']
+
+engine = StrategyEngine()
+
 # —— 主策略 ——
-async def main_strategy():
-    tp_offs=[0.0102,0.0123,0.0150,0.0180,0.0220]
-    while price_ts is None: await asyncio.sleep(0.1)
-    while True:
-        await asyncio.sleep(0.5)
-        p   = latest_price
-        bb1 = await data_mgr.get("1h","bb_pct")
+class MainStrategy:
+    def __init__(self):
+        self.last = 0
+        self.dyn = DynamicParameters()
+    async def check_signal(self, price):
+        if time.time()-self.last<1: return
         bb3 = await data_mgr.get("3m","bb_pct")
         st  = await data_mgr.get("15m","st")
-        if None in (bb1,bb3,st): continue
+        if bb3 is None or st is None: return
         if bb3<=0 or bb3>=1:
-            side="BUY" if p>st else "SELL"
-            # 主策略方向登记（不立即下市价单）
-            await mgr.safe_place("main", side, "MARKET", 0.000001)  # 触发方向，仅记录
-            strong=(p>st and bb1<0.2) or (p<st and bb1>0.8)
-            levels=dyn_params.update(st)
-            qty=0.12 if (p>st and strong) else 0.03
-            if p<st: qty=0.07 if strong else 0.015
+            await self.process(price, st, bb3)
+            self.last=time.time()
+    async def process(self, price, st, bb3):
+        await self.dyn.update_parameters()
+        side = "BUY" if price>st else "SELL"
+        strength = abs(bb3-0.5)*2
+        base_qty=0.1*strength
+        qty = min(base_qty*self.dyn.volatility, Config.MAX_POSITION*0.3)
+        for lvl in self.dyn.get_order_levels():
+            pr=price*(1+lvl if side=="BUY" else 1-lvl)
+            await mgr.safe_place("main", side, "LIMIT", qty, pr)
+        for tp in self.dyn.get_tp_levels():
+            pr=price*(1+tp if side=="BUY" else 1-tp)
             rev="SELL" if side=="BUY" else "BUY"
-            # 分级限价挂单
-            for off in levels:
-                price_off=p*(1+off if side=="BUY" else 1-off)
-                await mgr.safe_place("main", side, "LIMIT", qty, price_off)
-            # 止盈限价挂单
-            for off in tp_offs:
-                pt=p*(1+off if rev=="BUY" else 1-off)
-                await mgr.safe_place("main", rev, "LIMIT", qty*0.2, pt, reduceOnly=True)
-            # 止损/止盈市价单
-            slp=p*(0.98 if side=="BUY" else 1.02)
-            ttype="STOP_MARKET" if side=="BUY" else "TAKE_PROFIT_MARKET"
-            await mgr.safe_place("main", rev, ttype, None, None, slp)
+            await mgr.safe_place("main", rev, "LIMIT", qty*0.2, pr, reduceOnly=True)
+        slp=price*(0.98 if side=="BUY" else 1.02)*self.dyn.volatility
+        ot="STOP_MARKET" if side=="BUY" else "TAKE_PROFIT_MARKET"
+        await mgr.safe_place("main", rev, ot, stop=slp)
 
-# —— 子策略：MACD ——
-macd_cycle=None
-async def macd_strategy():
-    global macd_cycle
-    while True:
-        await asyncio.sleep(15)
+# —— MACD 策略 ——
+class MACDStrategy:
+    def __init__(self): self.cycle=None
+    async def check_signal(self, price):
         df=data_mgr.klines["15m"]
-        if len(df)<27 or "macd" not in df: continue
-        prev,cur=df["macd"].iat[-2],df["macd"].iat[-1]; osc=abs(cur)
-        if prev>0 and cur<prev and osc>=11 and macd_cycle!="DOWN":
-            macd_cycle="DOWN"
-            await mgr.safe_place("macd","SELL","MARKET",0.017)
-        if prev<0 and cur>prev and osc>=11 and macd_cycle!="UP":
-            macd_cycle="UP"
-            await mgr.safe_place("macd","BUY","MARKET",0.017)
+        if len(df)<30 or "macd" not in df: return
+        last3=df["macd"].iat[-3:]
+        # 三连跌且穿零轴
+        if (last3[0]>last3[1]>last3[2]<0):
+            await self.enter("SELL")
+        if last3[0]<last3[1]<last3[2]>0:
+            await self.enter("BUY")
+    async def enter(self, side):
+        steps=[0.3,0.5,0.2]
+        for s in steps:
+            await mgr.safe_place("macd", side, "MARKET", 0.15*s)
+            await asyncio.sleep(0.5)
 
-# —— 子策略：RVGI ——
-rvgi_cycle=None
-async def rvgi_strategy():
-    global rvgi_cycle
-    while True:
-        await asyncio.sleep(10)
+# —— RVGI 策略 ——
+class RVGIStrategy:
+    def __init__(self): self.cycle=None
+    async def check_signal(self, price):
         df=data_mgr.klines["15m"]
-        if len(df)<11 or not {"rvgi","rvsig"}.issubset(df.columns): continue
+        if len(df)<11 or not {"rvgi","rvsig"}.issubset(df.columns): return
         rv,sg=df["rvgi"].iat[-1],df["rvsig"].iat[-1]
-        if rv>sg and rvgi_cycle!="UP":
-            rvgi_cycle="UP"
-            await mgr.safe_place("rvgi","BUY","MARKET",0.016)
-            await mgr.safe_place("rvgi","SELL","LIMIT",0.016,latest_price*1.06)
-            await mgr.safe_place("rvgi","STOP_MARKET",None,None,latest_price*0.98)
-        if rv<sg and rvgi_cycle!="DOWN":
-            rvgi_cycle="DOWN"
-            await mgr.safe_place("rvgi","SELL","MARKET",0.016)
-            await mgr.safe_place("rvgi","BUY","LIMIT",0.016,latest_price*0.94)
-            await mgr.safe_place("rvgi","TAKE_PROFIT_MARKET",None,None,latest_price*1.02)
+        ma7=df["close"].rolling(7).mean().iat[-1]
+        ma25=df["close"].rolling(25).mean().iat[-1]
+        ma99=df["close"].rolling(99).mean().iat[-1]
+        if rv>sg and price>ma7>ma25>ma99:
+            await mgr.safe_place("rvgi","BUY","MARKET",0.05)
+        if rv<sg and price<ma7<ma25<ma99:
+            await mgr.safe_place("rvgi","SELL","MARKET",0.05)
 
-# —— 子策略：三重 SuperTrend ——
-triple_cycle=None
-async def triple_st_strategy():
-    global triple_cycle
-    while True:
-        await asyncio.sleep(30)
+# —— 三重 SuperTrend 策略 ——
+class TripleTrendStrategy:
+    def __init__(self): self.state=None
+    async def check_signal(self, price):
+        await order_guard.check("triple","")  # 触发平仓
         df=data_mgr.klines["15m"]
-        if len(df)<12: continue
-        high,low,close=df["high"].values,df["low"].values,df["close"].values
-        s1,d1=numba_supertrend(high,low,close,10,1)
-        s2,d2=numba_supertrend(high,low,close,11,2)
-        s3,d3=numba_supertrend(high,low,close,12,3)
-        up = d1[-1] and d2[-1] and d3[-1]
-        dn = not(up or d2[-1] or d3[-1])
-        if up and triple_cycle!="UP":
-            triple_cycle="UP";   await mgr.safe_place("triple","BUY","MARKET",0.015)
-        if dn and triple_cycle!="DOWN":
-            triple_cycle="DOWN"; await mgr.safe_place("triple","SELL","MARKET",0.015)
-        if triple_cycle=="UP"   and not up:
-            await mgr.safe_place("triple","SELL","MARKET",0.015)
-        if triple_cycle=="DOWN" and not dn:
-            await mgr.safe_place("triple","BUY","MARKET",0.015)
+        if len(df)<12: return
+        h,l,c=df["high"].values,df["low"].values,df["close"].values
+        _,d1=numba_supertrend(h,l,c,10,1)
+        _,d2=numba_supertrend(h,l,c,11,2)
+        _,d3=numba_supertrend(h,l,c,12,3)
+        up=d1[-1] and d2[-1] and d3[-1]
+        dn=not(up or d2[-1] or d3[-1])
+        if up and self.state!="UP":
+            self.state="UP"; await mgr.safe_place("triple","BUY","MARKET",0.15)
+        if dn and self.state!="DOWN":
+            self.state="DOWN"; await mgr.safe_place("triple","SELL","MARKET",0.15)
+        if self.state=="UP" and not up:
+            await mgr.safe_place("triple","SELL","MARKET",0.15)
+        if self.state=="DOWN" and not dn:
+            await mgr.safe_place("triple","BUY","MARKET",0.15)
 
-# —— 启动 ——
+# —— 动态参数 ——
+class DynamicParameters:
+    def __init__(self):
+        self.base_levels=[0.0025,0.0040,0.0060,0.0080,0.0160]
+        self.volatility=1.0; self.last=0
+    async def update_parameters(self):
+        if time.time()-self.last<60: return
+        df=data_mgr.klines["15m"]
+        if len(df)<14: return
+        atr=(df["high"].rolling(14).max()-df["low"].rolling(14).min()).iat[-1]
+        self.volatility=max(min(atr/latest_price if latest_price else 1,2.0),0.5)
+        self.last=time.time()
+    def get_order_levels(self):
+        return [l*self.volatility for l in self.base_levels]
+    def get_tp_levels(self):
+        return [0.0102*self.volatility,
+                0.0123*self.volatility,
+                0.0150*self.volatility*1.2,
+                0.0180*self.volatility*1.5,
+                0.0220*self.volatility*2]
+
+# —— 注册策略 & 启动 ——
+engine.register(MainStrategy())
+engine.register(MACDStrategy())
+engine.register(RVGIStrategy())
+engine.register(TripleTrendStrategy())
+
 async def main():
     global session
     session = aiohttp.ClientSession()
@@ -496,10 +545,7 @@ async def main():
             market_ws(),
             user_ws(),
             maintenance(),
-            main_strategy(),
-            macd_strategy(),
-            rvgi_strategy(),
-            triple_st_strategy()
+            engine.run()
         )
     finally:
         await session.close()
