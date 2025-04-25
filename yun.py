@@ -3,6 +3,7 @@
 
 import os, time, json, hmac, hashlib, asyncio, logging, uuid, urllib.parse, base64
 from collections import defaultdict
+from logging.handlers import RotatingFileHandler
 
 import uvloop, aiohttp, pandas as pd, numpy as np, websockets, watchfiles
 from dotenv import load_dotenv
@@ -11,13 +12,26 @@ from ta.trend import MACD
 from ta.momentum import ROCIndicator
 from numba import jit
 
-# —— 高性能事件循环 & 日志 ——
+# —— 高性能事件循环 ——
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
+# —— 环境变量 ——
 load_dotenv('/root/zhibai/.env')
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s [%(levelname)s] %(message)s'
-)
+
+# —— 日志配置：STDOUT + 文件轮转 ——
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)
+fmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+
+# 控制台
+ch = logging.StreamHandler()
+ch.setFormatter(fmt)
+logger.addHandler(ch)
+
+# 文件，保留最近1000条日志，每次到10MB轮转一次
+fh = RotatingFileHandler('/root/zhibai/yun.log', maxBytes=10*1024*1024, backupCount=1)
+fh.setFormatter(fmt)
+logger.addHandler(fh)
 
 class Config:
     SYMBOL           = 'ETHUSDC'
@@ -30,11 +44,11 @@ class Config:
         'wss://fstream.binance.com/stream?streams='
         f'{PAIR}@kline_3m/{PAIR}@kline_15m/{PAIR}@kline_1h/{PAIR}@markPrice'
     )
-    WS_USER_URL      = 'wss://ws-fapi.binance.com/ws-fapi/v1'
-    REST_BASE        = 'https://fapi.binance.com'
-    RECV_WINDOW      = 5000
-    SYNC_INTERVAL    = 300   # seconds
-    MAX_POSITION     = 2.0
+    WS_USER_URL   = 'wss://ws-fapi.binance.com/ws-fapi/v1'
+    REST_BASE     = 'https://fapi.binance.com'
+    RECV_WINDOW   = 5000
+    SYNC_INTERVAL = 300
+    MAX_POSITION  = 2.0
 
 # —— 全局状态 ——
 session: aiohttp.ClientSession
@@ -68,7 +82,6 @@ class DataManager:
             self.last_ts[tf] = rec["t"]
             self._compute(tf)
             logging.debug(f"Kline updated {tf} at {rec['t']}")
-            # 唤醒策略
             self._evt.set()
 
     def _compute(self, tf):
@@ -102,7 +115,6 @@ class DataManager:
         async with self.realtime['lock']:
             self.realtime['price'], self.realtime['ts'] = price, ts
         logging.debug(f"Price update: {price} at {ts}")
-        # 价格更新也唤醒策略
         self._evt.set()
 
 data_mgr = DataManager()
@@ -181,7 +193,8 @@ class RateLimiter:
         self._tokens=rate; self._rate=rate; self._per=per; self._last=time.time()
     async def acquire(self):
         now=time.time()
-        self._tokens=min(self._rate, self._tokens+(now-self._last)*(self._rate/self._per))
+        self._tokens=min(self._rate,
+            self._tokens+(now-self._last)*(self._rate/self._per))
         self._last=now
         if self._tokens<1:
             await asyncio.sleep((1-self._tokens)*(self._per/self._rate))
@@ -297,7 +310,6 @@ class EnhancedOrderManager(OrderManager):
         logging.debug(f"{strat}→{side} {otype} qty={qty} price={price} stop={stop}")
         if not await self.guard.check(strat,side): return
         if qty and not await self.guard.limit(strat,side,qty): return
-        # RVGI 专属 MA 过滤
         if strat=="rvgi":
             df=data_mgr.klines["15m"]
             if len(df)>=100:
@@ -348,7 +360,7 @@ class DynamicParameters:
                 0.0150*self.vol*1.2,0.0180*self.vol*1.5,
                 0.0220*self.vol*2.0]
 
-# —— 各策略 ——
+# —— MainStrategy ——
 class MainStrategy:
     def __init__(self):
         self.last=0; self.dyn=DynamicParameters()
@@ -376,6 +388,7 @@ class MainStrategy:
         ot = "STOP_MARKET" if side=="BUY" else "TAKE_PROFIT_MARKET"
         await mgr.safe_place("main",rev,ot,stop=slp)
 
+# —— MACDStrategy ——
 class MACDStrategy:
     def __init__(self): self._cd=0
     async def check_signal(self,price):
@@ -395,6 +408,7 @@ class MACDStrategy:
             await asyncio.sleep(0.5)
         self._cd=time.time()
 
+# —— RVGIStrategy ——
 class RVGIStrategy:
     def __init__(self): self._cd=0
     async def check_signal(self,price):
@@ -414,10 +428,11 @@ class RVGIStrategy:
             await mgr.safe_place("rvgi","SELL","MARKET",0.05)
             self._cd=time.time()
 
+# —— TripleTrendStrategy ——
 class TripleTrendStrategy:
     def __init__(self): self.state=None
     async def check_signal(self,price):
-        await order_guard.check("triple","")  # 内部平仓
+        await order_guard.check("triple","")
         df=data_mgr.klines["15m"]
         if len(df)<12: return
         h,l,c = df["high"].values, df["low"].values, df["close"].values
@@ -452,7 +467,7 @@ async def market_ws():
     while True:
         try:
             async with websockets.connect(Config.WS_MARKET_URL,
-                                          ping_interval=15, ping_timeout=10) as ws:
+                                          ping_interval=15,ping_timeout=10) as ws:
                 logging.info("Market WS connected")
                 retry=0
                 async for msg in ws:
@@ -463,8 +478,9 @@ async def market_ws():
                     elif "@kline_" in s:
                         tf=s.split("@")[1].split("_")[1]
                         k=d["k"]
-                        rec={"t":k["t"],"o":float(k["o"]),"h":float(k["h"]),
-                             "l":float(k["l"]),"c":float(k["c"])}
+                        rec={"t":k["t"],"o":float(k["o"]),
+                             "h":float(k["h"]),"l":float(k["l"]),
+                             "c":float(k["c"])}
                         await data_mgr.update_kline(tf, rec)
         except Exception as e:
             delay=min(2**retry,30)
