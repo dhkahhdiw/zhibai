@@ -321,7 +321,7 @@ class OrderGuard:
             return True
 
     async def limit(self, s, side, qty):
-        lim={"main":0.6,"macd":0.2,"rvgi":0.2,"triple":0.3}[s]
+        lim={"main":0.3,"macd":0.2,"rvgi":0.2,"triple":0.2}[s]
         async with self.lock:
             p = self.pos[s]
             return (p['long']+qty<=lim) if side=="BUY" else (p['short']+qty<=lim)
@@ -463,7 +463,7 @@ class MACDStrategy:
             await self._enter("SELL")
     async def _enter(self, side):
         for p in (0.3,0.5,0.2):
-            await mgr.safe_place("macd", side, "MARKET", 0.15*p)
+            await mgr.safe_place("macd", side, "MARKET", 0.017*p)
             await asyncio.sleep(0.5)
         self._cd = time.time()
 
@@ -480,10 +480,10 @@ class RVGIStrategy:
             df["close"].rolling(99).mean().iat[-1]
         )
         if rv>sg and price>ma7>ma25>ma99:
-            await mgr.safe_place("rvgi","BUY","MARKET",0.05)
+            await mgr.safe_place("rvgi","BUY","MARKET",0.016)
             self._cd=time.time()
         elif rv<sg and price<ma7<ma25<ma99:
-            await mgr.safe_place("rvgi","SELL","MARKET",0.05)
+            await mgr.safe_place("rvgi","SELL","MARKET",0.016)
             self._cd=time.time()
 
 class TripleTrendStrategy:
@@ -498,13 +498,13 @@ class TripleTrendStrategy:
         up = d1[-1] and d2[-1] and d3[-1]
         dn = not (d1[-1] or d2[-1] or d3[-1])
         if up and self.state!="UP":
-            self.state="UP"; await mgr.safe_place("triple","BUY","MARKET",0.15)
+            self.state="UP"; await mgr.safe_place("triple","BUY","MARKET",0.015)
         if dn and self.state!="DOWN":
-            self.state="DOWN"; await mgr.safe_place("triple","SELL","MARKET",0.15)
+            self.state="DOWN"; await mgr.safe_place("triple","SELL","MARKET",0.015)
         if self.state=="UP" and not up:
-            await mgr.safe_place("triple","SELL","MARKET",0.15)
+            await mgr.safe_place("triple","SELL","MARKET",0.015)
         if self.state=="DOWN" and not dn:
-            await mgr.safe_place("triple","BUY","MARKET",0.15)
+            await mgr.safe_place("triple","BUY","MARKET",0.015)
 
 engine.register(MainStrategy())
 engine.register(MACDStrategy())
