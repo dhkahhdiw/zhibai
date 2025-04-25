@@ -84,7 +84,7 @@ with open(Config.ED25519_KEY_PATH, 'rb') as f:
     ed_priv = load_pem_private_key(f.read(), password=None)
 LOG.info("Loaded Ed25519 private key")
 
-# —— DataManager：历史 & 实时 K 线数据 + 指标 ——
+# —— DataManager：历史 + 实时 K 线数据 & 指标 ——
 class DataManager:
     def __init__(self):
         self.klines       = {
@@ -99,25 +99,16 @@ class DataManager:
         self._history_loaded = False
 
     async def load_historical(self):
-        """启动时批量拉取历史 K 线并预计算全部指标"""
+        """启动时拉取历史 K 线并预计算指标"""
         async with self.lock:
-            for tf in ("3m","15m","1h"):
-                params = {
-                    "symbol":   Config.SYMBOL,
-                    "interval": tf,
-                    "limit":    Config.HISTORY_LIMIT
-                }
+            for tf in self.klines:
+                params = {"symbol":Config.SYMBOL,"interval":tf,"limit":Config.HISTORY_LIMIT}
                 url = f"{Config.REST_BASE}/fapi/v1/klines"
-                resp = await session.get(
-                    url, params=params,
-                    headers={"X-MBX-APIKEY":Config.API_KEY}
-                )
-                data = await resp.json()
+                resp=await session.get(url,params=params,headers={"X-MBX-APIKEY":Config.API_KEY})
+                data=await resp.json()
                 df = pd.DataFrame([{
-                    "open": float(x[1]),
-                    "high": float(x[2]),
-                    "low":  float(x[3]),
-                    "close":float(x[4])
+                    "open":float(x[1]),"high":float(x[2]),
+                    "low": float(x[3]),"close":float(x[4])
                 } for x in data])
                 self.klines[tf]   = df
                 self.last_ts[tf]  = int(data[-1][0])
@@ -126,21 +117,21 @@ class DataManager:
             self._history_loaded = True
 
     async def update_kline(self, tf, o, h, l, c, ts):
-        """增量更新最新一根 K 线并计算对应指标增量"""
+        """增量更新最新一根 K 线并计算指标增量"""
         async with self.lock:
             df = self.klines[tf]
-            row = {"open":o,"high":h,"low":l,"close":c}
             if df.empty or ts > self.last_ts[tf]:
-                df.loc[len(df)] = row
+                # 新增一行
+                df.loc[len(df), ["open","high","low","close"]] = [o,h,l,c]
             else:
-                df.iloc[-1] = list(row.values())
+                # 更新最后一行
+                df.loc[df.index[-1], ["open","high","low","close"]] = [o,h,l,c]
             self.last_ts[tf] = ts
-            # 仅增量计算最后一根所需指标
             self._compute(tf)
-            # 日志关键指标
-            if tf=="3m" and "bb_pct" in df and len(df)>=20:
+            # 日志输出关键指标
+            if tf=="3m" and len(df)>=20 and "bb_pct" in df:
                 LOG.debug(f"3m bb_pct={df.bb_pct.iat[-1]:.4f}")
-            if tf=="15m" and all(col in df for col in ("st","macd","rvgi","rvsig")):
+            if tf=="15m" and {"st","macd","rvgi","rvsig"}.issubset(df.columns):
                 LOG.debug(
                     f"15m st={df.st.iat[-1]:.2f} "
                     f"macd={df.macd.iat[-1]:.4f} "
@@ -153,23 +144,23 @@ class DataManager:
         df = self.klines[tf]
         if len(df) < 20:
             return
-        # Bollinger Bands
+        # Bollinger
         m = df.close.rolling(20).mean()
         s = df.close.rolling(20).std()
         df["bb_up"], df["bb_dn"] = m+2*s, m-2*s
         df["bb_pct"] = (df.close - df.bb_dn) / (df.bb_up - df.bb_dn)
-        if tf == "15m":
-            hl2 = (df.high + df.low) / 2
+        if tf=="15m":
+            hl2 = (df.high + df.low)/2
             atr = df.high.rolling(10).max() - df.low.rolling(10).min()
             df["st"]    = hl2 - 3*atr
             df["macd"]  = MACD(df.close,12,26,9).macd_diff()
-            rv = ROCIndicator(close=(df.close - df.open), window=10).roc()
+            rv = ROCIndicator(close=(df.close-df.open),window=10).roc()
             df["rvgi"], df["rvsig"] = rv, rv.rolling(4).mean()
 
     async def get(self, tf, col):
         async with self.lock:
             df = self.klines[tf]
-            if col in df.columns and not df.empty:
+            if not df.empty and col in df.columns:
                 return df[col].iat[-1]
         return None
 
@@ -197,9 +188,9 @@ def numba_supertrend(high, low, close, period, mult):
     st[0] = up[0]
     for i in range(1,n):
         if close[i] > st[i-1]:
-            st[i], dirc[i] = max(dn[i], st[i-1]), True
+            st[i], dirc[i] = max(dn[i],st[i-1]), True
         else:
-            st[i], dirc[i] = min(up[i], st[i-1]), False
+            st[i], dirc[i] = min(up[i],st[i-1]), False
     return st, dirc
 
 # —— 时间同步 & 模式检测 ——
@@ -215,9 +206,7 @@ async def detect_mode():
     qs  = urllib.parse.urlencode({'timestamp':ts,'recvWindow':Config.RECV_WINDOW})
     sig = hmac.new(Config.SECRET_KEY, qs.encode(), hashlib.sha256).hexdigest()
     url = f"{Config.REST_BASE}/fapi/v1/positionSide/dual?{qs}&signature={sig}"
-    res = await (await session.get(
-        url, headers={'X-MBX-APIKEY':Config.API_KEY}
-    )).json()
+    res = await (await session.get(url, headers={'X-MBX-APIKEY':Config.API_KEY})).json()
     is_hedge_mode = res.get('dualSidePosition', False)
     LOG.info("Hedge mode: %s", is_hedge_mode)
 
@@ -233,15 +222,13 @@ class PositionTracker:
         qs  = urllib.parse.urlencode({'timestamp':ts,'recvWindow':Config.RECV_WINDOW})
         sig = hmac.new(Config.SECRET_KEY, qs.encode(), hashlib.sha256).hexdigest()
         url = f"{Config.REST_BASE}/fapi/v2/positionRisk?{qs}&signature={sig}"
-        res = await (await session.get(
-            url, headers={'X-MBX-APIKEY':Config.API_KEY}
-        )).json()
+        res = await (await session.get(url, headers={'X-MBX-APIKEY':Config.API_KEY})).json()
         if isinstance(res, list):
             async with self.lock:
                 for p in res:
-                    if p['symbol'] == Config.SYMBOL:
+                    if p['symbol']==Config.SYMBOL:
                         amt = abs(float(p['positionAmt']))
-                        if p.get('positionSide','BOTH') == 'LONG':
+                        if p.get('positionSide','BOTH')=='LONG':
                             self.long = amt
                         else:
                             self.short = amt
@@ -269,24 +256,17 @@ class OrderManager:
         ts = int(time.time()*1000 + time_offset)
         p  = {
             "symbol":Config.SYMBOL,
-            "side":side,
-            "type":otype,
+            "side":   side,
+            "type":   otype,
             "recvWindow":Config.RECV_WINDOW,
-            "timestamp":ts
+            "timestamp":  ts
         }
         if is_hedge_mode and otype in ("LIMIT","MARKET"):
             p["positionSide"] = "LONG" if side=="BUY" else "SHORT"
         if otype=="LIMIT":
-            p.update({
-                "timeInForce":"GTC",
-                "quantity":f"{qty:.6f}",
-                "price":   f"{price:.2f}"
-            })
+            p.update({"timeInForce":"GTC", "quantity":f"{qty:.6f}", "price":f"{price:.2f}"})
         elif otype in ("STOP_MARKET","TAKE_PROFIT_MARKET"):
-            p.update({
-                "stopPrice":    f"{stop:.2f}",
-                "closePosition":"true"
-            })
+            p.update({"stopPrice":f"{stop:.2f}", "closePosition":"true"})
         else:
             p["quantity"] = f"{qty:.6f}"
         if reduceOnly:
@@ -322,7 +302,7 @@ class OrderManager:
             r.raise_for_status()
             LOG.info("Batch flushed")
         except aiohttp.ClientResponseError as e:
-            LOG.error("Batch flush error: %s", e)
+            LOG.error("Batch flush error: %s %s", e.status, e.message if hasattr(e,'message') else e)
 
 mgr = OrderManager()
 
@@ -331,33 +311,30 @@ class BaseStrategy:
     interval = 1.0
     def __init__(self):
         self._last = 0.0
-
     async def check(self, price):
         if time.time() - self._last < self.interval:
             return
-        sig = await self.signal(price)
+        try:
+            sig = await self.signal(price)
+        except StopIteration:
+            return
         if sig:
             await self.execute(sig, price)
             self._last = time.time()
-
-    async def signal(self, price):
-        raise NotImplementedError
-
-    async def execute(self, side, price):
-        raise NotImplementedError
+    async def signal(self, price): raise NotImplementedError
+    async def execute(self, side, price): raise NotImplementedError
 
 class MainStrategy(BaseStrategy):
     interval = 1.0
     def __init__(self):
         super().__init__()
-        self._dyn       = 1.0
-        self._last_dyn  = 0.0
+        self._dyn = 1.0
+        self._last_dyn = 0.0
 
     async def signal(self, price):
         bb3 = await data_mgr.get("3m","bb_pct")
         st  = await data_mgr.get("15m","st")
-        if bb3 is None or st is None:
-            return None
+        if bb3 is None or st is None: return None
         if bb3 <= 0 or bb3 >= 1:
             return "BUY" if price > st else "SELL"
         return None
@@ -365,15 +342,15 @@ class MainStrategy(BaseStrategy):
     async def execute(self, side, price):
         # 更新动态波动
         if time.time() - self._last_dyn > 60:
-            df = data_mgr.klines["15m"]
+            df  = data_mgr.klines["15m"]
             atr = (df.high.rolling(14).max() - df.low.rolling(14).min()).iat[-1]
-            self._dyn = max(0.5, min(2.0, atr / price))
+            self._dyn = max(0.5, min(2.0, atr/price))
             self._last_dyn = time.time()
             LOG.debug(f"Dynamic vol={self._dyn:.4f}")
 
-        bb3     = await data_mgr.get("3m","bb_pct")
-        strength= abs(bb3 - 0.5)*2
-        qty     = min(0.1 * strength * self._dyn, Config.MAX_POSITION * 0.3)
+        bb3      = await data_mgr.get("3m","bb_pct")
+        strength = abs(bb3 - 0.5)*2
+        qty      = min(0.1 * strength * self._dyn, Config.MAX_POSITION * 0.3)
 
         # 限价开仓
         for lvl in [0.0025,0.004,0.006,0.008,0.016]:
@@ -382,11 +359,11 @@ class MainStrategy(BaseStrategy):
 
         # 多级止盈
         rev = "SELL" if side=="BUY" else "BUY"
-        for tp_mul in (0.0102,0.0123,0.015*1.2,0.018*1.5,0.022*2.0):
-            pr = price * (1 + tp_mul*self._dyn if side=="BUY" else 1 - tp_mul*self._dyn)
+        for tp in (0.0102,0.0123,0.015*1.2,0.018*1.5,0.022*2.0):
+            pr = price * (1 + tp*self._dyn if side=="BUY" else 1 - tp*self._dyn)
             await mgr.place(rev,"LIMIT",qty*0.2,pr,reduceOnly=True)
 
-        # 止损/止盈市价平仓
+        # 止损/市价平仓
         sl = price * (0.98 if side=="BUY" else 1.02) * self._dyn
         ot = "STOP_MARKET" if side=="BUY" else "TAKE_PROFIT_MARKET"
         await mgr.place(rev,ot,stop=sl)
@@ -395,15 +372,11 @@ class MACDStrategy(BaseStrategy):
     interval = 5.0
     async def signal(self, price):
         df = data_mgr.klines["15m"]
-        if len(df) < 30 or "macd" not in df:
-            return None
+        if len(df)<30 or "macd" not in df: return None
         m = df.macd
-        if m.iat[-2] < 0 < m.iat[-1]:
-            return "BUY"
-        if m.iat[-2] > 0 > m.iat[-1]:
-            return "SELL"
+        if m.iat[-2]<0<m.iat[-1]: return "BUY"
+        if m.iat[-2]>0>m.iat[-1]: return "SELL"
         return None
-
     async def execute(self, side, price):
         LOG.debug(f"MACD → {side}")
         for p in (0.3,0.5,0.2):
@@ -414,20 +387,14 @@ class RVGIStrategy(BaseStrategy):
     interval = 5.0
     async def signal(self, price):
         df = data_mgr.klines["15m"]
-        if len(df) < 11 or not {"rvgi","rvsig"}.issubset(df):
-            return None
+        if len(df)<11 or not {"rvgi","rvsig"}.issubset(df.columns): return None
         rv, sg = df.rvgi.iat[-1], df.rvsig.iat[-1]
-        ma7, ma25, ma99 = (
-            df.close.rolling(7).mean().iat[-1],
-            df.close.rolling(25).mean().iat[-1],
-            df.close.rolling(99).mean().iat[-1]
-        )
-        if rv > sg and price > ma7 > ma25 > ma99:
-            return "BUY"
-        if rv < sg and price < ma7 < ma25 < ma99:
-            return "SELL"
+        ma7,ma25,ma99 = (df.close.rolling(7).mean().iat[-1],
+                         df.close.rolling(25).mean().iat[-1],
+                         df.close.rolling(99).mean().iat[-1])
+        if rv>sg and price>ma7>ma25>ma99: return "BUY"
+        if rv<sg and price<ma7<ma25<ma99: return "SELL"
         return None
-
     async def execute(self, side, price):
         LOG.debug(f"RVGI → {side}")
         await mgr.place(side,"MARKET",0.05)
@@ -440,26 +407,25 @@ class TripleTrendStrategy(BaseStrategy):
 
     async def signal(self, price):
         df = data_mgr.klines["15m"]
-        if len(df) < 12:
+        if len(df)<12: return None
+        h,l,c = df.high.values, df.low.values, df.close.values
+        # 捕获 StopIteration
+        try:
+            _,d1 = numba_supertrend(h,l,c,10,1)
+            _,d2 = numba_supertrend(h,l,c,11,2)
+            _,d3 = numba_supertrend(h,l,c,12,3)
+        except StopIteration:
             return None
-        h, l, c = df.high.values, df.low.values, df.close.values
-        _, d1 = numba_supertrend(h, l, c, 10, 1)
-        _, d2 = numba_supertrend(h, l, c, 11, 2)
-        _, d3 = numba_supertrend(h, l, c, 12, 3)
         up = d1[-1] and d2[-1] and d3[-1]
         dn = not (d1[-1] or d2[-1] or d3[-1])
-        if up and self._state != "UP":
-            self._state = "UP"
-            return "BUY"
-        if dn and self._state != "DOWN":
-            self._state = "DOWN"
-            return "SELL"
-        if self._state == "UP" and not up:
-            self._state = "DOWN"
-            return "SELL"
-        if self._state == "DOWN" and not dn:
-            self._state = "UP"
-            return "BUY"
+        if up and self._state!="UP":
+            self._state="UP"; return "BUY"
+        if dn and self._state!="DOWN":
+            self._state="DOWN"; return "SELL"
+        if self._state=="UP" and not up:
+            self._state="DOWN"; return "SELL"
+        if self._state=="DOWN" and not dn:
+            self._state="UP"; return "BUY"
         return None
 
     async def execute(self, side, price):
@@ -492,10 +458,8 @@ async def market_ws():
                         k  = d["k"]
                         await data_mgr.update_kline(
                             tf,
-                            float(k["o"]),
-                            float(k["h"]),
-                            float(k["l"]),
-                            float(k["c"]),
+                            float(k["o"]), float(k["h"]),
+                            float(k["l"]), float(k["c"]),
                             k["t"]
                         )
         except Exception as e:
@@ -512,7 +476,7 @@ async def user_ws():
             async with websockets.connect(Config.WS_USER, ping_interval=None) as ws:
                 retry = 0
                 ts = int(time.time()*1000 + time_offset)
-                params = {"apiKey":Config.ED25519_API, "timestamp":ts}
+                params = {"apiKey":Config.ED25519_API,"timestamp":ts}
                 payload = "&".join(f"{k}={v}" for k,v in sorted(params.items()))
                 sig = base64.b64encode(ed_priv.sign(payload.encode())).decode()
                 params["signature"] = sig
@@ -522,8 +486,7 @@ async def user_ws():
                     "params": params
                 }))
                 async for _ in ws:
-                    # noop; library auto-responds to ping/pong
-                    await asyncio.sleep(0)
+                    await asyncio.sleep(0)  # noop; auto ping/pong
         except Exception as e:
             LOG.error("User WS error: %s, reconnect in 5s", e)
             await asyncio.sleep(5)
@@ -532,7 +495,7 @@ async def user_ws():
 # —— 配置热加载 & 定期维护 ——
 async def watch_reload():
     async for changes in watchfiles.awatch('.'):
-        for _,path in changes:
+        for _, path in changes:
             if path.endswith(('.env','py')):
                 LOG.info("Reloading env/py")
                 load_dotenv()
@@ -545,7 +508,9 @@ async def maintenance():
         await sync_time()
         await detect_mode()
         await pos_tracker.sync()
-        await mgr._flush()
+        # 强制 flush
+        async with mgr.lock:
+            await mgr._flush()
 
 # —— 策略引擎 ——
 async def engine():
