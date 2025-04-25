@@ -108,7 +108,6 @@ class DataManager:
         async with self.lock:
             df = self.klines[tf]
             if ts > self.last_ts[tf]:
-                # 修正：显式指定列，避免 “keys and value” 错误
                 df.loc[len(df), ["open","high","low","close"]] = [o, h, l, c]
             else:
                 df.iloc[-1] = [o, h, l, c]
@@ -238,57 +237,66 @@ class MainStrategy:
     def __init__(self):
         self.interval=1; self._last=0; self._dyn=1; self._ldyn=0
     async def check(self, price):
-        now=time.time()
-        if now-self._last<self.interval: return
-        bb3 = data_mgr.klines["3m"].bb_pct.iat[-1] if len(data_mgr.klines["3m"])>=20 else None
-        st  = data_mgr.klines["15m"].st.iat[-1]    if "st" in data_mgr.klines["15m"] else None
-        if bb3 is None or st is None: return
-        if bb3<=0 or bb3>=1:
-            side="BUY" if price>st else "SELL"
-        else: return
-        self._last=now
-        if now-self._ldyn>60:
-            df=data_mgr.klines["15m"]
-            atr=(df.high.rolling(14).max()-df.low.rolling(14).min()).iat[-1]
-            self._dyn=max(0.5,min(2.0,atr/price)); self._ldyn=now
-            LOG.debug(f"dyn={self._dyn:.3f}")
-        strength=abs(bb3-0.5)*2
-        qty=min(0.1*strength*self._dyn,Config.MAX_POS*0.3)
-        for lvl in (0.0025,0.004,0.006,0.008,0.016):
-            pr = price*(1+lvl*self._dyn if side=="BUY" else 1-lvl*self._dyn)
-            await mgr.place(side,"LIMIT",qty,pr)
-        rev = "SELL" if side=="BUY" else "BUY"
-        for tp in (0.0102,0.0123,0.018,0.022):
-            pr = price*(1+tp*self._dyn if side=="BUY" else 1-tp*self._dyn)
-            await mgr.place(rev,"LIMIT",qty*0.2,pr,reduceOnly=True)
-        sl=price*(0.98 if side=="BUY" else 1.02)*self._dyn
-        await mgr.place(rev,"STOP_MARKET",stop=sl)
+        try:
+            now=time.time()
+            if now-self._last<self.interval: return
+            bb3 = data_mgr.klines["3m"].bb_pct.iat[-1] if len(data_mgr.klines["3m"])>=20 else None
+            st  = data_mgr.klines["15m"].st.iat[-1]    if "st" in data_mgr.klines["15m"] else None
+            if bb3 is None or st is None: return
+            if bb3<=0 or bb3>=1:
+                side="BUY" if price>st else "SELL"
+            else: return
+            self._last=now
+            if now-self._ldyn>60:
+                df=data_mgr.klines["15m"]
+                atr=(df.high.rolling(14).max()-df.low.rolling(14).min()).iat[-1]
+                self._dyn=max(0.5,min(2.0,atr/price)); self._ldyn=now
+                LOG.debug(f"dyn={self._dyn:.3f}")
+            strength=abs(bb3-0.5)*2
+            qty=min(0.1*strength*self._dyn,Config.MAX_POS*0.3)
+            for lvl in (0.0025,0.004,0.006,0.008,0.016):
+                pr=price*(1+lvl*self._dyn if side=="BUY" else 1-lvl*self._dyn)
+                await mgr.place(side,"LIMIT",qty,pr)
+            rev = "SELL" if side=="BUY" else "BUY"
+            for tp in (0.0102,0.0123,0.018,0.022):
+                pr=price*(1+tp*self._dyn if side=="BUY" else 1-tp*self._dyn)
+                await mgr.place(rev,"LIMIT",qty*0.2,pr,reduceOnly=True)
+            sl=price*(0.98 if side=="BUY" else 1.02)*self._dyn
+            await mgr.place(rev,"STOP_MARKET",stop=sl)
+        except StopIteration:
+            LOG.warning("MainStrategy stopped iteration unexpectedly, skipping this cycle.")
 
 class MACDStrategy:
     def __init__(self): self.interval=5; self._last=0
     async def check(self, price):
-        now=time.time()
-        if now-self._last<self.interval: return
-        df=data_mgr.klines["15m"]
-        if len(df)<30 or "macd" not in df: return
-        prev,cur=df.macd.iat[-2],df.macd.iat[-1]
-        if prev>0>cur:
-            await mgr.place("SELL","MARKET",qty=0.05); self._last=now; LOG.debug("MACD→SELL")
-        elif prev<0<cur:
-            await mgr.place("BUY","MARKET",qty=0.05); self._last=now; LOG.debug("MACD→BUY")
+        try:
+            now=time.time()
+            if now-self._last<self.interval: return
+            df=data_mgr.klines["15m"]
+            if len(df)<30 or "macd" not in df: return
+            prev,cur=df.macd.iat[-2],df.macd.iat[-1]
+            if prev>0>cur:
+                await mgr.place("SELL","MARKET",qty=0.05); self._last=now; LOG.debug("MACD→SELL")
+            elif prev<0<cur:
+                await mgr.place("BUY","MARKET",qty=0.05); self._last=now; LOG.debug("MACD→BUY")
+        except StopIteration:
+            LOG.warning("MACDStrategy StopIteration, skipping.")
 
 class RVGIStrategy:
     def __init__(self): self.interval=5; self._last=0
     async def check(self, price):
-        now=time.time()
-        if now-self._last<self.interval: return
-        df=data_mgr.klines["15m"]
-        if len(df)<11 or not {"rvgi","rvsig"}.issubset(df): return
-        rv,sg=df.rvgi.iat[-1],df.rvsig.iat[-1]
-        if rv>sg:
-            await mgr.place("BUY","MARKET",qty=0.05); self._last=now; LOG.debug("RVGI→BUY")
-        elif rv<sg:
-            await mgr.place("SELL","MARKET",qty=0.05); self._last=now; LOG.debug("RVGI→SELL")
+        try:
+            now=time.time()
+            if now-self._last<self.interval: return
+            df=data_mgr.klines["15m"]
+            if len(df)<11 or not {"rvgi","rvsig"}.issubset(df): return
+            rv,sg=df.rvgi.iat[-1],df.rvsig.iat[-1]
+            if rv>sg:
+                await mgr.place("BUY","MARKET",qty=0.05); self._last=now; LOG.debug("RVGI→BUY")
+            elif rv<sg:
+                await mgr.place("SELL","MARKET",qty=0.05); self._last=now; LOG.debug("RVGI→SELL")
+        except StopIteration:
+            LOG.warning("RVGIStrategy StopIteration, skipping.")
 
 class TripleTrendStrategy:
     def __init__(self): self.interval=1; self._last=0; self.state=None
@@ -296,21 +304,27 @@ class TripleTrendStrategy:
         now=time.time()
         if now-self._last<self.interval: return
         df=data_mgr.klines["15m"]
-        # 修正：确保有足够数据再调用 supertrend
+        # 确保足够长度
         if len(df) < 13: return
         h,l,c = df.high.values, df.low.values, df.close.values
-        _,d1 = numba_supertrend(h,l,c,10,1)
-        _,d2 = numba_supertrend(h,l,c,11,2)
-        _,d3 = numba_supertrend(h,l,c,12,3)
+        try:
+            _,d1 = numba_supertrend(h,l,c,10,1)
+            _,d2 = numba_supertrend(h,l,c,11,2)
+            _,d3 = numba_supertrend(h,l,c,12,3)
+        except StopIteration:
+            LOG.warning("TripleTrendStrategy StopIteration in numba_supertrend, skipping.")
+            return
         up = d1[-1] and d2[-1] and d3[-1]
-        dn = not (d1[-1] or d2[-1] or d3[-1])
+        dn = not (up or d2[-1] or d3[-1])
         side=None
         if up and self.state!="UP": side,self.state="BUY","UP"
         elif dn and self.state!="DOWN": side,self.state="SELL","DOWN"
         elif self.state=="UP" and not up: side,self.state="SELL","DOWN"
         elif self.state=="DOWN" and not dn: side,self.state="BUY","UP"
         if side:
-            await mgr.place(side,"MARKET",qty=0.15); self._last=now; LOG.debug(f"Triple→{side}")
+            await mgr.place(side,"MARKET",qty=0.15)
+            self._last=now
+            LOG.debug(f"Triple→{side}")
 
 strategies = [MainStrategy(), MACDStrategy(), RVGIStrategy(), TripleTrendStrategy()]
 
