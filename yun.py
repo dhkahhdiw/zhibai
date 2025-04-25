@@ -75,34 +75,37 @@ class DataManager:
         async with self.lock:
             df = self.klines[tf]
             row = {"open":o,"high":h,"low":l,"close":c}
-            if df.empty or ts>self.last_ts[tf]:
+            if df.empty or ts > self.last_ts[tf]:
                 df.loc[len(df)] = row
             else:
                 df.iloc[-1] = list(row.values())
             self.last_ts[tf] = ts
             self._compute(tf)
-            # 关键指标日志
-            if tf=="3m":
+
+            # —— 安全输出关键指标 ——
+            if tf=="3m" and "bb_pct" in df and len(df)>=20:
                 LOG.debug(f"3m bb_pct={df['bb_pct'].iat[-1]:.4f}")
-            if tf=="15m":
+            if tf=="15m" and all(col in df for col in ("st","macd","rvgi","rvsig")) and len(df)>=20:
                 LOG.debug(
                     f"15m st={df['st'].iat[-1]:.2f} "
                     f"macd={df['macd'].iat[-1]:.4f} "
                     f"rvgi={df['rvgi'].iat[-1]:.4f} "
                     f"rvsig={df['rvsig'].iat[-1]:.4f}"
                 )
+
             self._evt.set()
 
     def _compute(self, tf):
         df = self.klines[tf]
-        if len(df) < 20: return
+        if len(df) < 20:
+            return
         m = df["close"].rolling(20).mean()
         s = df["close"].rolling(20).std()
-        df["bb_up"], df["bb_dn"] = m+2*s, m-2*s
-        df["bb_pct"] = (df["close"]-df["bb_dn"]) / (df["bb_up"]-df["bb_dn"])
+        df["bb_up"], df["bb_dn"] = m + 2*s, m - 2*s
+        df["bb_pct"] = (df["close"] - df["bb_dn"]) / (df["bb_up"] - df["bb_dn"])
         if tf == "15m":
-            hl2 = (df["high"]+df["low"])/2
-            atr = df["high"].rolling(10).max()-df["low"].rolling(10).min()
+            hl2 = (df["high"] + df["low"]) / 2
+            atr = df["high"].rolling(10).max() - df["low"].rolling(10).min()
             df["st"]    = hl2 - 3*atr
             df["macd"]  = MACD(df["close"],12,26,9).macd_diff()
             rv = ROCIndicator(close=(df["close"]-df["open"]), window=10).roc()
@@ -111,7 +114,7 @@ class DataManager:
     async def get(self, tf, col):
         async with self.lock:
             df = self.klines[tf]
-            if col in df and not df.empty:
+            if col in df.columns and not df.empty:
                 return df[col].iat[-1]
         return None
 
@@ -277,7 +280,10 @@ class MainStrategy(BaseStrategy):
         st  = await data_mgr.get("15m","st")
         if bb3 is None or st is None:
             return None
-        return "BUY" if price>st else "SELL" if (bb3<=0 or bb3>=1) else None
+        # 只有当 bb3 ≤0 或 ≥1 时才触发
+        if bb3<=0 or bb3>=1:
+            return "BUY" if price>st else "SELL"
+        return None
     async def execute(self, side, price):
         # 更新动态参数
         if time.time()-self._last_dyn>60:
@@ -286,20 +292,22 @@ class MainStrategy(BaseStrategy):
             self._dyn = max(0.5, min(2.0, atr/price))
             self._last_dyn = time.time()
             LOG.debug(f"Dynamic vol={self._dyn:.4f}")
-        # 开仓 & 止盈止损
-        bb3=await data_mgr.get("3m","bb_pct")
+        bb3 = await data_mgr.get("3m","bb_pct")
         strength=abs(bb3-0.5)*2
         qty=min(0.1*strength*self._dyn, Config.MAX_POSITION*0.3)
+
         # 限价开仓
         for lvl in [0.0025,0.004,0.006,0.008,0.016]:
             pr = price*(1+(lvl*self._dyn) if side=="BUY" else 1-(lvl*self._dyn))
             await mgr.place(side,"LIMIT",qty,pr)
+
         # 多级止盈
         rev="SELL" if side=="BUY" else "BUY"
         for tp_mul in (0.0102,0.0123,0.015*1.2,0.018*1.5,0.022*2.0):
             pr = price*(1+(tp_mul*self._dyn) if side=="BUY" else 1-(tp_mul*self._dyn))
             await mgr.place(rev,"LIMIT",qty*0.2,pr,reduceOnly=True)
-        # 止损市价
+
+        # 止损/止盈市价
         sl = price*(0.98 if side=="BUY" else 1.02)*self._dyn
         ot = "STOP_MARKET" if side=="BUY" else "TAKE_PROFIT_MARKET"
         await mgr.place(rev,ot,stop=sl)
@@ -311,7 +319,11 @@ class MACDStrategy(BaseStrategy):
         if len(df)<30 or "macd" not in df:
             return None
         m = df.macd
-        return "BUY" if m.iat[-2]<0<m.iat[-1] else "SELL" if m.iat[-2]>0>m.iat[-1] else None
+        if m.iat[-2]<0<m.iat[-1]:
+            return "BUY"
+        if m.iat[-2]>0>m.iat[-1]:
+            return "SELL"
+        return None
     async def execute(self, side, price):
         LOG.debug(f"MACD → {side}")
         for p in (0.3,0.5,0.2):
@@ -364,7 +376,10 @@ class TripleTrendStrategy(BaseStrategy):
         LOG.debug(f"TripleTrend → {side}")
         await mgr.place(side,"MARKET",0.15)
 
-strategies = [MainStrategy(), MACDStrategy(), RVGIStrategy(), TripleTrendStrategy()]
+strategies = [
+    MainStrategy(), MACDStrategy(),
+    RVGIStrategy(), TripleTrendStrategy()
+]
 
 # —— WebSocket 市场流 ——
 async def market_ws():
@@ -390,8 +405,9 @@ async def market_ws():
                             k["t"]
                         )
         except Exception as e:
-            LOG.error("Market WS error: %s, reconnect in %ds", e, min(2**retry,30))
-            await asyncio.sleep(min(2**retry,30))
+            delay = min(2**retry, 30)
+            LOG.error("Market WS error: %s, reconnect in %ds", e, delay)
+            await asyncio.sleep(delay)
             retry += 1
 
 # —— WebSocket 用户流 ——
@@ -402,7 +418,7 @@ async def user_ws():
             async with websockets.connect(Config.WS_USER, ping_interval=None) as ws:
                 retry = 0
                 # 登录
-                ts = int(time.time()*1000+time_offset)
+                ts = int(time.time()*1000 + time_offset)
                 params={"apiKey":Config.ED25519_API,"timestamp":ts}
                 payload="&".join(f"{k}={v}" for k,v in sorted(params.items()))
                 sig = base64.b64encode(ed_priv.sign(payload.encode())).decode()
@@ -412,10 +428,9 @@ async def user_ws():
                     "method": "session.logon",
                     "params": params
                 }))
-                # 自动回应服务器 ping
-                async for message in ws:
-                    # 服务器通常发送 ping 帧，无需手动处理，库会自动 pong
-                    await asyncio.sleep(0)  # placeholder 保持循环
+                # 自动处理服务器 Ping/Pong
+                async for _ in ws:
+                    await asyncio.sleep(0)
         except Exception as e:
             LOG.error("User WS error: %s, reconnect in 5s", e)
             await asyncio.sleep(5)
@@ -426,18 +441,15 @@ async def watch_reload():
     async for changes in watchfiles.awatch('.'):
         for _, path in changes:
             if path.endswith(('.env','py')):
-                LOG.info("Reloading env/py")
-                load_dotenv()
+                LOG.info("Reloading env/py"); load_dotenv()
                 await pos_tracker.sync()
 
 async def maintenance():
     asyncio.create_task(watch_reload())
     while True:
         await asyncio.sleep(Config.SYNC_INTERVAL)
-        await sync_time()
-        await detect_mode()
-        await pos_tracker.sync()
-        await mgr.flush()
+        await sync_time(); await detect_mode()
+        await pos_tracker.sync(); await mgr.flush()
 
 # —— 策略引擎 ——
 async def engine():
