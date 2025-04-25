@@ -11,8 +11,10 @@ import logging
 import uuid
 import urllib.parse
 import base64
-from collections import defaultdict
-from logging.handlers import RotatingFileHandler
+from collections import defaultdict, deque
+from logging import Handler
+from dotenv import load_dotenv
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 import uvloop
 import aiohttp
@@ -20,8 +22,6 @@ import pandas as pd
 import numpy as np
 import websockets
 import watchfiles
-from dotenv import load_dotenv
-from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from ta.trend import MACD
 from ta.momentum import ROCIndicator
 from numba import jit
@@ -32,17 +32,48 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 # —— 环境变量 ——
 load_dotenv('/root/zhibai/.env')
 
-# —— 日志配置：STDOUT + 文件轮转 ——
+# —— 自定义日志处理器，只保留最近 max_lines 条记录 ——
+class LineCountRotatingFileHandler(Handler):
+    def __init__(self, filename, max_lines=1000, encoding='utf-8'):
+        super().__init__()
+        self.filename = filename
+        self.max_lines = max_lines
+        self.encoding = encoding
+        # 确保文件存在
+        open(self.filename, 'a', encoding=self.encoding).close()
+
+    def emit(self, record):
+        msg = self.format(record)
+        # 追加写入
+        with open(self.filename, 'a', encoding=self.encoding) as f:
+            f.write(msg + '\n')
+        # 检查并修剪过长的日志
+        self._prune()
+
+    def _prune(self):
+        with open(self.filename, 'r', encoding=self.encoding) as f:
+            lines = f.readlines()
+        if len(lines) <= self.max_lines:
+            return
+        # 只保留最后 max_lines 条
+        with open(self.filename, 'w', encoding=self.encoding) as f:
+            f.writelines(lines[-self.max_lines:])
+
+# —— 日志配置：STDOUT + 自定义限行数文件 ——
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
 fmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+# 控制台
 ch = logging.StreamHandler()
 ch.setFormatter(fmt)
 logger.addHandler(ch)
-fh = RotatingFileHandler('/root/zhibai/yun.log', maxBytes=10*1024*1024, backupCount=1)
+# 文件，仅保留最新 1000 条
+log_path = '/root/zhibai/yun.log'
+fh = LineCountRotatingFileHandler(log_path, max_lines=1000)
 fh.setFormatter(fmt)
 logger.addHandler(fh)
 
+# —— 配置类 ——
 class Config:
     SYMBOL           = 'ETHUSDC'
     PAIR             = SYMBOL.lower()
@@ -299,8 +330,12 @@ class OrderGuard:
             if side=="BUY":  p['long']+=qty
             else:            p['short']+=qty
     async def stamp(self,s,side):
-        async with self.lock():
-            self.states[s].update({'last_ts':time.time(),'last_dir':side,'waiting_cross': s=="macd"})
+        async with self.lock:
+            self.states[s].update({
+                'last_ts':time.time(),
+                'last_dir':side,
+                'waiting_cross': (s=="macd")
+            })
     async def get_triple_status(self):
         df=data_mgr.klines["15m"]
         if len(df)<12: return {'up':False,'down':False}
@@ -350,7 +385,7 @@ class StrategyEngine:
 
 engine = StrategyEngine()
 
-# —— 动态参数 ——
+# 动态参数
 class DynamicParameters:
     def __init__(self):
         self.base=[0.0025,0.0040,0.0060,0.0080,0.0160]
@@ -368,7 +403,7 @@ class DynamicParameters:
                 0.0150*self.vol*1.2,0.0180*self.vol*1.5,
                 0.0220*self.vol*2.0]
 
-# —— 各策略 ——
+# 各策略
 class MainStrategy:
     def __init__(self):
         self.last=0; self.dyn=DynamicParameters()
@@ -437,6 +472,7 @@ class RVGIStrategy:
 class TripleTrendStrategy:
     def __init__(self): self.state=None
     async def check_signal(self,price):
+        # 这里只调用 check，不需要额外 await
         await order_guard.check("triple","")
         df=data_mgr.klines["15m"]
         if len(df)<12: return
@@ -523,10 +559,13 @@ async def user_ws():
 
 # —— 配置热加载 & 定期维护 ——
 async def config_watcher():
-    async for _ in watchfiles.awatch('/root/zhibai/'):
-        logging.info("Config changed, reloading…")
-        load_dotenv('/root/zhibai/.env')
-        await pos_tracker.sync()
+    # 仅监控 .py 和 .env 文件，忽略 yun.log
+    async for changes in watchfiles.awatch('/root/zhibai'):
+        for change, path in changes:
+            if path.endswith('.py') or path.endswith('.env'):
+                logging.info("Config changed (%s), reloading…", path)
+                load_dotenv('/root/zhibai/.env')
+                await pos_tracker.sync()
 
 async def maintenance():
     asyncio.create_task(config_watcher())
