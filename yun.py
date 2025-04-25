@@ -1,11 +1,25 @@
 #!/usr/bin/env python3
 # coding: utf-8
 
-import os, time, json, hmac, hashlib, asyncio, logging, uuid, urllib.parse, base64
+import os
+import time
+import json
+import hmac
+import hashlib
+import asyncio
+import logging
+import uuid
+import urllib.parse
+import base64
 from collections import defaultdict
 from logging.handlers import RotatingFileHandler
 
-import uvloop, aiohttp, pandas as pd, numpy as np, websockets, watchfiles
+import uvloop
+import aiohttp
+import pandas as pd
+import numpy as np
+import websockets
+import watchfiles
 from dotenv import load_dotenv
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from ta.trend import MACD
@@ -22,13 +36,9 @@ load_dotenv('/root/zhibai/.env')
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
 fmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-
-# 控制台
 ch = logging.StreamHandler()
 ch.setFormatter(fmt)
 logger.addHandler(ch)
-
-# 文件，保留最近1000条日志，每次到10MB轮转一次
 fh = RotatingFileHandler('/root/zhibai/yun.log', maxBytes=10*1024*1024, backupCount=1)
 fh.setFormatter(fmt)
 logger.addHandler(fh)
@@ -44,11 +54,11 @@ class Config:
         'wss://fstream.binance.com/stream?streams='
         f'{PAIR}@kline_3m/{PAIR}@kline_15m/{PAIR}@kline_1h/{PAIR}@markPrice'
     )
-    WS_USER_URL   = 'wss://ws-fapi.binance.com/ws-fapi/v1'
-    REST_BASE     = 'https://fapi.binance.com'
-    RECV_WINDOW   = 5000
-    SYNC_INTERVAL = 300
-    MAX_POSITION  = 2.0
+    WS_USER_URL      = 'wss://ws-fapi.binance.com/ws-fapi/v1'
+    REST_BASE        = 'https://fapi.binance.com'
+    RECV_WINDOW      = 5000
+    SYNC_INTERVAL    = 300
+    MAX_POSITION     = 2.0
 
 # —— 全局状态 ——
 session: aiohttp.ClientSession
@@ -279,7 +289,7 @@ class OrderGuard:
                 if side=="SELL" and not ts['down']: return False
             return True
     async def limit(self,s,side,qty):
-        lim={"main":2.0,"macd":0.2,"rvgi":0.2,"triple":0.3}[s]
+        lim={"main":0.6,"macd":0.2,"rvgi":0.2,"triple":0.3}[s]
         async with self.lock:
             p=self.pos[s]
             return (p['long']+qty<=lim) if side=="BUY" else (p['short']+qty<=lim)
@@ -289,10 +299,8 @@ class OrderGuard:
             if side=="BUY":  p['long']+=qty
             else:            p['short']+=qty
     async def stamp(self,s,side):
-        async with self.lock:
-            self.states[s].update({'last_ts':time.time(),
-                                   'last_dir':side,
-                                   'waiting_cross': s=="macd"})
+        async with self.lock():
+            self.states[s].update({'last_ts':time.time(),'last_dir':side,'waiting_cross': s=="macd"})
     async def get_triple_status(self):
         df=data_mgr.klines["15m"]
         if len(df)<12: return {'up':False,'down':False}
@@ -360,7 +368,7 @@ class DynamicParameters:
                 0.0150*self.vol*1.2,0.0180*self.vol*1.5,
                 0.0220*self.vol*2.0]
 
-# —— MainStrategy ——
+# —— 各策略 ——
 class MainStrategy:
     def __init__(self):
         self.last=0; self.dyn=DynamicParameters()
@@ -388,7 +396,6 @@ class MainStrategy:
         ot = "STOP_MARKET" if side=="BUY" else "TAKE_PROFIT_MARKET"
         await mgr.safe_place("main",rev,ot,stop=slp)
 
-# —— MACDStrategy ——
 class MACDStrategy:
     def __init__(self): self._cd=0
     async def check_signal(self,price):
@@ -408,7 +415,6 @@ class MACDStrategy:
             await asyncio.sleep(0.5)
         self._cd=time.time()
 
-# —— RVGIStrategy ——
 class RVGIStrategy:
     def __init__(self): self._cd=0
     async def check_signal(self,price):
@@ -428,7 +434,6 @@ class RVGIStrategy:
             await mgr.safe_place("rvgi","SELL","MARKET",0.05)
             self._cd=time.time()
 
-# —— TripleTrendStrategy ——
 class TripleTrendStrategy:
     def __init__(self): self.state=None
     async def check_signal(self,price):
