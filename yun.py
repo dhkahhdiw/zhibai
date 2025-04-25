@@ -47,7 +47,8 @@ class Rotator(logging.Handler):
         with open(self.path,'a') as f: f.write(msg+'\n')
         lines = open(self.path).read().splitlines()
         if len(lines) > self.max:
-            open(self.path,'w').write('\n'.join(lines[-self.max:])+'\n')
+            with open(self.path,'w') as f:
+                f.write('\n'.join(lines[-self.max:]) + '\n')
 fh = Rotator('bot.log'); fh.setFormatter(fmt); LOG.addHandler(fh)
 
 # —— 全局状态 ——
@@ -82,8 +83,8 @@ class DataManager:
                 )
                 data = await resp.json()
                 df = pd.DataFrame([{
-                    "open":float(x[1]), "high":float(x[2]),
-                    "low": float(x[3]), "close":float(x[4])
+                    "open":float(x[1]),"high":float(x[2]),
+                    "low": float(x[3]),"close":float(x[4])
                 } for x in data])
                 self.klines[tf]  = df
                 self.last_ts[tf] = int(data[-1][0])
@@ -96,12 +97,14 @@ class DataManager:
             if ts > self.last_ts[tf]:
                 df.loc[len(df), ["open","high","low","close"]] = [o,h,l,c]
             else:
-                df.iloc[-1] = [o,h,l,c]
+                # 只更新这四列，避免列数不匹配
+                df.loc[df.index[-1], ["open","high","low","close"]] = [o,h,l,c]
             self.last_ts[tf] = ts
             self._compute(tf)
-            if tf=="3m" and "bb_pct" in df:
+            # 关键指标日志
+            if tf=="3m" and "bb_pct" in df.columns:
                 LOG.debug(f"3m bb_pct={df.bb_pct.iat[-1]:.4f}")
-            if tf=="15m" and {"st","macd","rvgi","rvsig"}.issubset(df):
+            if tf=="15m" and {"st","macd","rvgi","rvsig"}.issubset(df.columns):
                 LOG.debug(
                     f"15m st={df.st.iat[-1]:.2f} macd={df.macd.iat[-1]:.4f} "
                     f"rvgi={df.rvgi.iat[-1]:.4f} rvsig={df.rvsig.iat[-1]:.4f}"
@@ -111,21 +114,23 @@ class DataManager:
     def _compute(self, tf):
         df = self.klines[tf]
         if len(df) < 20: return
-        m, s = df.close.rolling(20).mean(), df.close.rolling(20).std()
+        m,s = df.close.rolling(20).mean(), df.close.rolling(20).std()
         df["bb_up"], df["bb_dn"] = m+2*s, m-2*s
         df["bb_pct"] = (df.close - df.bb_dn) / (df.bb_up - df.bb_dn)
         if tf=="15m":
             hl2 = (df.high + df.low)/2
             atr = df.high.rolling(10).max() - df.low.rolling(10).min()
-            df["st"]    = hl2 - 3*atr
-            df["macd"]  = MACD(df.close,12,26,9).macd_diff()
-            rv = ROCIndicator(df.close-df.open, window=10).roc()
+            df["st"]   = hl2 - 3*atr
+            df["macd"] = MACD(df.close,12,26,9).macd_diff()
+            rv = ROCIndicator(df.close - df.open, window=10).roc()
             df["rvgi"], df["rvsig"] = rv, rv.rolling(4).mean()
 
     async def get(self, tf, col):
         async with self.lock:
             df = self.klines[tf]
-            return df[col].iat[-1] if col in df and not df.empty else None
+            if not df.empty and col in df.columns:
+                return df[col].iat[-1]
+        return None
 
     async def wait_update(self):
         await self._evt.wait(); self._evt.clear()
@@ -171,7 +176,7 @@ async def detect_mode():
     is_hedge_mode = res.get('dualSidePosition', False)
     LOG.info("Hedge mode: %s", is_hedge_mode)
 
-# —— PositionTracker ——
+# —— 持仓追踪 ——
 class PositionTracker:
     def __init__(self):
         self.long, self.short = 0.0, 0.0
@@ -204,12 +209,12 @@ class OrderManager:
 
     async def place(self, side, otype, qty=None, price=None, stop=None, reduceOnly=False):
         ts = int(time.time()*1000 + time_offset)
-        # 构建参数字典（不含 signature）
+        # 构建所有请求参数（不含 signature）
         params = {
-            "symbol": Config.SYMBOL, "side": side, "type": otype,
-            "timestamp": ts,    "recvWindow": Config.RECV_WINDOW
+            "symbol":Config.SYMBOL, "side":side, "type":otype,
+            "timestamp":ts, "recvWindow":Config.RECV_WINDOW
         }
-        if otype == "LIMIT":
+        if otype=="LIMIT":
             params.update(timeInForce="GTC",
                           quantity=f"{qty:.6f}", price=f"{price:.2f}")
         elif otype in ("STOP_MARKET","TAKE_PROFIT_MARKET"):
@@ -220,25 +225,23 @@ class OrderManager:
             params["positionSide"] = "LONG" if side=="BUY" else "SHORT"
         if reduceOnly:
             params["reduceOnly"] = "true"
-        # 生成签名（对排序后的 params 编码，不含 signature）
-        query = urllib.parse.urlencode(sorted(params.items()))
-        signature = hmac.new(Config.SECRET_KEY, query.encode(), hashlib.sha256).hexdigest()
-        params["signature"] = signature
 
-        headers = {'X-MBX-APIKEY': Config.API_KEY}
+        # 对排序后的 params 编码并签名
+        query = urllib.parse.urlencode(sorted(params.items()))
+        params["signature"] = hmac.new(Config.SECRET_KEY, query.encode(), hashlib.sha256).hexdigest()
+
+        headers = {'X-MBX-APIKEY':Config.API_KEY}
         async with self.lock:
             start = time.perf_counter()
-            r = await session.post(
-                f"{Config.REST_BASE}/fapi/v1/order",
-                headers=headers,
-                data=params  # 将所有参数放在 body
-            )
-            latency = (time.perf_counter() - start)*1000
+            # 这里用 data=params，把所有参数（含 signature）放到请求 body
+            r = await session.post(f"{Config.REST_BASE}/fapi/v1/order",
+                                   headers=headers, data=params)
+            lat = (time.perf_counter()-start)*1000
             if r.status == 200:
-                LOG.info("Order %s %s OK (%.1fms)", otype, side, latency)
+                LOG.info("Order %s %s OK (%.1fms)", otype, side, lat)
             else:
                 err = await r.text()
-                LOG.error("Order %s %s ERROR %s (%.1fms)", otype, side, err, latency)
+                LOG.error("Order %s %s ERROR %s (%.1fms)", otype, side, err, lat)
 
 mgr = OrderManager()
 
@@ -424,6 +427,7 @@ async def main():
     session = aiohttp.ClientSession()
     await sync_time(); await detect_mode(); await data_mgr.load_historical()
     await asyncio.gather(market_ws(), user_ws(), maintenance(), engine())
+
 
 if __name__ == '__main__':
     asyncio.run(main())
