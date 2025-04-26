@@ -6,7 +6,6 @@ from dotenv import load_dotenv
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 import uvloop, aiohttp, websockets, pandas as pd
 from ta.trend import MACD
-from ta.momentum import ROCIndicator
 from numba import jit
 import watchfiles
 
@@ -117,8 +116,8 @@ class DataManager:
                 df.iloc[-1, df.columns.get_indexer(["open","high","low","close"])] = [o,h,l,c]
             self.last_ts[tf]=ts; self._compute(tf)
             if tf=="3m": LOG.debug(f"3m bb_pct={df.bb_pct.iat[-1]:.4f}")
-            if tf=="15m" and {"st","macd","rvgi","rvsig"}.issubset(df):
-                LOG.debug(f"15m st={df.st.iat[-1]:.2f} macd={df.macd.iat[-1]:.4f} rvgi={df.rvgi.iat[-1]:.4f} rvsig={df.rvsig.iat[-1]:.4f}")
+            if tf=="15m" and {"st","macd"}.issubset(df):
+                LOG.debug(f"15m st={df.st.iat[-1]:.2f} macd={df.macd.iat[-1]:.4f}")
             self._evt.set()
 
     def _compute(self, tf):
@@ -132,8 +131,6 @@ class DataManager:
             atr = df.high.rolling(10).max() - df.low.rolling(10).min()
             df["st"]   = hl2 - 3*atr
             df["macd"] = MACD(df.close,12,26,9).macd_diff()
-            rv = ROCIndicator(df.close-df.open,window=10).roc()
-            df["rvgi"], df["rvsig"] = rv, rv.rolling(4).mean()
 
     async def get(self, tf, col):
         async with self.lock:
@@ -204,37 +201,27 @@ class OrderManager:
         await ensure_session()
         ts=int(time.time()*1000+time_offset)
         params={"symbol":Config.SYMBOL,"side":side,"type":otype,"timestamp":ts,"recvWindow":Config.RECV_WINDOW}
-
         if qty is not None:
-            q=quantize(qty,qty_step)
-            params["quantity"]=f"{q:.{qty_prec}f}"
+            q=quantize(qty,qty_step); params["quantity"]=f"{q:.{qty_prec}f}"
         if price is not None:
-            p=quantize(price,price_step)
-            params["price"]=f"{p:.{price_prec}f}"
+            p=quantize(price,price_step); params["price"]=f"{p:.{price_prec}f}"
         if stop is not None:
-            sp=quantize(stop,price_step)
-            params["stopPrice"]=f"{sp:.{price_prec}f}"
-
+            sp=quantize(stop,price_step); params["stopPrice"]=f"{sp:.{price_prec}f}"
         if otype=="LIMIT":
             params["timeInForce"]="GTC"
         elif otype in ("STOP_MARKET","TAKE_PROFIT_MARKET"):
             params["closePosition"]="true"
-
         if is_hedge and otype in ("LIMIT","MARKET"):
             params["positionSide"]="LONG" if side=="BUY" else "SHORT"
-
         qs=urllib.parse.urlencode(sorted(params.items()))
         sig=hmac.new(Config.SECRET_KEY,qs.encode(),hashlib.sha256).hexdigest()
         url=f"{Config.REST_BASE}/fapi/v1/order?{qs}&signature={sig}"
         headers={'X-MBX-APIKEY':Config.API_KEY}
-
         async with self.lock:
             r=await session.post(url,headers=headers)
-            txt=await r.text(); lat=(r.elapsed.total_seconds()*1000) if hasattr(r,'elapsed') else 0
-            if r.status==200:
-                LOG.info(f"Order OK {otype} {side}")
-            else:
-                LOG.error(f"Order ERR {otype} {side} {txt}")
+            txt=await r.text()
+            if r.status==200: LOG.info(f"Order OK {otype} {side}")
+            else: LOG.error(f"Order ERR {otype} {side} {txt}")
 
 mgr=OrderManager()
 
@@ -281,20 +268,6 @@ class MACDStrategy:
         self._last=now; LOG.debug(f"MACD→{side}")
         await mgr.place(side,"MARKET",qty=0.05)
 
-class RVGIStrategy:
-    def __init__(self): self.interval=5; self._last=0
-    async def check(self, price):
-        now=time.time()
-        if now-self._last<self.interval: return
-        df=data_mgr.klines["15m"]
-        if len(df)<11 or not {"rvgi","rvsig"}.issubset(df): return
-        rv,sg=df.rvgi.iat[-1],df.rvsig.iat[-1]
-        if rv>sg: side="BUY"
-        elif rv<sg: side="SELL"
-        else: return
-        self._last=now; LOG.debug(f"RVGI→{side}")
-        await mgr.place(side,"MARKET",qty=0.05)
-
 class TripleTrendStrategy:
     def __init__(self): self.interval=1; self._last=0; self._state=None
     async def check(self, price):
@@ -319,7 +292,7 @@ class TripleTrendStrategy:
             self._last=now; LOG.debug(f"Triple→{side}")
             await mgr.place(side,"MARKET",qty=0.15)
 
-strategies=[MainStrategy(),MACDStrategy(),RVGIStrategy(),TripleTrendStrategy()]
+strategies=[MainStrategy(), MACDStrategy(), TripleTrendStrategy()]
 
 # —— WebSocket 市场 ——
 async def market_ws():
@@ -331,14 +304,12 @@ async def market_ws():
                 async for msg in ws:
                     o=json.loads(msg); s,d=o["stream"],o["data"]
                     if s.endswith("@markPrice"):
-                        p=float(d["p"])
-                        await data_mgr.track_price(p,int(time.time()*1000))
+                        p=float(d["p"]); await data_mgr.track_price(p,int(time.time()*1000))
                     else:
                         tf=s.split("@")[1].split("_")[1]; k=d["k"]
                         await data_mgr.update_kline(tf,float(k["o"]),float(k["h"]),float(k["l"]),float(k["c"]),k["t"])
         except Exception as e:
-            delay=min(2**retry,30)
-            LOG.error("MarketWS %s, retry %ds",e,delay)
+            delay=min(2**retry,30); LOG.error("MarketWS %s, retry %ds",e,delay)
             await asyncio.sleep(delay); retry+=1
 
 # —— WebSocket 用户 ——
@@ -361,11 +332,10 @@ async def user_ws():
         except Exception as e:
             LOG.error("UserWS %s, retry 5s",e); await asyncio.sleep(5); retry+=1
 
-# —— 热重载 & 维护 ——
+# —— 维护 ——
 async def watch_reload():
     async for _ in watchfiles.awatch('/root/zhibai'):
         LOG.info("Reloading…"); load_dotenv('/root/zhibai/.env'); await pos_tracker.sync()
-
 async def maintenance():
     asyncio.create_task(watch_reload())
     while True:
@@ -388,11 +358,9 @@ async def main():
     loop=asyncio.get_running_loop()
     for sig in (signal.SIGINT,signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(session.close()))
-
-    await sync_time(); await detect_mode()
-    await load_symbol_filters()     # ← 在此加载价格/数量精度
+    await sync_time(); await detect_mode(); await load_symbol_filters()
     await data_mgr.load_history(); await pos_tracker.sync()
-    await asyncio.gather(market_ws(),user_ws(),maintenance(),engine())
+    await asyncio.gather(market_ws(), user_ws(), maintenance(), engine())
 
 if __name__=='__main__':
     asyncio.run(main())
