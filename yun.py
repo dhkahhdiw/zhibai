@@ -38,7 +38,7 @@ class Config:
     SYNC_INTERVAL  = 300
     MAX_POS        = 2.0
     HIST_LIMIT     = 1000
-    ORDER_COOLDOWN = 60  # 同一信号最小间隔（秒）
+    ORDER_COOLDOWN = 360  # 同一信号最小间隔（秒）
 
 # —— 全局状态 ——
 session: aiohttp.ClientSession = None
