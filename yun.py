@@ -55,7 +55,7 @@ class Config:
     SYNC_INTERVAL  = 300
     MAX_POS        = 2.0
     HIST_LIMIT     = 1000
-    ORDER_COOLDOWN = 360  # 同一信号最小间隔（秒）
+    ORDER_COOLDOWN = 60  # 同一信号最小间隔（秒）
 
 # —— 全局状态 ——
 session: aiohttp.ClientSession = None
@@ -355,7 +355,9 @@ class MainStrategy:
         levels = [0.0025,0.004,0.006,0.008,0.016]
         for lvl in levels:
             price0 = price * (1 + lvl if side=="BUY" else 1 - lvl)
-            await mgr.safe_place("main", side, "LIMIT",
+            await mgr.safe_place("main", side, "
+
+LIMIT",
                                  qty=qty, price=price0,
                                  params={"lvl": lvl, "strength": strength})
 
