@@ -14,6 +14,7 @@ import logging
 import urllib.parse
 import signal
 from collections import defaultdict
+
 from dotenv import load_dotenv
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 import uvloop
@@ -176,7 +177,7 @@ def numba_supertrend(h, l, c, per, mult):
     st  = [0.0]*n
     dirc= [False]*n
     hl2 = [(h[i] + l[i]) / 2 for i in range(n)]
-    atr = [max(h[i-per+1:i+1]) - min(l[i-per+1:i+1]) for i in range(n)]
+    atr = [max(h[max(0, i-per+1):i+1]) - min(l[max(0, i-per+1):i+1]) for i in range(n)]
     up  = [hl2[i] + mult*atr[i] for i in range(n)]
     dn  = [hl2[i] - mult*atr[i] for i in range(n)]
     st[0], dirc[0] = up[0], True
@@ -215,7 +216,7 @@ class PositionTracker:
             used = (self.long - self.short) if side == 'BUY' else (self.short - self.long)
             return max(0.0, Config.MAX_POS - used)
 
-pos_tracker = PositionTracker()  # <<< 确保实例化
+pos_tracker = PositionTracker()
 
 # —— 会话管理 ——
 async def ensure_session():
@@ -229,8 +230,8 @@ class OrderGuard:
         self.states   = defaultdict(dict)
         self.lock     = asyncio.Lock()
         self.cooldown = {
-            "main": Config.ORDER_COOLDOWN,
-            "macd": Config.ORDER_COOLDOWN//2,
+            "main":   Config.ORDER_COOLDOWN,
+            "macd":   Config.ORDER_COOLDOWN//2,
             "triple": Config.ORDER_COOLDOWN*5
         }
 
@@ -273,8 +274,8 @@ class OrderManager:
         ts = int(time.time()*1000 + time_offset)
         params = {
             "symbol": Config.SYMBOL,
-            "side": side,
-            "type": otype,
+            "side":   side,
+            "type":   otype,
             "timestamp": ts,
             "recvWindow": Config.RECV_WINDOW
         }
@@ -318,36 +319,32 @@ class MainStrategy:
         if now - self._last < self.interval:
             return
 
-        # 15m Supertrend 趋势判断
         df15 = data_mgr.klines["15m"]
+        if len(df15) < 11:  # 至少需要 per+1 = 11 根
+            return
         h15, l15, c15 = df15.high.values, df15.low.values, df15.close.values
         try:
             st_line, st_dir = numba_supertrend(h15, l15, c15, 10, 3)
-        except StopIteration:
-            LOG.error("Numba supertrend StopIteration in MainStrategy, skip")
+        except Exception as e:
+            LOG.error("Supertrend 计算失败 in MainStrategy, skip: %s", e)
             return
 
         up = price > st_line[-1] and st_dir[-1]
         dn = price < st_line[-1] and not st_dir[-1]
 
-        # 1h BB% 强弱判定
         bb1 = data_mgr.klines["1h"].bb_pct.iat[-1]
         strong_long  = bb1 < 0.2
         strong_short = bb1 > 0.8
 
-        # 3m BB% 信号触发
         bb3 = data_mgr.klines["3m"].bb_pct.iat[-1]
         if not (bb3 <= 0 or bb3 >= 1):
             return
 
-        # 决策
         if up:
-            side = "BUY"
-            qty  = 0.12 if strong_long else 0.03
+            side = "BUY";  qty = 0.12 if strong_long else 0.03
             strength = "STRONG" if strong_long else "WEAK"
         elif dn:
-            side = "SELL"
-            qty  = 0.12 if strong_short else 0.03
+            side = "SELL"; qty = 0.12 if strong_short else 0.03
             strength = "STRONG" if strong_short else "WEAK"
         else:
             return
@@ -357,13 +354,12 @@ class MainStrategy:
 
         levels = [0.0025,0.004,0.006,0.008,0.016]
         for lvl in levels:
-            price0 = price * (1 + lvl if side == "BUY" else 1 - lvl)
+            price0 = price * (1 + lvl if side=="BUY" else 1 - lvl)
             await mgr.safe_place("main", side, "LIMIT",
                                  qty=qty, price=price0,
                                  params={"lvl": lvl, "strength": strength})
 
-        # 初始止损 + 止盈
-        sl = price * (0.97 if side == "BUY" else 1.02)
+        sl = price * (0.97 if side=="BUY" else 1.02)
         await mgr.safe_place("main", side, "STOP_MARKET", stop=sl, params={"SL": True})
         await mgr.safe_place("main", side, "TAKE_PROFIT_MARKET", params={"TP": True})
 
@@ -378,7 +374,6 @@ class MACDStrategy:
             return
         prev, cur = df.macd.iat[-2], df.macd.iat[-1]
 
-        # 死叉
         if prev > 0 > cur and not self._in:
             sp = price * 1.005
             LOG.info("MACD death cross → SELL")
@@ -386,8 +381,6 @@ class MACDStrategy:
             await mgr.safe_place("macd", "SELL", "STOP_MARKET", stop=sp*1.03, params={"cross":"death_SL"})
             await mgr.safe_place("macd", "SELL", "TAKE_PROFIT_MARKET", params={"cross":"death_TP"})
             self._in = True
-
-        # 金叉
         elif prev < 0 < cur and self._in:
             bp = price * 0.995
             LOG.info("MACD golden cross → BUY")
@@ -409,7 +402,7 @@ class TripleTrendStrategy:
             return
 
         df = data_mgr.klines["15m"]
-        if len(df) < 12:
+        if len(df) < 13:
             return
 
         h, l, c = df.high.values, df.low.values, df.close.values
@@ -417,8 +410,8 @@ class TripleTrendStrategy:
             _, d1 = numba_supertrend(h, l, c, 10, 1)
             _, d2 = numba_supertrend(h, l, c, 11, 2)
             _, d3 = numba_supertrend(h, l, c, 12, 3)
-        except StopIteration:
-            LOG.error("Numba supertrend StopIteration in TripleTrendStrategy, skip")
+        except Exception as e:
+            LOG.error("Supertrend 计算失败 in TripleTrendStrategy, skip: %s", e)
             return
 
         up = d1[-1] and d2[-1] and d3[-1]
@@ -429,9 +422,9 @@ class TripleTrendStrategy:
             side, self._state = "BUY", "UP"
         elif dn and self._state != "DOWN":
             side, self._state = "SELL","DOWN"
-        elif self._state == "UP" and not up:
+        elif self._state=="UP" and not up:
             side, self._state = "SELL","DOWN"
-        elif self._state == "DOWN" and not dn:
+        elif self._state=="DOWN" and not dn:
             side, self._state = "BUY","UP"
 
         if side:
@@ -538,7 +531,7 @@ async def main():
     await detect_mode()
     await load_symbol_filters()
     await data_mgr.load_history()
-    await pos_tracker.sync()  # 现在 pos_tracker 已定义
+    await pos_tracker.sync()
 
     await asyncio.gather(
         market_ws(),
