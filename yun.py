@@ -284,7 +284,7 @@ class TripleTrendStrategy:
             self._last=now; self.round_active=True; self.entry_price=price
             order_price = price * 0.995
             LOG.info("TRIPLE enter long → LIMIT BUY @%.2f", order_price)
-            await mgr.safe_place("triple","BUY","LIMIT",qty=0.15,price=order_price,params={"enter":"long"})
+            await mgr.safe_place("triple","BUY","LIMIT",qty=0.03,price=order_price,params={"enter":"long"})
             # 固定止损
             sl = price*0.97
             await mgr.safe_place("triple","BUY","STOP_MARKET",stop=sl,params={"stop":"long"})
@@ -294,7 +294,7 @@ class TripleTrendStrategy:
             self._last=now; self.round_active=True; self.entry_price=price
             order_price = price * 1.005
             LOG.info("TRIPLE enter short → LIMIT SELL @%.2f", order_price)
-            await mgr.safe_place("triple","SELL","LIMIT",qty=0.15,price=order_price,params={"enter":"short"})
+            await mgr.safe_place("triple","SELL","LIMIT",qty=0.03,price=order_price,params={"enter":"short"})
             sl = price*1.03
             await mgr.safe_place("triple","SELL","STOP_MARKET",stop=sl,params={"stop":"short"})
 
@@ -399,12 +399,12 @@ class MACDStrategy:
         prev,cur = df.macd.iat[-2],df.macd.iat[-1]
         if prev>0>cur and not self._in:
             sp=price*1.005; LOG.info("MACD death cross→SELL")
-            await mgr.safe_place("macd","SELL","LIMIT",qty=0.15,price=sp)
+            await mgr.safe_place("macd","SELL","LIMIT",qty=0.05,price=sp)
             await mgr.safe_place("macd","SELL","STOP_MARKET",stop=sp*1.03)
             self._in=True
         elif prev<0<cur and self._in:
             bp=price*0.995; LOG.info("MACD golden cross→BUY")
-            await mgr.safe_place("macd","BUY","LIMIT",qty=0.15,price=bp)
+            await mgr.safe_place("macd","BUY","LIMIT",qty=0.05,price=bp)
             await mgr.safe_place("macd","BUY","STOP_MARKET",stop=bp*0.97)
             self._in=False
 
