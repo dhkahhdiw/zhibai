@@ -111,8 +111,8 @@ class PositionTracker:
             self.active = True
 
     def __init__(self):
-        self.positions = {}   # cloid -> Position
-        self.orders = {}      # order_id -> cloid
+        self.positions = {}
+        self.orders = {}
         self.lock = asyncio.Lock()
         self.next_cloid = 1
 
@@ -191,10 +191,8 @@ class DataManager:
                     headers={"X-MBX-APIKEY": Config.API_KEY}
                 )
                 data = await res.json()
-                df = pd.DataFrame([{
-                    "open": float(x[1]), "high": float(x[2]),
-                    "low":  float(x[3]), "close": float(x[4])
-                } for x in data])
+                df = pd.DataFrame([{"open":float(x[1]),"high":float(x[2]),
+                                    "low":float(x[3]),"close":float(x[4])} for x in data])
                 self.klines[tf] = df
                 self.last_ts[tf] = int(data[-1][0])
                 self._compute(tf)
@@ -203,10 +201,14 @@ class DataManager:
     async def update_kline(self, tf, o, h, l, c, ts):
         async with self.lock:
             df = self.klines[tf]
+            # 只对 open/high/low/close 列赋值，避免新增列导致长度不匹配
             if ts > self.last_ts[tf]:
-                df.loc[len(df)] = [o, h, l, c]
+                idx = len(df)
+                df.loc[idx, ["open","high","low","close"]] = [o,h,l,c]
             else:
-                df.iloc[-1] = [o, h, l, c]
+                # 更新最后一行的指定列
+                idx = df.index[-1]
+                df.loc[idx, ["open","high","low","close"]] = [o,h,l,c]
             self.last_ts[tf] = ts
             self._compute(tf)
             self._evt.set()
@@ -223,8 +225,7 @@ class DataManager:
 
     def _compute(self, tf):
         df = self.klines[tf]
-        if len(df) < 20:
-            return
+        if len(df) < 20: return
         m = df.close.rolling(20).mean()
         s = df.close.rolling(20).std()
         df["bb_up"], df["bb_dn"] = m+2*s, m-2*s
@@ -232,8 +233,8 @@ class DataManager:
         if tf == "15m":
             hl2 = (df.high + df.low) / 2
             atr = df.high.rolling(10).max() - df.low.rolling(10).min()
-            df["st"] = hl2 - 3*atr
-            df["macd"] = MACD(df.close, 12, 26, 9).macd_diff()
+            df["st"]   = hl2 - 3*atr
+            df["macd"] = MACD(df.close,12,26,9).macd_diff()
             df["ma7"]  = df.close.rolling(7).mean()
             df["ma25"] = df.close.rolling(25).mean()
             df["ma99"] = df.close.rolling(99).mean()
@@ -247,14 +248,11 @@ def numba_supertrend(h, l, c, per, mult):
     st = [0.0]*n
     dirc = [False]*n
     hl2 = [(h[i]+l[i])/2 for i in range(n)]
-    atr = [
-        max(h[max(0, i-per+1):i+1]) - min(l[max(0, i-per+1):i+1])
-        for i in range(n)
-    ]
+    atr = [ (max(h[max(0,i-per+1):i+1]) - min(l[max(0,i-per+1):i+1])) for i in range(n) ]
     up = [hl2[i] + mult*atr[i] for i in range(n)]
     dn = [hl2[i] - mult*atr[i] for i in range(n)]
     st[0], dirc[0] = up[0], True
-    for i in range(1, n):
+    for i in range(1,n):
         if c[i] > st[i-1]:
             st[i], dirc[i] = max(dn[i], st[i-1]), True
         else:
@@ -272,15 +270,15 @@ class OrderGuard:
         async with self.lock:
             st = self.states[strat]
             now = time.time()
-            if st.get('fp') == fp and now - st.get('ts', 0) < self.cooldown[strat]:
+            if st.get('fp')==fp and now-st.get('ts',0)<self.cooldown[strat]:
                 return False
-            if now - st.get('ts', 0) < self.cooldown[strat]:
+            if now-st.get('ts',0)<self.cooldown[strat]:
                 return False
             return True
 
     async def update(self, strat, fp):
         async with self.lock:
-            self.states[strat] = {'fp': fp, 'ts': time.time()}
+            self.states[strat] = {'fp':fp,'ts':time.time()}
 
 guard = OrderGuard()
 
@@ -296,9 +294,8 @@ class OrderManager:
 
     async def safe_place(self, strat, side, otype, qty=None, price=None, stop=None, extra_params=None):
         fp = f"{strat}|{side}|{otype}|{hash(frozenset((extra_params or {}).items()))}"
-        if not await guard.check(strat, fp):
-            return
-        await self.place(side, otype, qty, price, stop, sig_key=fp, extra_params=extra_params or {})
+        if not await guard.check(strat, fp): return
+        await self.place(side,otype,qty,price,stop,sig_key=fp,extra_params=extra_params or {})
         await guard.update(strat, fp)
 
     async def place(self, side, otype, qty=None, price=None, stop=None,
@@ -306,23 +303,16 @@ class OrderManager:
         await ensure_session()
         ts = int(time.time()*1000 + time_offset)
         params = {
-            "symbol": Config.SYMBOL,
-            "side": side,
-            "type": otype,
-            "timestamp": ts,
-            "recvWindow": Config.RECV_WINDOW
+            "symbol": Config.SYMBOL, "side": side, "type": otype,
+            "timestamp": ts, "recvWindow": Config.RECV_WINDOW
         }
-        if qty is not None:
-            params["quantity"] = f"{quantize(qty, qty_step):.{qty_prec}f}"
-        if price is not None:
-            params["price"] = f"{quantize(price, price_step):.{price_prec}f}"
-        if stop is not None:
-            params["stopPrice"] = f"{quantize(stop, price_step):.{price_prec}f}"
-        if otype == "LIMIT":
-            params["timeInForce"] = "GTC"
-        if otype in ("STOP_MARKET", "TAKE_PROFIT_MARKET", "MARKET"):
+        if qty   is not None: params["quantity"]  = f"{quantize(qty, qty_step):.{qty_prec}f}"
+        if price is not None: params["price"]     = f"{quantize(price, price_step):.{price_prec}f}"
+        if stop  is not None: params["stopPrice"] = f"{quantize(stop, price_step):.{price_prec}f}"
+        if otype=="LIMIT":    params["timeInForce"] = "GTC"
+        if otype in ("STOP_MARKET","TAKE_PROFIT_MARKET","MARKET"):
             params["closePosition"] = "true"
-        if is_hedge and otype in ("LIMIT", "MARKET"):
+        if is_hedge and otype in ("LIMIT","MARKET"):
             params["positionSide"] = "LONG" if side=="BUY" else "SHORT"
         params.update(extra_params or {})
 
@@ -334,23 +324,19 @@ class OrderManager:
             r = await session.post(url, headers=headers)
             text = await r.text()
             tag = f"[{sig_key}]" if sig_key else ""
-            if r.status == 200:
+            if r.status==200:
                 data = await r.json()
                 LOG.info(f"Order OK {otype} {side} {tag}")
-                # 若为策略限价单且已有成交，记录仓位
-                if sig_key and otype == "LIMIT":
-                    exec_qty = float(data.get('executedQty', 0))
-                    sl = extra_params.get('sl')
-                    tp = extra_params.get('tp')
-                    if exec_qty > 0 and sl is not None and tp is not None:
-                        price_filled = float(data.get('price', 0))
+                # 仅在限价策略单成交后创建仓位
+                if sig_key and otype=="LIMIT":
+                    exec_qty = float(data.get('executedQty',0))
+                    sl = extra_params.get('sl'); tp = extra_params.get('tp')
+                    if exec_qty>0 and sl is not None and tp is not None:
+                        price_filled = float(data.get('price',0))
                         await pos_tracker.on_fill(
                             order_id=data['orderId'],
-                            side=side,
-                            qty=exec_qty,
-                            price=price_filled,
-                            sl=sl,
-                            tp=tp
+                            side=side, qty=exec_qty,
+                            price=price_filled, sl=sl, tp=tp
                         )
             else:
                 LOG.error(f"Order ERR {otype} {side} {tag}: {text}")
@@ -489,7 +475,7 @@ class MACDStrategy:
             await mgr.safe_place("macd", "BUY", "LIMIT", qty=0.15, price=bp, extra_params={'sl': bp*0.97, 'tp': bp*1.03})
             self._in = False
 
-strategies = [MainStrategy(), MACDStrategy(), TripleTrendStrategy()]
+strategies = [ MainStrategy(), MACDStrategy(), TripleTrendStrategy() ]
 
 # —— WS 市场 ——
 async def market_ws():
@@ -499,15 +485,15 @@ async def market_ws():
             async with websockets.connect(Config.WS_MARKET, ping_interval=None) as ws:
                 retry = 0
                 async for msg in ws:
-                    o = json.loads(msg)
-                    s, d = o["stream"], o["data"]
+                    o = json.loads(msg); s,d = o["stream"],o["data"]
                     if s.endswith("@markPrice"):
                         await data_mgr.track_price(float(d["p"]), int(time.time()*1000))
                     else:
                         tf = s.split("@")[1].split("_")[1]
                         k = d["k"]
                         await data_mgr.update_kline(tf,
-                            float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), k["t"]
+                            float(k["o"]), float(k["h"]),
+                            float(k["l"]), float(k["c"]), k["t"]
                         )
         except Exception as e:
             delay = min(2**retry, 30)
@@ -524,45 +510,39 @@ async def user_ws():
                 retry = 0
                 ts = int(time.time()*1000 + time_offset)
                 params = {"apiKey": Config.ED25519_API, "timestamp": ts}
-                payload = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+                payload = "&".join(f"{k}={v}" for k,v in sorted(params.items()))
                 sig = base64.b64encode(ed_priv.sign(payload.encode())).decode()
                 params["signature"] = sig
                 await ws.send(json.dumps({
-                    "id": str(uuid.uuid4()),
-                    "method": "session.logon",
-                    "params": params
+                    "id": str(uuid.uuid4()), "method": "session.logon", "params": params
                 }))
                 async for msg in ws:
                     r = json.loads(msg)
                     method = r.get("method") or r.get("e")
-                    if method in ("executionReport", "order.update"):
-                        o = r.get("params", r.get("result", r.get("o", {})))
-                        order_id = o.get('orderId') or o.get('i')
-                        status   = o.get('status')  or o.get('X')
-                        await pos_tracker.on_order_update(order_id, status)
+                    if method in ("executionReport","order.update"):
+                        o = r.get("params", r.get("result", r.get("o",{})))
+                        oid = o.get('orderId') or o.get('i')
+                        status = o.get('status') or o.get('X')
+                        await pos_tracker.on_order_update(oid, status)
         except Exception as e:
             LOG.error(f"[WS USER] {e}, reconnecting in 5s")
             await asyncio.sleep(5)
             retry += 1
 
-# —— 维护 & 主引擎 ——
+# —— 维护 & 执行 ——
 async def maintenance():
     while True:
         await asyncio.sleep(Config.SYNC_INTERVAL)
-        await sync_time()
-        await detect_mode()
-        await pos_tracker.sync()
+        await sync_time(); await detect_mode(); await pos_tracker.sync()
 
 async def engine():
     while True:
         await data_mgr.wait_update()
-        if data_mgr.price is None or time.time() - data_mgr.ptime > 60:
+        if data_mgr.price is None or time.time()-data_mgr.ptime>60:
             continue
         for strat in strategies:
-            try:
-                await strat.check(data_mgr.price)
-            except Exception:
-                LOG.exception(f"Strat {strat.__class__.__name__} failed")
+            try: await strat.check(data_mgr.price)
+            except: LOG.exception(f"Strat {strat.__class__.__name__} failed")
 
 async def main():
     global session
@@ -571,11 +551,8 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(session.close()))
 
-    await sync_time()
-    await detect_mode()
-    await load_symbol_filters()
-    await data_mgr.load_history()
-    await pos_tracker.sync()
+    await sync_time(); await detect_mode(); await load_symbol_filters()
+    await data_mgr.load_history(); await pos_tracker.sync()
     await asyncio.gather(market_ws(), user_ws(), maintenance(), engine())
 
 if __name__ == '__main__':
