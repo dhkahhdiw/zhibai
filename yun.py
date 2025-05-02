@@ -85,7 +85,9 @@ class PositionTracker:
         __slots__ = ('cloid','side','qty','entry_price','sl_price','tp_price','active')
         def __init__(self, cloid, side, qty, entry, sl, tp):
             self.cloid = cloid
-            self.side = side
+            # 直接使用买/卖方向判断
+            # BUY -> 多头，SELL -> 空头
+            self.side = side      # 'BUY' 或 'SELL'
             self.qty = qty
             self.entry_price = entry
             self.sl_price = sl
@@ -99,44 +101,70 @@ class PositionTracker:
         self.next_cloid = 1
 
     async def on_fill(self, order_id, side, qty, price, sl, tp):
+        """订单成交后调用，记录本地仓位并下远程 SL/TP"""
         async with self.lock:
-            cloid = self.next_cloid; self.next_cloid += 1
+            cloid = self.next_cloid
+            self.next_cloid += 1
             pos = self.Position(cloid, side, qty, price, sl, tp)
             self.positions[cloid] = pos
             self.orders[order_id] = cloid
             LOG.info(f"[PT] Opened cloid={cloid}, side={side}, qty={qty}, entry={price}, SL={sl}, TP={tp}")
-        # 远程止损 & 止盈单
-        close_side = 'SELL' if side=='LONG' else 'BUY'
-        await mgr.place(close_side, 'STOP_MARKET', qty=qty, stop=sl, extra_params={'closePosition':'true'})
-        await mgr.place(close_side, 'TAKE_PROFIT_MARKET', qty=qty, stop=tp, extra_params={'closePosition':'true'})
+
+        # 远程止损止盈单
+        # 对 BUY（多头）下 SELL 类型的 SL/TP；反之亦然
+        close_side = 'SELL' if side == 'BUY' else 'BUY'
+        # 市价触发止损
+        await mgr.place(close_side, 'STOP_MARKET',
+                        qty=qty, stop=sl,
+                        extra_params={'closePosition':'true'})
+        # 市价触发止盈
+        await mgr.place(close_side, 'TAKE_PROFIT_MARKET',
+                        qty=qty, stop=tp,
+                        extra_params={'closePosition':'true'})
 
     async def on_order_update(self, order_id, status):
+        """远程订单更新，同步本地状态"""
         async with self.lock:
-            if order_id not in self.orders: return
-            cloid = self.orders[order_id]; pos = self.positions.get(cloid)
-            if not pos: return
+            if order_id not in self.orders:
+                return
+            cloid = self.orders[order_id]
+            pos = self.positions.get(cloid)
+            if not pos:
+                return
             if status in ('FILLED','CANCELED'):
                 pos.active = False
                 LOG.info(f"[PT] Closed cloid={cloid} via remote update")
 
     async def check_trigger(self, price):
+        """本地价格推送时触发，双保险机制"""
         async with self.lock:
             for pos in list(self.positions.values()):
-                if not pos.active: continue
-                if (pos.side=='LONG'  and (price <= pos.sl_price or price >= pos.tp_price)) or \
-                   (pos.side=='SHORT' and (price >= pos.sl_price or price <= pos.tp_price)):
-                    await self.close_position(pos, price)
+                if not pos.active:
+                    continue
+                # 多头：BUY，空头：SELL
+                if pos.side == 'BUY':
+                    # 多头到达止损或止盈
+                    if price <= pos.sl_price or price >= pos.tp_price:
+                        await self.close_position(pos, price)
+                else:
+                    # 空头 SELL 到达止损（价格上破）或止盈（价格下破）
+                    if price >= pos.sl_price or price <= pos.tp_price:
+                        await self.close_position(pos, price)
 
     async def close_position(self, pos, trigger_price):
-        side = 'SELL' if pos.side=='LONG' else 'BUY'
+        """本地触发平仓：市价全平"""
+        side = 'SELL' if pos.side == 'BUY' else 'BUY'
         LOG.info(f"[PT] Local trigger close cloid={pos.cloid} via MARKET {side} @price={trigger_price}")
         try:
-            await mgr.place(side, 'MARKET', qty=pos.qty, extra_params={'closePosition':'true'})
+            await mgr.place(side, 'MARKET',
+                            qty=pos.qty,
+                            extra_params={'closePosition':'true'})
             pos.active = False
         except Exception as e:
             LOG.error(f"[PT] close_position failed: {e}")
 
     async def sync(self):
+        """定期同步远程持仓，仅供监控"""
         ts = int(time.time()*1000 + time_offset)
         qs = urllib.parse.urlencode({'timestamp': ts, 'recvWindow': Config.RECV_WINDOW})
         sig = hmac.new(Config.SECRET_KEY, qs.encode(), hashlib.sha256).hexdigest()
