@@ -226,7 +226,7 @@ class OrderGuard:
     def __init__(self):
         self.states = defaultdict(dict)
         self.lock   = asyncio.Lock()
-        self.cooldown = {"main":360, "macd":360, "triple":360}
+        self.cooldown = {"main":361, "macd":360, "triple":360}
 
     async def check(self, strat, fp, trend):
         async with self.lock:
