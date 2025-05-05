@@ -400,11 +400,11 @@ class TripleTrendStrategy:
         if up_all and not self.round_active:
             self.round_active=True
             p0,sl,tp = price*0.995, price*0.97, price*1.02
-            await mgr.safe_place("triple","BUY","LIMIT",qty=0.15,price=p0,extra_params={'sl':sl,'tp':tp})
+            await mgr.safe_place("triple","BUY","LIMIT",qty=0.015,price=p0,extra_params={'sl':sl,'tp':tp})
         elif dn_all and not self.round_active:
             self.round_active=True
             p0,sl,tp = price*1.005, price*1.03, price*0.98
-            await mgr.safe_place("triple","SELL","LIMIT",qty=0.15,price=p0,extra_params={'sl':sl,'tp':tp})
+            await mgr.safe_place("triple","SELL","LIMIT",qty=0.015,price=p0,extra_params={'sl':sl,'tp':tp})
         elif flip_dn:
             await mgr.safe_place("triple","SELL","MARKET"); self.round_active=False
         elif flip_up:
