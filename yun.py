@@ -31,12 +31,13 @@ class Config:
     ED25519_KEY   = os.getenv('ED25519_KEY_PATH')
     REST_BASE     = 'https://fapi.binance.com'
     WS_MARKET     = f"wss://fstream.binance.com/stream?streams={PAIR}@kline_3m/{PAIR}@kline_15m/{PAIR}@kline_1h/{PAIR}@markPrice"
-    WS_USER       = 'wss://ws-fapi.binance.com/ws-fapi/v1'
+    WS_USER       = 'wss://fstream.binance.com/ws/'  # 修正WebSocket地址
     RECV_WINDOW   = 5000
-    SYNC_INTERVAL = 300
+    SYNC_INTERVAL = 60
 
 # —— 全局状态 ——
 session: aiohttp.ClientSession = None
+listen_key = None
 time_offset = 0
 is_hedge = False
 price_step = qty_step = None
@@ -105,14 +106,13 @@ class PositionTracker:
             self.positions[cloid] = pos
             self.orders[order_id] = cloid
             LOG.info(f"[PT] Opened cloid={cloid}, side={side}, qty={qty}, entry={price}, SL={sl}, TP={tp}")
-        # 远程止损止盈
+        # 修正止盈止损订单参数
         close_side = 'SELL' if side=='BUY' else 'BUY'
-        # STOP_MARKET
+        # 使用closePosition代替quantity
         await mgr.place(close_side, 'STOP_MARKET', stop=sl,
-                        extra_params={'closePosition':'true','quantity':f"{qty:.{qty_prec}f}"})
-        # TAKE_PROFIT_MARKET
+                        extra_params={'closePosition':'true'})
         await mgr.place(close_side, 'TAKE_PROFIT_MARKET', stop=tp,
-                        extra_params={'closePosition':'true','quantity':f"{qty:.{qty_prec}f}"})
+                        extra_params={'closePosition':'true'})
 
     async def on_order_update(self, order_id, status):
         async with self.lock:
@@ -141,7 +141,6 @@ class PositionTracker:
         side = 'SELL' if pos.side=='BUY' else 'BUY'
         LOG.info(f"[PT] Local trigger close cloid={pos.cloid} MARKET {side}@{price}")
         try:
-            # 市价平仓，需带 qty，且不带 closePosition
             await mgr.place(side, 'MARKET', qty=pos.qty)
             pos.active = False
         except Exception as e:
@@ -261,6 +260,30 @@ async def ensure_session():
     if session is None or session.closed:
         session = aiohttp.ClientSession()
 
+# —— 获取listenKey ——
+async def get_listen_key():
+    ts = int(time.time()*1000 + time_offset)
+    payload = f"timestamp={ts}"
+    signature = base64.b64encode(ed_priv.sign(payload.encode())).decode()
+    headers = {"X-MBX-APIKEY": Config.ED25519_API}
+    async with session.post(
+        f"{Config.REST_BASE}/fapi/v1/listenKey",
+        headers=headers,
+        params={"signature": signature, "timestamp": ts}
+    ) as response:
+        data = await response.json()
+        return data['listenKey']
+
+# —— 定期更新listenKey ——
+async def keepalive_listen_key():
+    while True:
+        await asyncio.sleep(1800)  # 30分钟更新一次
+        try:
+            listen_key = await get_listen_key()
+            LOG.info("ListenKey renewed")
+        except Exception as e:
+            LOG.error(f"ListenKey renewal failed: {e}")
+
 # —— 下单管理 ——
 class OrderManager:
     def __init__(self):
@@ -283,10 +306,10 @@ class OrderManager:
         if price is not None: params["price"]     = f"{quantize(price,price_step):.{price_prec}f}"
         if stop  is not None: params["stopPrice"] = f"{quantize(stop,price_step):.{price_prec}f}"
         if otype=="LIMIT":    params["timeInForce"]="GTC"
-        # 仅 STOP_MARKET/TAKE_PROFIT_MARKET 带 closePosition
+        # 修正止盈止损参数
         if otype in ("STOP_MARKET","TAKE_PROFIT_MARKET"):
-            params["closePosition"]="true"
-        # 对冲模式下标注方向
+            params["closePosition"] = "true"
+            params.pop("quantity", None)  # 确保不传递quantity参数
         if is_hedge and otype in ("LIMIT","MARKET"):
             params["positionSide"]="LONG" if side=="BUY" else "SHORT"
         params.update(extra_params or {})
@@ -321,10 +344,8 @@ class MainStrategy:
         if now-self._last<self.interval: return
         df15 = data_mgr.klines["15m"]
         if len(df15)<99: return
-        # MA 前置过滤
         ma7,ma25,ma99 = df15.ma7.iat[-1], df15.ma25.iat[-1], df15.ma99.iat[-1]
         if not (price<ma7<ma25<ma99 or price>ma7>ma25>ma99): return
-        # Supertrend 判断趋势
         h,l,c = df15.high.values, df15.low.values, df15.close.values
         st_line, st_dir = numba_supertrend(h,l,c,10,3)
         trend_up = price>st_line[-1] and st_dir[-1]
@@ -332,7 +353,6 @@ class MainStrategy:
         bb3 = data_mgr.klines["3m"].bb_pct.iat[-1]
         if not (bb3<=0 or bb3>=1): return
         side = "BUY" if bb3<=0 else "SELL"
-        # 网格+SL/TP
         bb1 = data_mgr.klines["1h"].bb_pct.iat[-1]
         strong = bb1<0.2 or bb1>0.8
         if strong:
@@ -349,7 +369,6 @@ class MainStrategy:
             sl=price*0.98 if side=="BUY" else price*1.02
             tp=price*(1+0.01 if side=="BUY" else 1-0.01)
             await mgr.safe_place("main", side, "LIMIT", qty=sz, price=p0, extra_params={'sl':sl,'tp':tp})
-        # 止损
         sl = price*0.98 if side=="BUY" else price*1.02
         await mgr.safe_place("main", side, "STOP_MARKET", stop=sl)
 
@@ -359,7 +378,6 @@ class MACDStrategy:
     async def check(self, price):
         df = data_mgr.klines["15m"]
         if len(df)<30 or "macd" not in df: return
-        # MA 前置
         ma7,ma25,ma99 = df.ma7.iat[-1], df.ma25.iat[-1], df.ma99.iat[-1]
         if not (price<ma7<ma25<ma99 or price>ma7>ma25>ma99): return
         prev, curr = df.macd.iat[-2], df.macd.iat[-1]
@@ -381,7 +399,6 @@ class TripleTrendStrategy:
         if now-self._last<1: return
         df = data_mgr.klines["15m"]
         if len(df)<99: return
-        # MA 前置
         ma7,ma25,ma99 = df.ma7.iat[-1], df.ma25.iat[-1], df.ma99.iat[-1]
         if not (price<ma7<ma25<ma99 or price>ma7>ma25>ma99): return
         h,l,c = df.high.values, df.low.values, df.close.values
@@ -429,25 +446,18 @@ async def market_ws():
             await asyncio.sleep(delay); retry+=1
 
 async def user_ws():
+    global listen_key
     retry=0
     while True:
         try:
-            async with websockets.connect(Config.WS_USER, ping_interval=None) as ws:
-                retry=0
-                ts=int(time.time()*1000+time_offset)
-                params={"apiKey":Config.ED25519_API,"timestamp":ts}
-                payload="&".join(f"{k}={v}" for k,v in sorted(params.items()))
-                sig=base64.b64encode(ed_priv.sign(payload.encode())).decode()
-                params["signature"]=sig
-                await ws.send(json.dumps({"id":str(uuid.uuid4()),"method":"session.logon","params":params}))
+            listen_key = await get_listen_key()
+            async with websockets.connect(Config.WS_USER + listen_key) as ws:
+                LOG.info(f"Connected to user stream: {listen_key}")
                 async for msg in ws:
-                    r=json.loads(msg)
-                    method=r.get("method") or r.get("e")
-                    if method in("executionReport","order.update"):
-                        o=r.get("params",r.get("result",r.get("o",{})))
-                        oid=o.get('orderId') or o.get('i')
-                        st=o.get('status') or o.get('X')
-                        await pos_tracker.on_order_update(oid,st)
+                    data = json.loads(msg)
+                    if 'e' in data and data['e'] == 'ORDER_TRADE_UPDATE':
+                        order = data['o']
+                        await pos_tracker.on_order_update(order['i'], order['X'])
         except Exception as e:
             LOG.error(f"[WS USER] {e}, reconnect in 5s"); await asyncio.sleep(5); retry+=1
 
@@ -473,7 +483,13 @@ async def main():
 
     await sync_time(); await detect_mode(); await load_symbol_filters()
     await data_mgr.load_history(); await pos_tracker.sync()
-    await asyncio.gather(market_ws(), user_ws(), maintenance(), engine())
+    await asyncio.gather(
+        market_ws(),
+        user_ws(),
+        maintenance(),
+        engine(),
+        keepalive_listen_key()  # 新增listenKey保活
+    )
 
 if __name__=='__main__':
     asyncio.run(main())
