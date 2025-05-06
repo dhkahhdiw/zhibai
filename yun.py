@@ -35,19 +35,21 @@ sh = logging.StreamHandler()
 sh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
 LOG.addHandler(sh)
 
+
 # —— 配置 ——
 class Config:
-    SYMBOL        = 'ETHUSDC'
-    PAIR          = SYMBOL.lower()
-    API_KEY       = os.getenv('BINANCE_API_KEY')
-    SECRET_KEY    = os.getenv('BINANCE_SECRET_KEY').encode()
-    ED25519_API   = os.getenv('ED25519_API_KEY')
-    ED25519_KEY   = os.getenv('ED25519_KEY_PATH')
-    REST_BASE     = 'https://fapi.binance.com'
-    WS_MARKET     = f"wss://fstream.binance.com/stream?streams={PAIR}@kline_3m/{PAIR}@kline_15m/{PAIR}@kline_1h/{PAIR}@markPrice"
-    WS_USER       = 'wss://ws-fapi.binance.com/ws-fapi/v1'
-    RECV_WINDOW   = 5000
+    SYMBOL = 'ETHUSDC'
+    PAIR = SYMBOL.lower()
+    API_KEY = os.getenv('BINANCE_API_KEY')
+    SECRET_KEY = os.getenv('BINANCE_SECRET_KEY').encode()
+    ED25519_API = os.getenv('ED25519_API_KEY')
+    ED25519_KEY = os.getenv('ED25519_KEY_PATH')
+    REST_BASE = 'https://fapi.binance.com'
+    WS_MARKET = f"wss://fstream.binance.com/stream?streams={PAIR}@kline_3m/{PAIR}@kline_15m/{PAIR}@kline_1h/{PAIR}@markPrice"
+    WS_USER = 'wss://ws-fapi.binance.com/ws-fapi/v1'
+    RECV_WINDOW = 5000
     SYNC_INTERVAL = 300
+
 
 # —— 全局状态 ——
 session: aiohttp.ClientSession = None
@@ -61,42 +63,48 @@ with open(Config.ED25519_KEY, 'rb') as f:
     ed_priv = load_pem_private_key(f.read(), password=None)
 LOG.info("Ed25519 key loaded")
 
+
 def quantize(val: float, step: float) -> float:
-    return math.floor(val/step) * step
+    return math.floor(val / step) * step
+
 
 # —— 时间同步 & 模式检测 ——
 async def sync_time():
     global time_offset
     data = await (await session.get(f"{Config.REST_BASE}/fapi/v1/time")).json()
-    time_offset = data['serverTime'] - int(time.time()*1000)
+    time_offset = data['serverTime'] - int(time.time() * 1000)
     LOG.debug(f"Time offset: {time_offset}ms")
+
 
 async def detect_mode():
     global is_hedge
-    ts = int(time.time()*1000 + time_offset)
+    ts = int(time.time() * 1000 + time_offset)
     qs = urllib.parse.urlencode({'timestamp': ts, 'recvWindow': Config.RECV_WINDOW})
     sig = hmac.new(Config.SECRET_KEY, qs.encode(), hashlib.sha256).hexdigest()
     url = f"{Config.REST_BASE}/fapi/v1/positionSide/dual?{qs}&signature={sig}"
-    data = await (await session.get(url, headers={'X‑MBX‑APIKEY': Config.API_KEY})).json()
+    data = await (await session.get(url, headers={'X-MBX-APIKEY': Config.API_KEY})).json()
     is_hedge = data.get('dualSidePosition', False)
     LOG.info(f"Hedge mode: {is_hedge}")
+
 
 # —— 精度加载 ——
 async def load_symbol_filters():
     global price_step, qty_step, price_prec, qty_prec
     info = await (await session.get(f"{Config.REST_BASE}/fapi/v1/exchangeInfo")).json()
-    sym = next(s for s in info['symbols'] if s['symbol']==Config.SYMBOL)
-    pf = next(f for f in sym['filters'] if f['filterType']=='PRICE_FILTER')
-    ls = next(f for f in sym['filters'] if f['filterType']=='LOT_SIZE')
+    sym = next(s for s in info['symbols'] if s['symbol'] == Config.SYMBOL)
+    pf = next(f for f in sym['filters'] if f['filterType'] == 'PRICE_FILTER')
+    ls = next(f for f in sym['filters'] if f['filterType'] == 'LOT_SIZE')
     price_step, qty_step = float(pf['tickSize']), float(ls['stepSize'])
     price_prec = int(round(-math.log10(price_step)))
-    qty_prec   = int(round(-math.log10(qty_step)))
+    qty_prec = int(round(-math.log10(qty_step)))
     LOG.info(f"Filters: price_step={price_step}, qty_step={qty_step}")
+
 
 # —— 持仓＆止盈止损管理 ——
 class PositionTracker:
     class Pos:
-        __slots__ = ('cloid','side','qty','entry','sl','tp','active','sl_id','tp_id')
+        __slots__ = ('cloid', 'side', 'qty', 'entry', 'sl', 'tp', 'active', 'sl_id', 'tp_id')
+
         def __init__(self, cloid, side, qty, entry, sl, tp, sl_id, tp_id):
             self.cloid, self.side, self.qty = cloid, side, qty
             self.entry, self.sl, self.tp = entry, sl, tp
@@ -104,70 +112,76 @@ class PositionTracker:
             self.sl_id, self.tp_id = sl_id, tp_id
 
     def __init__(self):
-        self.positions = {}     # cloid -> Pos
-        self.order_map = {}     # orderId -> cloid
+        self.positions = {}  # cloid -> Pos
+        self.order_map = {}  # orderId -> cloid
         self.lock = asyncio.Lock()
         self.next_cloid = 1
 
     async def on_fill(self, order: dict, side, qty, price, sl, tp):
-        """限价单成交回调，注册本地跟踪并下 SL/TP 市价单"""
+        """限价单成交回调，下挂远程 SL/TP 并本地注册"""
         async with self.lock:
-            cloid = self.next_cloid; self.next_cloid+=1
-            # 下远程止损/止盈市价单，并获取它们的 orderId
-            close_side = 'SELL' if side=='BUY' else 'BUY'
-            sl_res = await mgr.place(close_side, 'STOP_MARKET',
-                                     qty=qty, stop=sl,
-                                     extra_params={'closePosition':'true'}, return_id=True)
-            tp_res = await mgr.place(close_side, 'TAKE_PROFIT_MARKET',
-                                     qty=qty, stop=tp,
-                                     extra_params={'closePosition':'true'}, return_id=True)
-            pos = self.Pos(cloid, side, qty, price, sl, tp,
-                           sl_id=sl_res, tp_id=tp_res)
+            cloid = self.next_cloid;
+            self.next_cloid += 1
+            close_side = 'SELL' if side == 'BUY' else 'BUY'
+            sl_id = await mgr.place(close_side, 'STOP_MARKET',
+                                    qty=qty, stop=sl,
+                                    extra_params={'closePosition': 'true'},
+                                    return_id=True)
+            tp_id = await mgr.place(close_side, 'TAKE_PROFIT_MARKET',
+                                    qty=qty, stop=tp,
+                                    extra_params={'closePosition': 'true'},
+                                    return_id=True)
+            pos = self.Pos(cloid, side, qty, price, sl, tp, sl_id, tp_id)
             self.positions[cloid] = pos
             self.order_map[order['orderId']] = cloid
-            LOG.info(f"[PT] Opened cloid={cloid} {side}@{price:.4f}, SL={sl:.4f}({sl_res}), TP={tp:.4f}({tp_res})")
+            LOG.info(f"[PT] Opened cloid={cloid} {side}@{price:.4f} SL={sl:.4f}({sl_id}) TP={tp:.4f}({tp_id})")
 
     async def on_order_update(self, order_id, status):
         async with self.lock:
-            # 远程 SL/TP 已执行或取消，标记本地 pos inactive
+            # 远程 SL/TP 执行或取消
             for pos in self.positions.values():
                 if order_id in (pos.sl_id, pos.tp_id):
-                    pos.active=False
+                    pos.active = False
                     LOG.info(f"[PT] Remote SL/TP triggered for cloid={pos.cloid}")
                     return
-            # 常规限价单被完全成交后 on_fill 已处理
-            if order_id in self.order_map and status in ('FILLED','CANCELED'):
-                cloid = self.order_map[order_id]
-                self.positions[cloid].active=False
-                LOG.info(f"[PT] Position closed remote for cloid={cloid}")
+            # 限价单被成交/取消
+            if order_id in self.order_map and status in ('FILLED', 'CANCELED'):
+                cl = self.order_map[order_id]
+                self.positions[cl].active = False
+                LOG.info(f"[PT] Position closed remote for cloid={cl}")
 
     async def check_trigger(self, price):
-        """本地价格检查，备份触发"""
+        """本地触发备份：先 cancel 远程单，再市价平仓"""
         async with self.lock:
             for pos in list(self.positions.values()):
                 if not pos.active: continue
-                hit_sl = (pos.side=='BUY' and price<=pos.sl) or (pos.side=='SELL' and price>=pos.sl)
-                hit_tp = (pos.side=='BUY' and price>=pos.tp) or (pos.side=='SELL' and price<=pos.tp)
+                hit_sl = (pos.side == 'BUY' and price <= pos.sl) or (pos.side == 'SELL' and price >= pos.sl)
+                hit_tp = (pos.side == 'BUY' and price >= pos.tp) or (pos.side == 'SELL' and price <= pos.tp)
                 if hit_sl or hit_tp:
                     LOG.info(f"[PT] Local trigger cloid={pos.cloid} price={price:.4f}")
-                    # 清除远程挂单
-                    await mgr.cancel(pos.sl_id); await mgr.cancel(pos.tp_id)
-                    # 本地市价平仓
-                    close = 'SELL' if pos.side=='BUY' else 'BUY'
-                    await mgr.place(close, 'MARKET', qty=pos.qty, extra_params={})
-                    pos.active=False
+                    await mgr.cancel(pos.sl_id);
+                    await mgr.cancel(pos.tp_id)
+                    close = 'SELL' if pos.side == 'BUY' else 'BUY'
+                    await mgr.place(close, 'MARKET', qty=pos.qty)
+                    pos.active = False
 
     async def sync(self):
-        ts = int(time.time()*1000+time_offset)
-        qs = urllib.parse.urlencode({'timestamp':ts,'recvWindow':Config.RECV_WINDOW})
+        """同步远程仓位风险；保证返回是 List，再迭代"""
+        ts = int(time.time() * 1000 + time_offset)
+        qs = urllib.parse.urlencode({'timestamp': ts, 'recvWindow': Config.RECV_WINDOW})
         sig = hmac.new(Config.SECRET_KEY, qs.encode(), hashlib.sha256).hexdigest()
         url = f"{Config.REST_BASE}/fapi/v2/positionRisk?{qs}&signature={sig}"
-        res = await (await session.get(url, headers={'X‑MBX‑APIKEY':Config.API_KEY})).json()
-        for p in res:
-            if p['symbol']==Config.SYMBOL:
-                LOG.debug(f"[PT] Remote pos amt={p['positionAmt']} side={p.get('positionSide')}")
+        data = await (await session.get(url, headers={'X-MBX-APIKEY': Config.API_KEY})).json()
+        if isinstance(data, list):
+            for p in data:
+                if p.get('symbol') == Config.SYMBOL:
+                    LOG.debug(f"[PT] Remote pos amt={p['positionAmt']} side={p.get('positionSide')}")
+        else:
+            LOG.error(f"[PT] positionRisk unexpected response: {data}")
+
 
 pos_tracker = PositionTracker()
+
 
 # —— 数据管理 ——
 class DataManager:
@@ -477,20 +491,7 @@ async def user_ws():
         except:
             await asyncio.sleep(5); retry+=1
 
-# —— 维护、引擎 ——
-async def maintenance():
-    while True:
-        await asyncio.sleep(Config.SYNC_INTERVAL)
-        await sync_time(); await detect_mode(); await pos_tracker.sync()
-
-async def engine():
-    while True:
-        await data_mgr.wait_update()
-        if data_mgr.price is None or time.time()-data_mgr.ptime>60: continue
-        for strat in strategies:
-            try: await strat.check(data_mgr.price)
-            except: LOG.exception(f"Strategy {strat} failed")
-
+# —— 启动 ——
 async def main():
     global session
     session = aiohttp.ClientSession()
@@ -498,11 +499,20 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(session.close()))
 
-    await sync_time(); await detect_mode()
-    await load_symbol_filters(); await data_mgr.load_history()
+    await sync_time()
+    await detect_mode()
+    await load_symbol_filters()
+    await data_mgr.load_history()
     await pos_tracker.sync()
-    # 并行启动
-    await asyncio.gather(market_ws(), user_ws(), maintenance(), engine())
 
-if __name__=='__main__':
+    # 并行运行
+    await asyncio.gather(
+        market_ws(),
+        user_ws(),
+        maintenance(),
+        engine(),
+    )
+
+
+if __name__ == '__main__':
     asyncio.run(main())
