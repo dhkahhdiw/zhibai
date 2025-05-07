@@ -33,8 +33,8 @@ class Config:
     WS_MARKET     = f"wss://fstream.binance.com/stream?streams={PAIR}@kline_3m/{PAIR}@kline_15m/{PAIR}@kline_1h/{PAIR}@markPrice"
     WS_USER       = 'wss://fstream.binance.com/ws/'  # 修正WebSocket地址
     RECV_WINDOW   = 5000
-    SYNC_INTERVAL = 300
-    ROTATION_COOLDOWN = 3600  # 轮流冷却 1 小时
+    SYNC_INTERVAL = 60
+    ROTATION_COOLDOWN = 3000  # 轮流冷却 1 小时
 
 # —— 全局状态 ——
 session: aiohttp.ClientSession = None
