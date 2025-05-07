@@ -33,7 +33,8 @@ class Config:
     WS_MARKET     = f"wss://fstream.binance.com/stream?streams={PAIR}@kline_3m/{PAIR}@kline_15m/{PAIR}@kline_1h/{PAIR}@markPrice"
     WS_USER       = 'wss://fstream.binance.com/ws/'  # 修正WebSocket地址
     RECV_WINDOW   = 5000
-    SYNC_INTERVAL = 60
+    SYNC_INTERVAL = 300
+    ROTATION_COOLDOWN = 3600  # 轮流冷却 1 小时
 
 # —— 全局状态 ——
 session: aiohttp.ClientSession = None
@@ -86,7 +87,7 @@ class PositionTracker:
         __slots__ = ('cloid','side','qty','entry_price','sl_price','tp_price','active')
         def __init__(self, cloid, side, qty, entry, sl, tp):
             self.cloid = cloid
-            self.side = side      # 'BUY' or 'SELL'
+            self.side = side
             self.qty = qty
             self.entry_price = entry
             self.sl_price = sl
@@ -106,13 +107,10 @@ class PositionTracker:
             self.positions[cloid] = pos
             self.orders[order_id] = cloid
             LOG.info(f"[PT] Opened cloid={cloid}, side={side}, qty={qty}, entry={price}, SL={sl}, TP={tp}")
-        # 修正止盈止损订单参数
+        # 下发止盈止损单
         close_side = 'SELL' if side=='BUY' else 'BUY'
-        # 使用closePosition代替quantity
-        await mgr.place(close_side, 'STOP_MARKET', stop=sl,
-                        extra_params={'closePosition':'true'})
-        await mgr.place(close_side, 'TAKE_PROFIT_MARKET', stop=tp,
-                        extra_params={'closePosition':'true'})
+        await mgr.place(close_side, 'STOP_MARKET', stop=sl, extra_params={'closePosition':'true'})
+        await mgr.place(close_side, 'TAKE_PROFIT_MARKET', stop=tp, extra_params={'closePosition':'true'})
 
     async def on_order_update(self, order_id, status):
         async with self.lock:
@@ -154,7 +152,7 @@ class PositionTracker:
         res = await (await session.get(url, headers={'X-MBX-APIKEY': Config.API_KEY})).json()
         for p in res:
             if p['symbol']==Config.SYMBOL:
-                LOG.debug(f"[PT] Remote pos: amt={p['positionAmt']} side={p.get('positionSide')}")
+                LOG.debug(f"[PT] Remote pos: amt={p['positionAmt']}")
 
 pos_tracker = PositionTracker()
 
@@ -236,31 +234,42 @@ def numba_supertrend(h,l,c,per,mult):
 # —— 订单守卫 ——
 class OrderGuard:
     def __init__(self):
-        self.states = defaultdict(dict)
-        self.lock   = asyncio.Lock()
-        self.cooldown = {"main":360,"macd":360,"triple":360}
+        self.states   = defaultdict(lambda: {'ts':0,'trend':None,'fp':None})
+        self.lock     = asyncio.Lock()
+        # 1 小时冷却
+        self.cooldown = { 'main':Config.ROTATION_COOLDOWN,
+                          'macd':Config.ROTATION_COOLDOWN,
+                          'triple':Config.ROTATION_COOLDOWN }
 
     async def check(self, strat, fp, trend):
+        """
+        - 同方向：若距上次同方向触发 < 冷却，则拒绝；否则允许。
+        - 触发相反方向时自动重置冷却（因 trend != last_trend）。
+        - 重复 fp（参数集）也拒绝。
+        """
         async with self.lock:
-            st=self.states.get(strat,{})
-            now=time.time(); cd=self.cooldown[strat]
-            if now-st.get('ts',0)<cd: return False
-            if st.get('trend')==trend: return False
-            if st.get('fp')==fp:      return False
+            st = self.states[strat]
+            now = time.time()
+            last_ts    = st['ts']
+            last_trend = st['trend']
+            if trend == last_trend and (now - last_ts) < self.cooldown[strat]:
+                return False
+            if st['fp'] == fp:
+                return False
             return True
 
     async def update(self, strat, fp, trend):
         async with self.lock:
-            self.states[strat]={'fp':fp,'trend':trend,'ts':time.time()}
+            self.states[strat] = {'fp':fp, 'trend':trend, 'ts':time.time()}
 
-guard=OrderGuard()
+guard = OrderGuard()
 
 async def ensure_session():
     global session
     if session is None or session.closed:
         session = aiohttp.ClientSession()
 
-# —— 获取listenKey ——
+# —— 获取 listenKey ——
 async def get_listen_key():
     ts = int(time.time()*1000 + time_offset)
     payload = f"timestamp={ts}"
@@ -274,10 +283,10 @@ async def get_listen_key():
         data = await response.json()
         return data['listenKey']
 
-# —— 定期更新listenKey ——
 async def keepalive_listen_key():
+    global listen_key
     while True:
-        await asyncio.sleep(1800)  # 30分钟更新一次
+        await asyncio.sleep(1800)
         try:
             listen_key = await get_listen_key()
             LOG.info("ListenKey renewed")
@@ -292,7 +301,8 @@ class OrderManager:
     async def safe_place(self, strat, side, otype, qty=None, price=None, stop=None, extra_params=None):
         fp = f"{strat}|{side}|{otype}|{hash(frozenset((extra_params or {}).items()))}"
         trend = 'LONG' if side=='BUY' else 'SHORT'
-        if not await guard.check(strat, fp, trend): return
+        if not await guard.check(strat, fp, trend):
+            return
         LOG.info(f"[Mgr] {strat} → {side} {otype}")
         await self.place(side,otype,qty,price,stop,sig_key=fp,extra_params=extra_params or {})
         await guard.update(strat,fp,trend)
@@ -306,10 +316,9 @@ class OrderManager:
         if price is not None: params["price"]     = f"{quantize(price,price_step):.{price_prec}f}"
         if stop  is not None: params["stopPrice"] = f"{quantize(stop,price_step):.{price_prec}f}"
         if otype=="LIMIT":    params["timeInForce"]="GTC"
-        # 修正止盈止损参数
         if otype in ("STOP_MARKET","TAKE_PROFIT_MARKET"):
             params["closePosition"] = "true"
-            params.pop("quantity", None)  # 确保不传递quantity参数
+            params.pop("quantity", None)
         if is_hedge and otype in ("LIMIT","MARKET"):
             params["positionSide"]="LONG" if side=="BUY" else "SHORT"
         params.update(extra_params or {})
@@ -335,7 +344,7 @@ class OrderManager:
 
 mgr = OrderManager()
 
-# —— 策略：Main ——
+# —— 策略实现（与原版一致） ——
 class MainStrategy:
     def __init__(self):
         self._last=0; self.interval=1
@@ -372,7 +381,6 @@ class MainStrategy:
         sl = price*0.98 if side=="BUY" else price*1.02
         await mgr.safe_place("main", side, "STOP_MARKET", stop=sl)
 
-# —— 策略：MACD ——
 class MACDStrategy:
     def __init__(self): self._in=False
     async def check(self, price):
@@ -390,7 +398,6 @@ class MACDStrategy:
             await mgr.safe_place("macd","BUY","LIMIT",qty=0.15,price=bp,extra_params={'sl':bp*0.97,'tp':bp*1.03})
             self._in=False
 
-# —— 策略：TripleTrend ——
 class TripleTrendStrategy:
     def __init__(self):
         self.round_active=False; self._last=0
@@ -414,11 +421,11 @@ class TripleTrendStrategy:
         if up_all and not self.round_active:
             self.round_active=True
             p0,sl,tp = price*0.995, price*0.97, price*1.02
-            await mgr.safe_place("triple","BUY","LIMIT",qty=0.015,price=p0,extra_params={'sl':sl,'tp':tp})
+            await mgr.safe_place("triple","BUY","LIMIT",qty=0.05,price=p0,extra_params={'sl':sl,'tp':tp})
         elif dn_all and not self.round_active:
             self.round_active=True
             p0,sl,tp = price*1.005, price*1.03, price*0.98
-            await mgr.safe_place("triple","SELL","LIMIT",qty=0.015,price=p0,extra_params={'sl':sl,'tp':tp})
+            await mgr.safe_place("triple","SELL","LIMIT",qty=0.05,price=p0,extra_params={'sl':sl,'tp':tp})
         elif flip_dn:
             await mgr.safe_place("triple","SELL","MARKET"); self.round_active=False
         elif flip_up:
@@ -464,7 +471,12 @@ async def user_ws():
 async def maintenance():
     while True:
         await asyncio.sleep(Config.SYNC_INTERVAL)
-        await sync_time(); await detect_mode(); await pos_tracker.sync()
+        await sync_time()
+        await detect_mode()
+        await pos_tracker.sync()
+        # --- 补偿检查：确保止盈止损未触发部分能够本地扫描平仓 ---
+        if data_mgr.price is not None:
+            await pos_tracker.check_trigger(data_mgr.price)
 
 async def engine():
     while True:
@@ -488,7 +500,7 @@ async def main():
         user_ws(),
         maintenance(),
         engine(),
-        keepalive_listen_key()  # 新增listenKey保活
+        keepalive_listen_key()
     )
 
 if __name__=='__main__':
