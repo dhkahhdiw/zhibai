@@ -49,7 +49,7 @@ class Config:
     )
     WS_USER_BASE      = 'wss://fstream.binance.com/ws/'
     RECV_WINDOW       = 5000
-    SYNC_INTERVAL     = 300
+    SYNC_INTERVAL     = 60
     ROTATION_COOLDOWN = 2600  # 同方向冷却 1 小时
 
 # —— 全局状态 ——
@@ -129,17 +129,27 @@ class PositionTracker:
             self.orders[order_id]  = cloid
             LOG.info(f"[PT] Opened cloid={cloid}, side={side}, entry={price}, SL={sl_q}, TP={tp_q}")
         close_side = 'SELL' if side=='BUY' else 'BUY'
-        # STOP_MARKET
+        # 下发止损单
         await mgr.place(
             close_side, 'STOP_MARKET',
             stop=pos.sl_price,
-            extra_params={'closePosition':'true','workingType':'MARK_PRICE','priceProtect':'FALSE'}
+            extra_params={
+                'closePosition':'true',
+                'workingType':'MARK_PRICE',
+                'priceProtect':'FALSE',
+                **({'positionSide':'LONG' if side=='BUY' else 'SHORT','reduceOnly':'true'} if is_hedge else {})
+            }
         )
-        # TAKE_PROFIT_MARKET
+        # 下发止盈单
         await mgr.place(
             close_side, 'TAKE_PROFIT_MARKET',
             stop=pos.tp_price,
-            extra_params={'closePosition':'true','workingType':'MARK_PRICE','priceProtect':'FALSE'}
+            extra_params={
+                'closePosition':'true',
+                'workingType':'MARK_PRICE',
+                'priceProtect':'FALSE',
+                **({'positionSide':'LONG' if side=='BUY' else 'SHORT','reduceOnly':'true'} if is_hedge else {})
+            }
         )
 
     async def on_order_update(self, order_id, status):
@@ -166,10 +176,10 @@ class PositionTracker:
                         triggered = True
                 else:
                     if price >= pos.sl_price - eps:
-                        LOG.info(f"[PT] SL(short) triggered at {price} >= {pos.sl_price}")
+                        LOG.info(f"[PT] SL(short) at {price} >= {pos.sl_price}")
                         triggered = True
                     elif price <= pos.tp_price + eps:
-                        LOG.info(f"[PT] TP(short) triggered at {price} <= {pos.tp_price}")
+                        LOG.info(f"[PT] TP(short) at {price} <= {pos.tp_price}")
                         triggered = True
                 if triggered:
                     await self._local_close(pos, price)
@@ -351,6 +361,9 @@ class OrderManager:
             params["closePosition"]="true"
             params.update(extra_params or {})
             params.pop("quantity", None)
+            if is_hedge:
+                params["positionSide"] = "LONG" if side=="BUY" else "SHORT"
+                params["reduceOnly"]   = "true"
         if is_hedge and otype in ("LIMIT","MARKET"):
             params["positionSide"] = "LONG" if side=="BUY" else "SHORT"
         params.update(extra_params or {})
@@ -379,7 +392,7 @@ class OrderManager:
 
 mgr = OrderManager()
 
-# —— 策略实现 —— (同原版) ——
+# —— 策略实现 ——
 class MainStrategy:
     def __init__(self): self._last=0; self.interval=1
     async def check(self, price):
@@ -420,16 +433,16 @@ class MACDStrategy:
     async def check(self, price):
         df=data_mgr.klines["15m"]
         if len(df)<30 or "macd" not in df: return
-        ma7,ma25,ma99 = df.ma7.iat[-1],df.ma25.iat[-1],df.ma99.iat[-1]
+        ma7,ma25,ma99=df.ma7.iat[-1],df.ma25.iat[-1],df.ma99.iat[-1]
         if not (price<ma7<ma25<ma99 or price>ma7>ma25>ma99): return
         prev,curr=df.macd.iat[-2],df.macd.iat[-1]
         if prev>0>curr and not self._in:
             sp=price*1.005
-            await mgr.safe_place("macd","SELL","LIMIT",qty=0.05,price=sp,extra_params={'sl':sp*1.03,'tp':sp*0.97})
+            await mgr.safe_place("macd","SELL","LIMIT",qty=0.15,price=sp,extra_params={'sl':sp*1.03,'tp':sp*0.97})
             self._in=True
         elif prev<0<curr and self._in:
             bp=price*0.995
-            await mgr.safe_place("macd","BUY","LIMIT",qty=0.05,price=bp,extra_params={'sl':bp*0.97,'tp':bp*1.03})
+            await mgr.safe_place("macd","BUY","LIMIT",qty=0.15,price=bp,extra_params={'sl':bp*0.97,'tp':bp*1.03})
             self._in=False
 
 class TripleTrendStrategy:
@@ -529,7 +542,13 @@ async def main():
 
     await sync_time(); await detect_mode(); await load_symbol_filters()
     await data_mgr.load_history(); await pos_tracker.sync()
-    await asyncio.gather(market_ws(),user_ws(),maintenance(),engine(),keepalive_listen_key())
+    await asyncio.gather(
+        market_ws(),
+        user_ws(),
+        maintenance(),
+        engine(),
+        keepalive_listen_key()
+    )
 
 if __name__=='__main__':
     asyncio.run(main())
