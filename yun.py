@@ -25,10 +25,10 @@ LOG.addHandler(sh)
 class Config:
     SYMBOL            = 'ETHUSDC'
     PAIR              = SYMBOL.lower()
-    API_KEY           = os.getenv('BINANCE_API_KEY')
-    SECRET_KEY        = os.getenv('BINANCE_SECRET_KEY').encode()
-    ED25519_API       = os.getenv('ED25519_API_KEY')
-    ED25519_KEY_PATH  = os.getenv('ED25519_KEY_PATH')
+    API_KEY           = os.getenv('YZ_BINANCE_API_KEY')
+    SECRET_KEY        = os.getenv('YZ_BINANCE_SECRET_KEY').encode()
+    ED25519_API       = os.getenv('YZ_ED25519_API_KEY')
+    ED25519_KEY_PATH  = os.getenv('YZ_ED25519_KEY_PATH')
     REST_BASE         = 'https://fapi.binance.com'
     WS_MARKET         = (
         f"wss://fstream.binance.com/stream?streams="
