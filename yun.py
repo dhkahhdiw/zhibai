@@ -16,7 +16,7 @@ load_dotenv('/root/zhibai/.env')
 
 # —— 日志配置 ——
 LOG = logging.getLogger('bot')
-LOG.setLevel(logging.DEBUG)
+LOG.setLevel(logging.INFO)
 sh = logging.StreamHandler()
 sh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
 LOG.addHandler(sh)
@@ -38,16 +38,15 @@ class Config:
     RECV_WINDOW       = 5000
     SYNC_INTERVAL     = 60
     ROTATION_COOLDOWN = 1800  # 同方向冷却 30 分钟
-    RATE_LIMIT_RESET  = 60    # REST 权重重置间隔（秒）
 
 # —— 全局状态 ——
 session     = None
 listen_key  = None
 time_offset = 0
 is_hedge    = False
+
 price_step = qty_step = None
 price_prec = qty_prec = 0
-last_weight = {'ip':0,'uid':0,'ts':0}
 
 # —— Ed25519 私钥加载 ——
 with open(Config.ED25519_KEY_PATH, 'rb') as f:
@@ -57,13 +56,20 @@ LOG.info("Ed25519 key loaded")
 def quantize(val: float, step: float) -> float:
     return math.floor(val/step) * step
 
+# —— 确保 session ——
+async def ensure_session():
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+
 # —— 时间同步 & 模式检测 ——
 async def sync_time():
-    global time_offset
+    await ensure_session()
     for _ in range(3):
         try:
             r = await session.get(f"{Config.REST_BASE}/fapi/v1/time")
             data = await r.json()
+            global time_offset
             time_offset = data['serverTime'] - int(time.time()*1000)
             LOG.debug(f"Time offset {time_offset}ms")
             return
@@ -73,7 +79,7 @@ async def sync_time():
     LOG.error("Failed sync_time after retries")
 
 async def detect_mode():
-    global is_hedge
+    await ensure_session()
     ts = int(time.time()*1000 + time_offset)
     qs = urllib.parse.urlencode({'timestamp':ts,'recvWindow':Config.RECV_WINDOW})
     sig= hmac.new(Config.SECRET_KEY, qs.encode(), hashlib.sha256).hexdigest()
@@ -81,6 +87,7 @@ async def detect_mode():
     try:
         r = await session.get(url, headers={'X-MBX-APIKEY':Config.API_KEY})
         j = await r.json()
+        global is_hedge
         is_hedge = j.get('dualSidePosition', False)
         LOG.debug(f"Hedge mode: {is_hedge}")
     except Exception as e:
@@ -88,6 +95,7 @@ async def detect_mode():
 
 # —— 实时账户净值 (equity) 获取 ——
 async def fetch_equity():
+    await ensure_session()
     ts = int(time.time()*1000 + time_offset)
     qs = urllib.parse.urlencode({'timestamp':ts,'recvWindow':Config.RECV_WINDOW})
     sig= hmac.new(Config.SECRET_KEY, qs.encode(), hashlib.sha256).hexdigest()
@@ -104,12 +112,13 @@ async def fetch_equity():
 
 # —— 精度过滤 ——
 async def load_symbol_filters():
-    global price_step, qty_step, price_prec, qty_prec
+    await ensure_session()
     r = await session.get(f"{Config.REST_BASE}/fapi/v1/exchangeInfo")
     info = await r.json()
     sym = next(s for s in info['symbols'] if s['symbol']==Config.SYMBOL)
     pf  = next(f for f in sym['filters'] if f['filterType']=='PRICE_FILTER')
     ls  = next(f for f in sym['filters'] if f['filterType']=='LOT_SIZE')
+    global price_step, qty_step, price_prec, qty_prec
     price_step, qty_step = float(pf['tickSize']), float(ls['stepSize'])
     price_prec = int(round(-math.log10(price_step)))
     qty_prec   = int(round(-math.log10(qty_step)))
@@ -125,13 +134,13 @@ class KellyOptimizer:
         lst.append(profit)
         if len(lst)>self.window: lst.pop(0)
     def calculate(self, strat: str, price: float, equity: float) -> float:
-        profs = self.trades[strat]
         if equity is None or price<=0: return 0
+        profs = self.trades[strat]
         if len(profs)<10:
             return 0.02 * equity / price
         wins = [p for p in profs if p>0]
         loss = [p for p in profs if p<=0]
-        p = len(wins)/len(profs)
+        p = len(wins)/len(profs) if profs else 0
         if not wins or not loss:
             return 0.02 * equity / price
         b = (sum(wins)/len(wins)) / abs(sum(loss)/len(loss))
@@ -201,6 +210,7 @@ class DataManager:
         self.price   = None; self.ptime=0
 
     async def load(self):
+        await ensure_session()
         async with self.lock:
             for tf in self.tfs:
                 r = await session.get(f"{Config.REST_BASE}/fapi/v1/klines",
@@ -277,13 +287,9 @@ class OrderGuard:
 
 guard = OrderGuard()
 
-async def ensure_session():
-    global session
-    if session is None or session.closed:
-        session = aiohttp.ClientSession()
-
 # —— 用户流 ListenKey & 保活 ——
 async def get_listen_key():
+    await ensure_session()
     ts = int(time.time()*1000 + time_offset)
     payload = f"timestamp={ts}"
     sig     = base64.b64encode(ed_priv.sign(payload.encode())).decode()
@@ -309,6 +315,10 @@ class OrderManager:
         self.SECRET_KEY = secret_key
 
     async def safe_place(self, strat, side, otype, qty=None, price=None, stop=None, extra_params=None):
+        # skip zero or too small qty
+        if qty is None or qty < qty_step:
+            LOG.debug(f"[Mgr] skip {otype} {side}: qty {qty} below min {qty_step}")
+            return
         fp    = f"{strat}|{side}|{otype}|{hash(frozenset((extra_params or {}).items()))}"
         trend = 'LONG' if side=='BUY' else 'SHORT'
         if not await guard.check(strat,fp,trend): return
@@ -372,7 +382,6 @@ class MainStrategy:
         total_size = optimizer.calculate(self.name, price, equity)
         self._last=now
 
-        # 分档挂单
         if strong:
             levels = [0.0025,0.004,0.006,0.008,0.016]
         else:
@@ -384,7 +393,6 @@ class MainStrategy:
             p0 = price*(1+lvl if side=="BUY" else 1-lvl)
             await mgr.safe_place(self.name, side, "LIMIT",
                                  qty=per, price=p0, extra_params={'sl':sl,'tp':tp})
-        # 挂止损触发单
         await mgr.safe_place(self.name, side, "STOP_MARKET", stop=sl)
 
 class MACDStrategy:
@@ -473,7 +481,7 @@ async def user_ws():
         try:
             listen_key = await get_listen_key()
             async with websockets.connect(Config.WS_USER_BASE+listen_key) as ws:
-                LOG.info(f"User stream connected")
+                LOG.info("User stream connected")
                 async for msg in ws:
                     data=json.loads(msg)
                     if data.get('e')=='ORDER_TRADE_UPDATE':
