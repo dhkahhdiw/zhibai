@@ -1,10 +1,23 @@
 #!/usr/bin/env python3
 # coding: utf-8
 
-import os, time, json, math, hmac, hashlib, asyncio, logging, signal, urllib.parse, base64
+import os
+import time
+import json
+import math
+import hmac
+import hashlib
+import asyncio
+import logging
+import signal
+import urllib.parse
+import base64
 from collections import defaultdict
 
-import uvloop, aiohttp, websockets, pandas as pd
+import uvloop
+import aiohttp
+import websockets
+import pandas as pd
 from ta.trend import MACD
 from numba import jit
 from dotenv import load_dotenv
@@ -44,7 +57,7 @@ class Config:
     WS_USER_BASE        = 'wss://fstream.binance.com/ws/'
     RECV_WINDOW         = 5000
     SYNC_INTERVAL       = 60
-    ROTATION_COOLDOWN   = 2200
+    ROTATION_COOLDOWN   = 2200  # 冷却时间
 
 # —— 全局状态 ——
 session     = None
@@ -118,22 +131,14 @@ class PositionTracker:
             self.positions[cloid] = pos
             self.orders[order_id]  = cloid
             LOG.info(f"[PT] Opened cloid={cloid}, side={side}, entry={price}, SL={sl_q}, TP={tp_q}")
-
-        # 主/备用账号同步下发止盈止损
+        # 同步发主/备用账号 止盈止损
         for manager in (mgr, yz_mgr):
             close_side = 'SELL' if side=='BUY' else 'BUY'
-            extra = {
-                'closePosition':'true',
-                'workingType':'MARK_PRICE',
-                'priceProtect':'FALSE'
-            }
+            extra = {'closePosition':'true','workingType':'MARK_PRICE','priceProtect':'FALSE'}
             if is_hedge:
-                extra.update({
-                    'positionSide':'LONG' if side=='BUY' else 'SHORT',
-                    'reduceOnly':'true'
-                })
-            await manager.place(close_side, 'STOP_MARKET', stop=sl_q, extra_params=extra)
-            await manager.place(close_side, 'TAKE_PROFIT_MARKET', stop=tp_q, extra_params=extra)
+                extra.update({'positionSide':'LONG' if side=='BUY' else 'SHORT','reduceOnly':'true'})
+            await manager.place(close_side,'STOP_MARKET', stop=sl_q, extra_params=extra)
+            await manager.place(close_side,'TAKE_PROFIT_MARKET', stop=tp_q, extra_params=extra)
 
     async def on_order_update(self, order_id, status):
         async with self.lock:
@@ -151,11 +156,9 @@ class PositionTracker:
                 if not pos.active: continue
                 triggered = False
                 if pos.side=='BUY':
-                    if price <= pos.sl_price + eps or price >= pos.tp_price - eps:
-                        triggered = True
+                    if price<=pos.sl_price+eps or price>=pos.tp_price-eps: triggered=True
                 else:
-                    if price >= pos.sl_price - eps or price <= pos.tp_price + eps:
-                        triggered = True
+                    if price>=pos.sl_price-eps or price<=pos.tp_price+eps: triggered=True
                 if triggered:
                     await self._local_close(pos, price)
 
@@ -164,7 +167,7 @@ class PositionTracker:
         LOG.info(f"[PT] Local close MARKET {side}@{price} for cloid={pos.cloid}")
         for manager in (mgr, yz_mgr):
             try:
-                await manager.place(side, 'MARKET', qty=pos.qty)
+                await manager.place(side,'MARKET',qty=pos.qty)
             except Exception as e:
                 LOG.error(f"[PT] Local close failed on {manager.API_KEY}: {e}")
         pos.active = False
@@ -213,7 +216,7 @@ class DataManager:
         async with self.lock:
             df=self.klines[tf]
             idx=len(df) if ts>self.last_ts[tf] else df.index[-1]
-            df.loc[idx, ["open","high","low","close"]]=[o,h,l,c]
+            df.loc[idx, ["open","high","low","close"]] = [o,h,l,c]
             self.last_ts[tf]=ts
             self._compute(tf)
             self._evt.set()
@@ -237,14 +240,12 @@ class DataManager:
         df["bb_pct"]=(df.close-df.bb_dn)/(df.bb_up-df.bb_dn)
         if tf=="15m":
             hl2=(df.high+df.low)/2
-            atr=df.high.rolling(10).max()-df.low.rolling(10).min()
-            df["st"]=hl2-3*atr
-            df["macd"]=MACD(df.close,12,26,9).macd_diff()
-            df["ma7"],df["ma25"],df["ma99"] = (
-                df.close.rolling(7).mean(),
-                df.close.rolling(25).mean(),
-                df.close.rolling(99).mean()
-            )
+            atr=df.high.rolling(10).max() - df.low.rolling(10).min()
+            df["st"]   = hl2 - 3*atr
+            df["macd"] = MACD(df.close,12,26,9).macd_diff()
+            df["ma7"]  = df.close.rolling(7).mean()
+            df["ma25"] = df.close.rolling(25).mean()
+            df["ma99"] = df.close.rolling(99).mean()
 
 data_mgr = DataManager()
 
@@ -268,17 +269,15 @@ class OrderGuard:
     def __init__(self):
         self.states   = defaultdict(lambda:{'ts':0,'trend':None,'fp':None})
         self.lock     = asyncio.Lock()
-        self.cooldown ={ 'main':Config.ROTATION_COOLDOWN,
-                         'macd':Config.ROTATION_COOLDOWN,
-                         'triple':Config.ROTATION_COOLDOWN }
+        self.cooldown ={ 'main':Config.ROTATION_COOLDOWN,'macd':Config.ROTATION_COOLDOWN,'triple':Config.ROTATION_COOLDOWN }
+
     async def check(self, strat, fp, trend):
         async with self.lock:
             st=self.states[strat]; now=time.time()
-            if trend==st['trend'] and now-st['ts']<self.cooldown[strat]:
-                return False
-            if st['fp']==fp:
-                return False
+            if trend==st['trend'] and now-st['ts']<self.cooldown[strat]: return False
+            if st['fp']==fp: return False
             return True
+
     async def update(self, strat, fp, trend):
         async with self.lock:
             self.states[strat]={'fp':fp,'trend':trend,'ts':time.time()}
@@ -301,7 +300,8 @@ async def get_listen_key():
         headers={'X-MBX-APIKEY':Config.ED25519_API},
         params={'signature':sig,'timestamp':ts}
     )
-    return (await resp.json())['listenKey']
+    data = await resp.json()
+    return data['listenKey']
 
 async def keepalive_listen_key():
     global listen_key
@@ -324,8 +324,7 @@ class OrderManager:
     async def safe_place(self, strat, side, otype, qty=None, price=None, stop=None, extra_params=None):
         fp    = f"{strat}|{side}|{otype}|{hash(frozenset((extra_params or {}).items()))}"
         trend = 'LONG' if side=='BUY' else 'SHORT'
-        if not await guard.check(strat, fp, trend):
-            return
+        if not await guard.check(strat, fp, trend): return
         tag = "-YZ" if self.is_yz else ""
         LOG.info(f"[Mgr{tag}] {strat} → {side} {otype}")
         await self.place(side, otype, qty, price, stop, fp, extra_params or {})
@@ -345,10 +344,7 @@ class OrderManager:
         if otype in ("STOP_MARKET","TAKE_PROFIT_MARKET"):
             params["closePosition"]="true"
             if is_hedge:
-                params.update({
-                    'positionSide':'LONG' if side=='BUY' else 'SHORT',
-                    'reduceOnly':'true'
-                })
+                params.update({'positionSide':'LONG' if side=='BUY' else 'SHORT','reduceOnly':'true'})
         if is_hedge and otype in ("LIMIT","MARKET"):
             params["positionSide"] = 'LONG' if side=='BUY' else 'SHORT'
         params.update(extra_params)
@@ -356,7 +352,7 @@ class OrderManager:
         LOG.debug(f"[Mgr{tag}] Sending {otype} {side} params: {params}")
 
         qs  = urllib.parse.urlencode(sorted(params.items()))
-        key = self.SECRET_KEY if not self.is_yz else Config.YZ_SECRET_KEY
+        key = self.SECRET_KEY
         sig = hmac.new(key, qs.encode(), hashlib.sha256).hexdigest()
         url = f"{Config.REST_BASE}/fapi/v1/order?{qs}&signature={sig}"
         hdr = {'X-MBX-APIKEY': self.API_KEY}
@@ -373,7 +369,7 @@ class OrderManager:
                 LOG.error(f"[Mgr{tag}] Order ERR {otype} {side}: {data}")
             else:
                 LOG.info(f"[Mgr{tag}] Order OK {otype} {side}")
-                # 如果限价单有部分成交，注册持仓
+                # 限价单部分成交时登记持仓
                 if otype=="LIMIT" and float(data.get('executedQty',0))>0:
                     eq = float(data['executedQty'])
                     sl = extra_params.get('sl'); tp = extra_params.get('tp')
@@ -413,30 +409,31 @@ class MainStrategy:
         for lvl,sz in zip(levels,sizes):
             p0 = price*(1+lvl if side=="BUY" else 1-lvl)
             sl,tp = price*(0.98 if side=="BUY" else 1.02), price*(1.01 if side=="BUY" else 0.99)
-            await mgr.safe_place("main", side, "LIMIT", qty=sz, price=p0, extra_params={'sl':sl,'tp':tp})
-            await yz_mgr.safe_place("main",side,"LIMIT",qty=sz, price=p0, extra_params={'sl':sl,'tp':tp})
-
+            # 主/备用 同步下单
+            await mgr.safe_place("main",side,"LIMIT",qty=sz,price=p0,extra_params={'sl':sl,'tp':tp})
+            await yz_mgr.safe_place("main",side,"LIMIT",qty=sz,price=p0,extra_params={'sl':sl,'tp':tp})
+        # 挂止损触发单
         sl = price*(0.98 if side=="BUY" else 1.02)
-        await mgr.safe_place("main", side, "STOP_MARKET", stop=sl)
-        await yz_mgr.safe_place("main",side,"STOP_MARKET", stop=sl)
+        await mgr.safe_place("main",side,"STOP_MARKET",stop=sl)
+        await yz_mgr.safe_place("main",side,"STOP_MARKET",stop=sl)
 
 class MACDStrategy:
     def __init__(self): self._in=False
     async def check(self, price):
         df = data_mgr.klines["15m"]
         if len(df)<30 or "macd" not in df: return
-        ma7,ma25,ma99 = df.ma7.iat[-1],df.ma25.iat[-1],df.ma99.iat[-1]
-        if not (price<ma7<ma25<ma99 or price>ma7>ma25>ma99): return
+        ma7, ma25, ma99 = df.ma7.iat[-1], df.ma25.iat[-1], df.ma99.iat[-1]
+        if not (price < ma7 < ma25 < ma99 or price > ma7 > ma25 > ma99): return
         prev,curr = df.macd.iat[-2], df.macd.iat[-1]
         if prev>0>curr and not self._in:
             sp = price*1.005
-            await mgr.safe_place("macd","SELL","LIMIT",qty=0.07,price=sp, extra_params={'sl':sp*1.03,'tp':sp*0.97})
-            await yz_mgr.safe_place("macd","SELL","LIMIT",qty=0.07,price=sp, extra_params={'sl':sp*1.03,'tp':sp*0.97})
+            for m in (mgr,yz_mgr):
+                await m.safe_place("macd","SELL","LIMIT",qty=0.07,price=sp,extra_params={'sl':sp*1.03,'tp':sp*0.97})
             self._in=True
         elif prev<0<curr and self._in:
-            bp=price*0.995
-            await mgr.safe_place("macd","BUY","LIMIT",qty=0.07,price=bp, extra_params={'sl':bp*0.97,'tp':bp*1.03})
-            await yz_mgr.safe_place("macd","BUY","LIMIT",qty=0.07,price=bp, extra_params={'sl':bp*0.97,'tp':bp*1.03})
+            bp = price*0.995
+            for m in (mgr,yz_mgr):
+                await m.safe_place("macd","BUY","LIMIT",qty=0.07,price=bp,extra_params={'sl':bp*0.97,'tp':bp*1.03})
             self._in=False
 
 class TripleTrendStrategy:
@@ -446,29 +443,29 @@ class TripleTrendStrategy:
         if now-self._last<1: return
         df=data_mgr.klines["15m"]
         if len(df)<99: return
-        ma7,ma25,ma99 = df.ma7.iat[-1],df.ma25.iat[-1],df.ma99.iat[-1]
-        if not (price<ma7<ma25<ma99 or price>ma7>ma25>ma99): return
-        h,l,c = df.high.values, df.low.values, df.close.values
-        _,d1 = numba_supertrend(h,l,c,10,1)
-        _,d2 = numba_supertrend(h,l,c,11,2)
-        _,d3 = numba_supertrend(h,l,c,12,3)
-        up_all = d1[-1] and d2[-1] and d3[-1]
-        dn_all = not (d1[-1] or d2[-1] or d3[-1])
-        prev,curr = (d1[-2],d2[-2],d3[-2]), (d1[-1],d2[-1],d3[-1])
-        flip_dn = self.round_active and any(p and not c2 for p,c2 in zip(prev,curr))
-        flip_up = self.round_active and any(not p and c2 for p,c2 in zip(prev,curr))
+        ma7, ma25, ma99 = df.ma7.iat[-1], df.ma25.iat[-1], df.ma99.iat[-1]
+        if not (price < ma7 < ma25 < ma99 or price > ma7 > ma25 > ma99): return
+        h,l,c=df.high.values,df.low.values,df.close.values
+        _,d1=numba_supertrend(h,l,c,10,1)
+        _,d2=numba_supertrend(h,l,c,11,2)
+        _,d3=numba_supertrend(h,l,c,12,3)
+        up_all=d1[-1] and d2[-1] and d3[-1]
+        dn_all=not (d1[-1] or d2[-1] or d3[-1])
+        prev,curr=(d1[-2],d2[-2],d3[-2]),(d1[-1],d2[-1],d3[-1])
+        flip_dn=self.round_active and any(p and not c2 for p,c2 in zip(prev,curr))
+        flip_up=self.round_active and any(not p and c2 for p,c2 in zip(prev,curr))
         self._last=now
 
         if up_all and not self.round_active:
             self.round_active=True
-            p0,sl,tp = price*0.995,price*0.97,price*1.02
-            await mgr.safe_place("triple","BUY","LIMIT", qty=0.05, price=p0, extra_params={'sl':sl,'tp':tp})
-            await yz_mgr.safe_place("triple","BUY","LIMIT", qty=0.05, price=p0, extra_params={'sl':sl,'tp':tp})
+            p0,sl,tp=price*0.995,price*0.97,price*1.02
+            for m in (mgr,yz_mgr):
+                await m.safe_place("triple","BUY","LIMIT",qty=0.05,price=p0,extra_params={'sl':sl,'tp':tp})
         elif dn_all and not self.round_active:
             self.round_active=True
-            p0,sl,tp = price*1.005,price*1.03,price*0.98
-            await mgr.safe_place("triple","SELL","LIMIT",qty=0.05,price=p0, extra_params={'sl':sl,'tp':tp})
-            await yz_mgr.safe_place("triple","SELL","LIMIT",qty=0.05,price=p0, extra_params={'sl':sl,'tp':tp})
+            p0,sl,tp=price*1.005,price*1.03,price*0.98
+            for m in (mgr,yz_mgr):
+                await m.safe_place("triple","SELL","LIMIT",qty=0.05,price=p0,extra_params={'sl':sl,'tp':tp})
         elif flip_dn:
             for m in (mgr,yz_mgr): await m.safe_place("triple","SELL","MARKET")
             self.round_active=False
@@ -486,13 +483,17 @@ async def market_ws():
             async with websockets.connect(Config.WS_MARKET, ping_interval=None) as ws:
                 retry = 0
                 async for msg in ws:
-                    o = json.loads(msg); s,d = o["stream"], o["data"]
+                    o = json.loads(msg)
+                    s,d = o["stream"], o["data"]
                     if s.endswith("@markPrice"):
                         await data_mgr.track_price(float(d["p"]), int(time.time()*1000))
                     else:
-                        tf = s.split("@")[1].split("_")[1]; k = d["k"]
-                        await data_mgr.update_kline(tf,
-                            float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), k["t"])
+                        tf = s.split("@")[1].split("_")[1]
+                        k  = d["k"]
+                        await data_mgr.update_kline(
+                            tf,
+                            float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), k["t"]
+                        )
         except Exception as e:
             delay = min(2**retry, 30)
             LOG.error(f"[WS MKT] {e}, retry in {delay}s")
@@ -521,7 +522,9 @@ async def user_ws():
 async def maintenance():
     while True:
         await asyncio.sleep(Config.SYNC_INTERVAL)
-        await sync_time(); await detect_mode(); await pos_tracker.sync()
+        await sync_time()
+        await detect_mode()
+        await pos_tracker.sync()
         if data_mgr.price is not None:
             await pos_tracker.check_trigger(data_mgr.price)
 
@@ -543,9 +546,14 @@ async def main():
     for sig in (signal.SIGINT,signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(session.close()))
 
-    await sync_time(); await detect_mode(); await load_symbol_filters()
-    await data_mgr.load_history(); await pos_tracker.sync()
+    # 初始化同步
+    await sync_time()
+    await detect_mode()
+    await load_symbol_filters()
+    await data_mgr.load_history()
+    await pos_tracker.sync()
 
+    # 并行运行
     await asyncio.gather(
         market_ws(),
         user_ws(),
