@@ -16,7 +16,7 @@ load_dotenv('/root/zhibai/.env')
 
 # —— 日志配置 ——
 LOG = logging.getLogger('bot')
-LOG.setLevel(logging.INFO)
+LOG.setLevel(logging.DEBUG)
 sh = logging.StreamHandler()
 sh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
 LOG.addHandler(sh)
