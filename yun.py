@@ -84,40 +84,45 @@ async def load_symbol_filters():
 class OrderManager:
     def __init__(self):
         self.lock = asyncio.Lock()
+
     async def place(self, side, otype, qty=None, price=None, stop=None,
                     extra_params=None, return_id=False):
         await ensure_session()
         ts = int(time.time()*1000 + time_offset)
         params = {"symbol":Config.SYMBOL,"side":side,"type":otype,
                   "timestamp":ts,"recvWindow":Config.RECV_WINDOW}
-        if qty is not None: params["quantity"]  = f"{quantize(qty,qty_step):.{qty_prec}f}"
-        if price is not None: params["price"]    = f"{quantize(price,price_step):.{price_prec}f}"
-        if stop is not None:  params["stopPrice"]= f"{quantize(stop,price_step):.{price_prec}f}"
-        if otype=="LIMIT":    params["timeInForce"]="GTC"
-        # 条件单必须带这些
+        if qty is not None:    params["quantity"]   = f"{quantize(qty,qty_step):.{qty_prec}f}"
+        if price is not None:  params["price"]      = f"{quantize(price,price_step):.{price_prec}f}"
+        if stop is not None:   params["stopPrice"]  = f"{quantize(stop,price_step):.{price_prec}f}"
+        if otype=="LIMIT":     params["timeInForce"] = "GTC"
+
+        # 条件单参数
         if otype in ("STOP_MARKET","TAKE_PROFIT_MARKET"):
             params.update({
                 "workingType":  "MARK_PRICE",
                 "priceProtect": "FALSE",
                 "closePosition":"true"
             })
-            # 对冲模式需加 reduceOnly
             if is_hedge:
                 params["positionSide"] = "LONG" if side=="BUY" else "SHORT"
                 params["reduceOnly"]   = "true"
-        # 对冲模式下限价/市价单也需标记
+
+        # 对冲模式下市价/限价
         if is_hedge and otype in ("LIMIT","MARKET"):
             params["positionSide"] = "LONG" if side=="BUY" else "SHORT"
+
         if extra_params:
             params.update(extra_params)
-        qs = urllib.parse.urlencode(sorted(params.items()), safe=',')
-        sig= hmac.new(Config.SECRET_KEY, qs.encode(), hashlib.sha256).hexdigest()
-        url= f"{Config.REST_BASE}/fapi/v1/order?{qs}&signature={sig}"
-        headers={'X-MBX-APIKEY':Config.API_KEY}
+
+        qs  = urllib.parse.urlencode(sorted(params.items()), safe=',')
+        sig = hmac.new(Config.SECRET_KEY, qs.encode(), hashlib.sha256).hexdigest()
+        url = f"{Config.REST_BASE}/fapi/v1/order?{qs}&signature={sig}"
+        headers = {'X-MBX-APIKEY':Config.API_KEY}
+
         async with self.lock:
-            resp = await session.post(url, headers=headers)
-            data = await resp.json()
-            if resp.status!=200:
+            r = await session.post(url, headers=headers)
+            data = await r.json()
+            if r.status != 200:
                 LOG.error(f"[Mgr] ERR {otype} {side}: {data}")
                 return None
             oid = data.get('orderId')
@@ -131,7 +136,7 @@ async def ensure_session():
     if session is None or session.closed:
         session = aiohttp.ClientSession()
 
-# —— 持仓 & SL/TP 管理 ——
+# —— 持仓 & SL/TP 管理 —— （同原版） ——
 class PositionTracker:
     class Pos:
         __slots__ = ('cloid','side','qty','sl','tp','sl_id','tp_id','active')
@@ -144,21 +149,17 @@ class PositionTracker:
     def __init__(self):
         self.lock       = asyncio.Lock()
         self.next_cloid = 1
-        self.positions  = {}     # cloid -> Pos
-        self.ord2cloid  = {}     # origOrderId -> cloid
+        self.positions  = {}
+        self.ord2cloid  = {}
 
     async def on_fill(self, order, side, qty, price, sl, tp):
-        # 1. 注册仓位并下条件单
         async with self.lock:
-            cloid = self.next_cloid; self.next_cloid+=1
+            cloid = self.next_cloid; self.next_cloid += 1
             sl_q = quantize(sl, price_step)
             tp_q = quantize(tp, price_step)
             close = 'SELL' if side=='BUY' else 'BUY'
-            # 下远程止损、止盈并获取ID
-            sl_id = await mgr.place(close, 'STOP_MARKET',
-                                    qty=None, stop=sl_q, return_id=True)
-            tp_id = await mgr.place(close, 'TAKE_PROFIT_MARKET',
-                                    qty=None, stop=tp_q, return_id=True)
+            sl_id = await mgr.place(close, 'STOP_MARKET', stop=sl_q, return_id=True)
+            tp_id = await mgr.place(close, 'TAKE_PROFIT_MARKET', stop=tp_q, return_id=True)
             pos = self.Pos(cloid, side, qty, sl_q, tp_q, sl_id, tp_id)
             self.positions[cloid] = pos
             self.ord2cloid[order['orderId']] = cloid
@@ -166,16 +167,16 @@ class PositionTracker:
 
     async def on_order_update(self, oid, status):
         async with self.lock:
-            # 远程 SL 或 TP 触发
+            # 远程 SL/TP
             for pos in self.positions.values():
                 if oid in (pos.sl_id, pos.tp_id):
-                    pos.active=False
+                    pos.active = False
                     LOG.info(f"[PT] Remote SL/TP triggered cloid={pos.cloid}")
                     return
-            # 限价仓位单取消或完全成交
+            # 限价仓位单
             cloid = self.ord2cloid.get(oid)
             if cloid and status in ('FILLED','CANCELED'):
-                self.positions[cloid].active=False
+                self.positions[cloid].active = False
                 LOG.info(f"[PT] Remote position close cloid={cloid}")
 
     async def check_trigger(self, price):
@@ -189,15 +190,13 @@ class PositionTracker:
                          (pos.side=='SELL' and price<=pos.tp + eps)
                 if hit_sl or hit_tp:
                     LOG.info(f"[PT] Local trigger cloid={pos.cloid} price={price}")
-                    # 取消挂单
-                    await mgr.place('', '', extra_params={}, qty=None)  # no-op to yield
-                    await mgr.place('', '', extra_params={}, qty=None)  # noop
-                    # 无法同时 cancel 两个，用 session.delete 也可扩展
-                    await mgr.place('','', extra_params={}, qty=None)
+                    # 撤销挂单
+                    await mgr.place('', '', extra_params={}, qty=None)
+                    await mgr.place('', '', extra_params={}, qty=None)
                     # 市价平仓
                     close = 'SELL' if pos.side=='BUY' else 'BUY'
                     await mgr.place(close, 'MARKET', qty=pos.qty)
-                    pos.active=False
+                    pos.active = False
 
 pos_tracker = PositionTracker()
 
