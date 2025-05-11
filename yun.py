@@ -1,10 +1,24 @@
 #!/usr/bin/env python3
 # coding: utf-8
 
-import os, time, json, math, asyncio, logging, signal, urllib.parse, base64, hmac, hashlib
+import os
+import time
+import json
+import math
+import asyncio
+import logging
+import signal
+import urllib.parse
+import base64
+import hmac
+import hashlib
+
 from collections import defaultdict
 
-import uvloop, aiohttp, websockets, pandas as pd
+import uvloop
+import aiohttp
+import websockets
+import pandas as pd
 from ta.trend import MACD
 from numba import jit
 from dotenv import load_dotenv
@@ -123,13 +137,13 @@ class KellyOptimizer:
         profs = self.trades[strat]
         if len(profs) < 10:
             return 0.02 * equity / price
-        wins = [p for p in profs if p>0]
-        loss = [p for p in profs if p<=0]
-        p = len(wins)/len(profs)
+        wins = [p for p in profs if p > 0]
+        loss = [p for p in profs if p <= 0]
+        p = len(wins) / len(profs)
         if not wins or not loss:
             return 0.02 * equity / price
         b = (sum(wins)/len(wins)) / abs(sum(loss)/len(loss))
-        f = max(0, (p*b - (1-p))/b)*0.5
+        f = max(0, (p*b - (1-p))/b) * 0.5
         return f * equity / price
 
 optimizer = KellyOptimizer()
@@ -168,7 +182,7 @@ class OrderManager:
         if qty   is not None: params['quantity']  = f"{quantize(qty,qty_step):.{qty_prec}f}"
         if price is not None: params['price']     = f"{quantize(price,price_step):.{price_prec}f}"
         if stop  is not None: params['stopPrice'] = f"{quantize(stop,price_step):.{price_prec}f}"
-        if otype=='LIMIT':    params['timeInForce'] = 'GTC'
+        if otype == 'LIMIT':  params['timeInForce'] = 'GTC'
 
         # 条件单止盈止损
         if otype in ('STOP_MARKET','TAKE_PROFIT_MARKET'):
@@ -194,7 +208,7 @@ class OrderManager:
         headers = {'X-MBX-APIKEY': Config.API_KEY}
 
         async with self.lock:
-            r = await session.post(url, headers=headers)
+            r    = await session.post(url, headers=headers)
             data = await r.json()
             if r.status != 200:
                 LOG.error(f"[Mgr] ERR {otype} {side}: {data}")
@@ -228,14 +242,14 @@ class PositionTracker:
     async def on_fill(self, oid, side, qty, price, sl, tp):
         async with self.lock:
             cloid = self.next_cloid; self.next_cloid += 1
-            sl_q = quantize(sl, price_step)
-            tp_q = quantize(tp, price_step)
+            sl_q  = quantize(sl, price_step)
+            tp_q  = quantize(tp, price_step)
             close = 'SELL' if side=='BUY' else 'BUY'
             sl_id = await mgr.place(close, 'STOP_MARKET', stop=sl_q, return_id=True)
             tp_id = await mgr.place(close, 'TAKE_PROFIT_MARKET', stop=tp_q, return_id=True)
-            pos = self.Pos(cloid, side, qty, sl_q, tp_q, sl_id, tp_id)
+            pos   = self.Pos(cloid, side, qty, sl_q, tp_q, sl_id, tp_id)
             self.positions[cloid] = pos
-            self.ord2cloid[oid] = cloid
+            self.ord2cloid[oid]    = cloid
             LOG.info(f"[PT] Open cloid={cloid} SL={sl_q}({sl_id}) TP={tp_q}({tp_id})")
 
     async def on_order_update(self, oid, status):
@@ -270,7 +284,8 @@ class PositionTracker:
                     pos.active = False
 
     async def sync(self):
-        pass  # 如需从 REST 同步持仓，可在此扩展
+        # 可选：REST 同步持仓
+        pass
 
 pos_tracker = PositionTracker()
 
@@ -299,15 +314,15 @@ class DataManager:
                     "open":float(x[1]),"high":float(x[2]),
                     "low":float(x[3]),"close":float(x[4])
                 } for x in data])
-                self.klines[tf]   = df
-                self.last_ts[tf]  = int(data[-1][0])
+                self.klines[tf]  = df
+                self.last_ts[tf] = int(data[-1][0])
                 self._compute(tf)
                 LOG.info(f"[DM] {tf} loaded {len(df)} bars")
 
     async def update_kline(self, tf, o, h, l, c, ts):
         async with self.lock:
             df = self.klines[tf]
-            idx = len(df) if ts>self.last_ts[tf] else df.index[-1]
+            idx = len(df) if ts > self.last_ts[tf] else df.index[-1]
             df.loc[idx, ["open","high","low","close"]] = [o,h,l,c]
             self.last_ts[tf] = ts
             self._compute(tf)
@@ -330,8 +345,8 @@ class DataManager:
         s = df.close.rolling(20).std()
         df["bb_up"], df["bb_dn"] = m+2*s, m-2*s
         df["bb_pct"] = (df.close - df.bb_dn) / (df.bb_up - df.bb_dn)
-        if tf=="15m":
-            hl2 = (df.high+df.low)/2
+        if tf == "15m":
+            hl2 = (df.high + df.low) / 2
             atr = df.high.rolling(10).max() - df.low.rolling(10).min()
             df["st"]   = hl2 - 3*atr
             df["macd"] = MACD(df.close,12,26,9).macd_diff()
@@ -371,9 +386,9 @@ class OrderGuard:
         async with self.lock:
             st  = self.states[strat]
             now = time.time()
-            if trend==st['trend'] and now-st['ts']<self.cooldown[strat]:
+            if trend == st['trend'] and now - st['ts'] < self.cooldown[strat]:
                 return False
-            if st['fp']==fp:
+            if st['fp'] == fp:
                 return False
             return True
     async def update(self, strat, fp, trend):
@@ -484,11 +499,9 @@ class TripleTrendStrategy:
         if size<=qty_step: return
         self._last=now
         if up_all and not self.active:
-            p0,sl,tp=price*0.995,price*0.97,price*1.03
-            await mgr.place("BUY","LIMIT",qty=size,price=p0,extra_params={'sl':sl,'tp':tp}); self.active=True
+            p0,sl,tp=price*0.995,price*0.97,price*1.03; await mgr.place("BUY","LIMIT",qty=size,price=p0,extra_params={'sl':sl,'tp':tp}); self.active=True
         elif dn_all and not self.active:
-            p0,sl,tp=price*1.005,price*1.03,price*0.98
-            await mgr.place("SELL","LIMIT",qty=size,price=p0,extra_params={'sl':sl,'tp':tp}); self.active=True
+            p0,sl,tp=price*1.005,price*1.03,price*0.98; await mgr.place("SELL","LIMIT",qty=size,price=p0,extra_params={'sl':sl,'tp':tp}); self.active=True
         elif flip_dn:
             await mgr.place("SELL","MARKET"); self.active=False
         elif flip_up:
@@ -545,21 +558,27 @@ async def engine():
         if data_mgr.price is None or time.time()-data_mgr.ptime>60:
             continue
         for strat in strategies:
-            try: await strat.check(data_mgr.price)
-            except Exception: LOG.exception(f"{strat.name} failed")
+            try:
+                await strat.check(data_mgr.price)
+            except Exception:
+                LOG.exception(f"Strategy {strat.name} failed")
 
 async def main():
     global session
-    session = aiohttp.ClientSession()
+    await ensure_session()
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(session.close()))
 
+    # 信号处理：优雅退出，不在此关闭 session，让后台任务正常完成后自行退出
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda: LOG.info(f"Received {sig.name}, shutting down..."))
+
+    # 启动前初始化
     await sync_time()
     await detect_mode()
     await load_symbol_filters()
     await data_mgr.load_history()
 
+    # 并行运行
     await asyncio.gather(
         market_ws(),
         user_ws(),
@@ -568,5 +587,5 @@ async def main():
         keepalive_listen_key()
     )
 
-if __name__=='__main__':
+if __name__ == '__main__':
     asyncio.run(main())
