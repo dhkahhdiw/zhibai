@@ -24,11 +24,11 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 # —— 高性能事件循环 & 环境加载 ——
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-load_dotenv()  # .env 中设置 YZ_BINANCE_API_KEY, YZ_BINANCE_SECRET_KEY, YZ_ED25519_API_KEY, YZ_ED25519_KEY_PATH
+load_dotenv()
 
 # —— 日志配置 ——
 LOG = logging.getLogger('bot')
-LOG.setLevel(logging.INFO)
+LOG.setLevel(logging.DEBUG)
 sh = logging.StreamHandler()
 sh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
 LOG.addHandler(sh)
