@@ -24,7 +24,7 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 # —— 高性能事件循环 & 环境加载 ——
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-load_dotenv()
+load_dotenv()  # .env 中设置 YZ_BINANCE_API_KEY, YZ_BINANCE_SECRET_KEY, YZ_ED25519_API_KEY, YZ_ED25519_KEY_PATH
 
 # —— 日志配置 ——
 LOG = logging.getLogger('bot')
@@ -127,23 +127,22 @@ class PositionTracker:
     async def on_fill(self, order_id, side, qty, price, sl_raw, tp_raw):
         async with self.lock:
             cl = self.next; self.next += 1
-            # 多空分别 ceil/floor
             if side == 'BUY':
-                slp = quantize_floor (sl_raw, price_step)
-                tpp = quantize_ceil  (tp_raw, price_step)
+                slp = quantize_floor(sl_raw, price_step)
+                tpp = quantize_ceil (tp_raw, price_step)
             else:
-                slp = quantize_ceil  (sl_raw, price_step)
-                tpp = quantize_floor (tp_raw, price_step)
+                slp = quantize_ceil (sl_raw, price_step)
+                tpp = quantize_floor(tp_raw, price_step)
             pos = self.Pos(cl, side, qty, price, slp, tpp)
-            self.pos[cl]    = pos
+            self.pos[cl]       = pos
             self.o2cl[order_id] = cl
             LOG.info(f"[PT] NEW pos#{cl} {side} {qty}@{price:.5f} SL={slp:.5f} TP={tpp:.5f}")
 
-        # 下止损市价单
+        # 止损单
         await mgr.place(
-            side = 'SELL' if side=='BUY' else 'BUY',
+            side='SELL' if side=='BUY' else 'BUY',
             otype='STOP_MARKET',
-            qty = qty,
+            qty=qty,
             stop=pos.sl,
             extra_params={
                 'closePosition':'true',
@@ -152,11 +151,11 @@ class PositionTracker:
                 **({'positionSide':'LONG' if side=='BUY' else 'SHORT','reduceOnly':'true'} if is_hedge else {})
             }
         )
-        # 下止盈市价单
+        # 止盈单
         await mgr.place(
-            side = 'SELL' if side=='BUY' else 'BUY',
+            side='SELL' if side=='BUY' else 'BUY',
             otype='TAKE_PROFIT_MARKET',
-            qty = qty,
+            qty=qty,
             stop=pos.tp,
             extra_params={
                 'closePosition':'true',
@@ -165,6 +164,16 @@ class PositionTracker:
                 **({'positionSide':'LONG' if side=='BUY' else 'SHORT','reduceOnly':'true'} if is_hedge else {})
             }
         )
+
+    async def on_order_update(self, order_id, status):
+        async with self.lock:
+            if order_id not in self.o2cl:
+                return
+            cl = self.o2cl[order_id]
+            pos = self.pos.get(cl)
+            if pos and status in ('FILLED', 'CANCELED', 'REJECTED'):
+                pos.active = False
+                LOG.info(f"[PT] Closed cloid={cl} via {status}")
 
 pos_tracker = PositionTracker()
 
@@ -219,14 +228,12 @@ class DataManager:
     def _compute(self, tf):
         df = self.klines[tf]
         if len(df) < 20: return
-        # 布林带
         m = df.close.rolling(20).mean()
         s = df.close.rolling(20).std()
         df["bb_up"]  = m + 2*s
         df["bb_dn"]  = m - 2*s
         df["bb_pct"] = (df.close - df.bb_dn) / (df.bb_up - df.bb_dn)
         if tf == "15m":
-            hl2 = (df.high + df.low)/2
             df["st_line"], df["st_dir"] = numba_supertrend(
                 df.high.values, df.low.values, df.close.values, 10, 3
             )
@@ -247,11 +254,9 @@ def numba_supertrend(h,l,c,per,mult):
     st_line[0], dirc[0] = up[0], True
     for i in range(1,n):
         if c[i] > st_line[i-1]:
-            st_line[i] = max(dn[i], st_line[i-1])
-            dirc[i] = True
+            st_line[i] = max(dn[i], st_line[i-1]); dirc[i]=True
         else:
-            st_line[i] = min(up[i], st_line[i-1])
-            dirc[i] = False
+            st_line[i] = min(up[i], st_line[i-1]); dirc[i]=False
     return st_line, dirc
 
 data_mgr = DataManager()
@@ -326,7 +331,6 @@ class OrderManager:
         if price is not None: params['price']     = f"{quantize_floor(price,price_step):.{price_prec}f}"
         if stop  is not None: params['stopPrice'] = f"{quantize_floor(stop,price_step):.{price_prec}f}"
         if otype=='LIMIT': params['timeInForce'] = 'GTC'
-
         if extra_params:
             params.update(extra_params)
         if is_hedge and otype in ('LIMIT','MARKET'):
@@ -351,7 +355,7 @@ class OrderManager:
         oid = data.get('orderId')
         LOG.info(f"[Mgr] 下单成功 id={oid}")
 
-        # 如果限价单有立即成交部分，回调 on_fill
+        # 限价单若有部分立即成交，触发 on_fill
         exec_qty = float(data.get('executedQty', 0))
         if otype=='LIMIT' and exec_qty>0:
             sl = float(extra_params.get('stopPrice') or extra_params.get('slPrice') or 0)
@@ -397,11 +401,10 @@ class MainStrategy:
         for lvl,sz in zip(levels, sizes):
             px = price * (1+lvl if side=='BUY' else 1-lvl)
             sl = price * (0.98 if side=='BUY' else 1.02)
-            tp = price * (1.02 if side=='BUY' else 0.98)
+            tp = price * (1.01 if side=='BUY' else 0.99)
             await mgr.safe_place('main', side, 'LIMIT',
                                  qty=sz, price=px,
                                  extra_params={'slPrice':sl,'tpPrice':tp})
-        # 最后放一个止损
         sl0 = price * (0.98 if side=='BUY' else 1.02)
         await mgr.safe_place('main', side, 'STOP_MARKET', stop=sl0)
         self.last = now
@@ -419,13 +422,13 @@ class MACDStrategy:
         if prev>0>curr and not self.in_pos:
             px = price*1.005
             await mgr.safe_place('macd','SELL','LIMIT',
-                                 qty=0.05, price=px,
+                                 qty=0.017, price=px,
                                  extra_params={'slPrice':px*1.03,'tpPrice':px*0.97})
             self.in_pos = True
         elif prev<0<curr and self.in_pos:
             px = price*0.995
             await mgr.safe_place('macd','BUY','LIMIT',
-                                 qty=0.05, price=px,
+                                 qty=0.017, price=px,
                                  extra_params={'slPrice':px*0.97,'tpPrice':px*1.03})
             self.in_pos = False
 
@@ -440,7 +443,7 @@ class TripleTrendStrategy:
         df = data_mgr.klines['15m']
         if len(df) < 100: return
         c7,c25,c99 = df.ma7.iat[-1],df.ma25.iat[-1],df.ma99.iat[-1]
-        if not ((price<c7<c25<c99) or (price>c7>c25>c99)): return
+        if not ((price<c7<c25<c99) or (price>c7>c25<c99)): return
 
         h,l,c = df.high.values, df.low.values, df.close.values
         _,d1 = numba_supertrend(h,l,c,10,1)
@@ -456,13 +459,13 @@ class TripleTrendStrategy:
         if up_all and not self.active:
             px = price*0.999; sl = price*0.97; tp = price*1.02
             await mgr.safe_place('triple','BUY','LIMIT',
-                                 qty=0.025, price=px,
+                                 qty=0.016, price=px,
                                  extra_params={'slPrice':sl,'tpPrice':tp})
             self.active = True
         elif dn_all and not self.active:
             px = price*1.001; sl = price*1.03; tp = price*0.98
             await mgr.safe_place('triple','SELL','LIMIT',
-                                 qty=0.025, price=px,
+                                 qty=0.016, price=px,
                                  extra_params={'slPrice':sl,'tpPrice':tp})
             self.active = True
         elif flip_dn:
@@ -514,7 +517,7 @@ async def user_ws():
                     evt = json.loads(msg)
                     if evt.get('e') == 'ORDER_TRADE_UPDATE':
                         o = evt['o']
-                        await pos_tracker.on_fill(o['i'], o['S'], float(o['l']), float(o['L']), None, None)
+                        await pos_tracker.on_order_update(o.get('i'), o.get('X'))
         except Exception as e:
             LOG.error(f"[WS USER] {e}, reconnect in 5s")
             await asyncio.sleep(5)
@@ -524,8 +527,6 @@ async def maintenance():
     while True:
         await asyncio.sleep(Config.SYNC_INTERVAL)
         await sync_time(); await detect_mode()
-        # 同步持仓风险（可选日志）
-        # await pos_tracker.sync()
 
 async def engine():
     while True:
@@ -535,7 +536,7 @@ async def engine():
         for strat in strategies:
             try:
                 await strat.check(data_mgr.price)
-            except Exception:
+            except:
                 LOG.exception(f"Strategy {strat.__class__.__name__} error")
 
 async def main():
