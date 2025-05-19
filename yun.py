@@ -384,12 +384,9 @@ class MainStrategy:
         if len(df15) < 99 or df15['adx'].iat[-1] <= 25:
             return
 
-        # 超出均线 20% 跳过
-        m1h = data_mgr.klines["1h"].close[-100:].mean()
-        if not (0.8*m1h < price < 1.2*m1h):
-            LOG.warning("Price deviation too large, skip")
+        ma7, ma25, ma99 = df15.ma7.iat[-1], df15.ma25.iat[-1], df15.ma99.iat[-1]
+        if not (price < ma7 < ma25 < ma99 or price > ma7 > ma25 > ma99):
             return
-
         h,l,c = df15.high.values, df15.low.values, df15.close.values
         st,sd = numba_supertrend(h,l,c,10,3)
         trend_up = price > st[-1] and sd[-1]
