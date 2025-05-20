@@ -432,11 +432,7 @@ class MainStrategy:
         df15 = data_mgr.klines["15m"]
         if len(df15) < 99 or df15['adx'].iat[-1] <= 25:
             return
-        ma7, ma25, ma99 = df15.ma7.iat[-1], df15.ma25.iat[-1], df15.ma99.iat[-1]
-        is_bear = price < ma7 and ma7 < ma25 and ma25 < ma99
-        is_bull = price > ma7 and ma7 > ma25 and ma25 > ma99
-        if not (is_bear or is_bull):
-            return
+
         h,l,c = df15.high.values, df15.low.values, df15.close.values
         st,sd = numba_supertrend(h,l,c,10,3)
         trend_up = price > st[-1] and sd[-1]
@@ -452,13 +448,13 @@ class MainStrategy:
 
         qty = 0.12 if ((side=="BUY" and trend_up) or (side=="SELL" and trend_dn)) else 0.07
         if strong:
-            levels = [0.0025,0.004,0.006,0.008,0.016]
+            levels = [0.0025,0.014,0.026,0.038,0.056]
             sizes  = [qty*0.2]*5
         else:
             if side=="BUY":
-                levels = [-0.0055,-0.0155] if trend_up else [-0.0075]
+                levels = [-0.0155,-0.0255] if trend_up else [-0.0075]
             else:
-                levels = [0.0055,0.0155] if trend_dn else [0.0075]
+                levels = [0.0155,0.0255] if trend_dn else [0.0075]
             sizes = [0.015]*len(levels)
 
         self._last = now
@@ -484,13 +480,11 @@ class MACDStrategy:
         if len(df) < 30 or df['adx'].iat[-1] <= 25:
             return
         prev, curr = df.macd.iat[-2], df.macd.iat[-1]
-        ma7, ma25, ma99 = df15.ma7.iat[-1], df15.ma25.iat[-1], df15.ma99.iat[-1]
-        is_bear = price < ma7 and ma7 < ma25 and ma25 < ma99
-        is_bull = price > ma7 and ma7 > ma25 and ma25 > ma99
-        if not (is_bear or is_bull):
+        ma7, ma25, ma99 = df.ma7.iat[-1], df.ma25.iat[-1], df.ma99.iat[-1]
+        if not (price<ma7<ma25<ma99 or price>ma7>ma25>ma99):
             return
 
-    if prev>0>curr and not self._in:
+        if prev>0>curr and not self._in:
             sp = price*1.005
             await mgr.safe_place("macd","SELL","LIMIT",
                                  qty=0.06, price=sp,
@@ -518,10 +512,8 @@ class TripleTrendStrategy:
         df15 = data_mgr.klines["15m"]
         if len(df15) < 99:
             return
-        ma7, ma25, ma99 = df15.ma7.iat[-1], df15.ma25.iat[-1], df15.ma99.iat[-1]
-        is_bear = price < ma7 and ma7 < ma25 and ma25 < ma99
-        is_bull = price > ma7 and ma7 > ma25 and ma25 > ma99
-        if not (is_bear or is_bull):
+        ma7,ma25,ma99 = df15.ma7.iat[-1], df15.ma25.iat[-1], df15.ma99.iat[-1]
+        if not (price<ma7<ma25<ma99 or price>ma7>ma25>ma99):
             return
 
         h,l,c = df15.high.values, df15.low.values, df15.close.values
