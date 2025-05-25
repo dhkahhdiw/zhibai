@@ -278,7 +278,6 @@ async def maintenance():
         await asyncio.sleep(60)
         try:
             await exchange.load_markets()
-            await data_mgr.load_history()
         except Exception:
             LOG.exception("maintenance")
 
