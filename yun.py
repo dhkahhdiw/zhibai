@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
 # coding: utf-8
 
-import os
-import time
-import math
-import json
-import signal
-import asyncio
-import logging
-
+import os, time, math, json, signal, asyncio, logging, base64
 import ccxt.async_support as ccxt
 import websockets
 import pandas as pd
@@ -16,102 +9,104 @@ from ta.trend import MACD, ADXIndicator
 from numba import jit
 from dotenv import load_dotenv
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
-from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-# —— 全局日志配置 ——
+# —— 日志 ——
 LOG = logging.getLogger('vhf_bot')
 LOG.setLevel(logging.INFO)
 sh = logging.StreamHandler()
 sh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
 LOG.addHandler(sh)
 
-# —— 环境与密钥加载 ——
+# —— 环境 & 密钥 ——
 load_dotenv('/root/zhibai/.env')
-ED25519_API_KEY    = os.getenv('YZ_ED25519_API_KEY')
-ED25519_KEY_PATH   = os.getenv('YZ_ED25519_KEY_PATH')
-REST_API_KEY       = os.getenv('YZ_BINANCE_API_KEY')
-REST_SECRET_KEY    = os.getenv('YZ_BINANCE_SECRET_KEY')
+ED25519_API_KEY  = os.getenv('YZ_ED25519_API_KEY')
+ED25519_KEY_PATH = os.getenv('YZ_ED25519_KEY_PATH')
+REST_API_KEY     = os.getenv('YZ_BINANCE_API_KEY')
+REST_SECRET_KEY  = os.getenv('YZ_BINANCE_SECRET_KEY')
 
 with open(ED25519_KEY_PATH, 'rb') as f:
     ed_priv = load_pem_private_key(f.read(), password=None)
-    if isinstance(ed_priv, Ed25519PrivateKey):
-        LOG.info("✅ ED25519 private key loaded")
-    else:
-        LOG.error("❌ ED25519 key format error"); exit(1)
+    assert isinstance(ed_priv, Ed25519PrivateKey)
+    LOG.info("✅ Ed25519 private key loaded")
 
-# —— 交易对与时间框架 ——
-SYMBOL       = 'ETH/USDC'
-TF_CONFIG    = {'3m':'3m','15m':'15m','1h':'1h'}
-TIMEFRAMES   = list(TF_CONFIG.values())
+# —— 基础配置 ——
+SYMBOL     = 'ETH/USDC'
+TF_CONFIG  = {'3m':'3m','15m':'15m','1h':'1h'}
+TIMEFRAMES = list(TF_CONFIG.values())
 
-# —— CCXT 交易所实例 ——
 exchange = ccxt.binance({
     'apiKey':    REST_API_KEY,
     'secret':    REST_SECRET_KEY,
     'enableRateLimit': True,
     'options': {
-        'defaultType': 'future',
-        'hedgeMode':   True,
-        'recvWindow':  3000,
+        'defaultType':    'future',
+        'hedgeMode':      True,
+        'recvWindow':     3000,
         'timeDifference': 0,
     },
 })
 
-# —— numba 超趋势加速 ——
+# —— 超趋势加速 ——
 @jit(nopython=True)
 def numba_supertrend(h, l, c, per, mult):
     n = len(c)
     st = [0.0]*n; dirc=[False]*n
-    hl2= [(h[i]+l[i])*0.5 for i in range(n)]
-    atr= [max(h[max(0,i-per+1):i+1]) - min(l[max(0,i-per+1):i+1]) for i in range(n)]
+    hl2 = [(h[i]+l[i])*0.5 for i in range(n)]
+    atr = [max(h[max(0,i-per+1):i+1]) - min(l[max(0,i-per+1):i+1]) for i in range(n)]
     up = [hl2[i] + mult*atr[i] for i in range(n)]
     dn = [hl2[i] - mult*atr[i] for i in range(n)]
-    st[0], dirc[0] = up[0], True
+    st[0],dirc[0]=up[0],True
     for i in range(1,n):
-        if c[i] > st[i-1]:
-            st[i],dirc[i] = max(dn[i], st[i-1]), True
+        if c[i]>st[i-1]:
+            st[i],dirc[i]=max(dn[i],st[i-1]),True
         else:
-            st[i],dirc[i] = min(up[i], st[i-1]), False
-    return st, dirc
+            st[i],dirc[i]=min(up[i],st[i-1]),False
+    return st,dirc
 
 # —— 数据管理 ——
 class DataManager:
     def __init__(self):
-        self.klines = {tf: pd.DataFrame(columns=['open','high','low','close','vol']) for tf in TIMEFRAMES}
+        # 初始化空 DF 并预置 ma 列
+        cols = ['open','high','low','close','vol','ma7','ma25','ma99']
+        self.klines = {tf: pd.DataFrame(columns=cols) for tf in TIMEFRAMES}
         self.price  = None
         self.lock   = asyncio.Lock()
         self._evt   = asyncio.Event()
 
     async def load_history(self):
-        LOG.info("▶️ Loading historical klines")
+        LOG.info("▶️ Loading history")
         async with self.lock:
-            for tf_alias, tf in TF_CONFIG.items():
-                LOG.debug(f"  • Fetching {tf}")
+            for alias,tf in TF_CONFIG.items():
                 ohlcv = await exchange.fetch_ohlcv(SYMBOL, tf, limit=1000)
                 df = pd.DataFrame(ohlcv, columns=['ts','open','high','low','close','vol'])
-                df.set_index('ts', inplace=True)
-                # 预计算均线
+                df.set_index('ts',inplace=True)
+                # 批量计算均线
                 df['ma7']  = df['close'].rolling(7).mean()
                 df['ma25'] = df['close'].rolling(25).mean()
                 df['ma99'] = df['close'].rolling(99).mean()
                 self.klines[tf] = df
         LOG.info("✔️ History loaded")
 
-    async def update_kline(self, tf_alias, ohlc):
-        ts, o,h,l,c,v = ohlc
-        tf = TF_CONFIG[tf_alias]
+    async def update_kline(self, alias, ohlc):
+        ts,o,h,l,c,v = ohlc
+        tf = TF_CONFIG[alias]
         async with self.lock:
             df = self.klines[tf]
-            df.loc[ts] = [o,h,l,c,v,
-                          # 新点增量均线
-                          df['close'].iloc[-6:].append(pd.Series(c)).rolling(7).mean().iat[-1],
-                          df['close'].iloc[-24:].append(pd.Series(c)).rolling(25).mean().iat[-1],
-                          df['close'].iloc[-98:].append(pd.Series(c)).rolling(99).mean().iat[-1]]
+            # 增量计算：取最近 n-1 个 close 与新 c 拼接
+            closes7  = list(df['close'].iloc[-6:])  + [c]
+            closes25 = list(df['close'].iloc[-24:]) + [c]
+            closes99 = list(df['close'].iloc[-98:]) + [c]
+            ma7  = sum(closes7)/7
+            ma25 = sum(closes25)/25
+            ma99 = sum(closes99)/99
+            new = {'open':o,'high':h,'low':l,'close':c,'vol':v,'ma7':ma7,'ma25':ma25,'ma99':ma99}
+            df.loc[ts] = new
             if len(df)>1000: df.drop(df.index[0], inplace=True)
             self.klines[tf] = df
+            self.price = self.price  # no-op but mark that price unchanged
             self._evt.set()
-            LOG.debug(f"{tf}@{ts} ⬆️")
+        LOG.debug(f"{tf}@{ts} updated")
 
     async def set_price(self, price):
         async with self.lock:
@@ -119,51 +114,56 @@ class DataManager:
             self._evt.set()
 
     async def wait_update(self):
-        await self._evt.wait(); self._evt.clear()
+        await self._evt.wait()
+        self._evt.clear()
 
 data_mgr = DataManager()
 
-# —— 持仓与 OCO 管理 ——
+# —— 持仓 & OCO ——
 class PositionTracker:
     def __init__(self):
         self.positions = {}
         self.lock      = asyncio.Lock()
         self._cid      = 1
 
-    async def on_fill(self, side, qty, entry_price, sl, tp):
+    async def on_fill(self, side, qty, entry, sl, tp):
         async with self.lock:
             cid = self._cid; self._cid+=1
-            pos = dict(side=side, qty=qty, sl=sl, tp=tp, active=True)
-            self.positions[cid] = pos
-            LOG.info(f"[POS#{cid}] {side.upper()} {qty}@{entry_price:.4f} SL={sl:.4f} TP={tp:.4f}")
-
-            # 下 OCO 订单
-            opposite = 'sell' if side=='buy' else 'buy'
-            params = {
-                'symbol':        exchange.market_id(SYMBOL),
-                'side':          opposite.upper(),
-                'stopPrice':     sl if side=='buy' else tp,
-                'type':          'STOP_MARKET',
+            self.positions[cid] = dict(side=side,qty=qty,sl=sl,tp=tp,active=True)
+            LOG.info(f"[POS#{cid}] {side}@{entry:.4f} SL={sl:.4f} TP={tp:.4f}")
+            opp = 'sell' if side=='buy' else 'buy'
+            base = exchange.market_id(SYMBOL)
+            # 下 STOP_MARKET
+            slp = sl if side=='buy' else tp
+            sl_ord = await exchange.fapiPrivatePostOrder({
+                'symbol': base,
+                'side':   opp.upper(),
+                'type':   'STOP_MARKET',
+                'stopPrice': slp,
                 'closePosition': True,
-                'workingType':   'MARK_PRICE',
-                'newClientOrderId': f"sl_{cid}"
-            }
-            sl_ord = await exchange.fapiPrivatePostOrder(params)
-            tp_ord = await exchange.fapiPrivatePostOrder({
-                **params,
-                'type':           'TAKE_PROFIT_MARKET',
-                'stopPrice':      tp if side=='buy' else sl,
-                'newClientOrderId': f"tp_{cid}"
+                'workingType':'MARK_PRICE',
+                'newClientOrderId':f"sl_{cid}"
             })
-            pos.update(sl_oid=sl_ord['orderId'], tp_oid=tp_ord['orderId'])
+            # 下 TAKE_PROFIT_MARKET
+            tpp = tp if side=='buy' else sl
+            tp_ord = await exchange.fapiPrivatePostOrder({
+                'symbol': base,
+                'side':   opp.upper(),
+                'type':   'TAKE_PROFIT_MARKET',
+                'stopPrice': tpp,
+                'closePosition': True,
+                'workingType':'MARK_PRICE',
+                'newClientOrderId':f"tp_{cid}"
+            })
+            self.positions[cid].update(sl_oid=sl_ord['orderId'], tp_oid=tp_ord['orderId'])
 
     async def on_order_update(self, msg):
         oid = msg['o']['i']; status = msg['o']['X']
         async with self.lock:
-            for cid, p in self.positions.items():
+            for cid,p in self.positions.items():
                 if not p['active']: continue
                 if oid in (p['sl_oid'], p['tp_oid']) and status=='FILLED':
-                    p['active']=False
+                    p['active'] = False
                     other = p['tp_oid'] if oid==p['sl_oid'] else p['sl_oid']
                     LOG.info(f"[POS#{cid}] OCO fill {oid}, cancel {other}")
                     await exchange.cancel_order(other, SYMBOL)
@@ -251,66 +251,61 @@ class TripleTrendStrategy(BaseStrategy):
 strategies = sorted([MainStrategy(), MACDStrategy(), TripleTrendStrategy()],
                     key=lambda s: s.priority)
 
-# —— 市场数据 WS ——
+# —— 市场 WS ——
 async def market_ws():
-    streams = [f"{exchange.market_id(SYMBOL).lower()}@kline_{tf}" for tf in TF_CONFIG] \
-            + [f"{exchange.market_id(SYMBOL).lower()}@markPrice"]
-    uri = f"wss://fstream.binance.com/stream?streams=" + "/".join(streams)
+    streams = [f"{exchange.market_id(SYMBOL).lower()}@kline_{tf}" for tf in TF_CONFIG] + \
+              [f"{exchange.market_id(SYMBOL).lower()}@markPrice"]
+    uri = "wss://fstream.binance.com/stream?streams=" + "/".join(streams)
     retry = 0
     while True:
         try:
-            LOG.info("🔗 Connecting market WS")
+            LOG.info("🔗 market WS connecting")
             async with websockets.connect(uri, ping_interval=20) as ws:
-                retry=0
+                retry = 0
                 async for msg in ws:
                     o = json.loads(msg)
-                    st, d = o['stream'], o['data']
+                    st,d = o['stream'], o['data']
                     if st.endswith('markPrice'):
                         await data_mgr.set_price(float(d['p']))
                     else:
-                        tf = st.split('@')[1].split('_')[1]
+                        alias = st.split('@')[1].split('_')[1]
                         k = d['k']
-                        await data_mgr.update_kline(tf,
-                            [k['t'], float(k['o']), float(k['h']),
-                             float(k['l']), float(k['c']), float(k['v'])])
+                        await data_mgr.update_kline(alias, [
+                            k['t'], float(k['o']), float(k['h']),
+                            float(k['l']), float(k['c']), float(k['v'])
+                        ])
         except Exception as e:
             LOG.warning(f"market_ws ▶️ {e}")
             await asyncio.sleep(min(2**retry,30)); retry+=1
 
-# —— 用户数据 WS (Ed25519 RPC) ——
+# —— 用户 WS (Ed25519 登录) ——
 async def user_ws():
-    uri = "wss://fstream.binance.com/ws"
-    retry=0
+    uri = "wss://ws-fapi.binance.com/ws-fapi/v1"  # 正式环境  [oai_citation:1‡binance-Rest.txt](file-service://file-HAcrt27JLMgJymPcB5GQtG)
+    retry = 0
     while True:
         try:
-            LOG.info("🔑 Connecting user WS (Ed25519)")
+            LOG.info("🔑 user WS connecting")
             async with websockets.connect(uri, ping_interval=20) as ws:
-                # 构造订阅请求
+                # 构造 session.logon 请求
                 ts = int(time.time()*1000)
-                payload = json.dumps({
-                    "id": ts,
-                    "method": "account.subscribe",
-                    "params": {
-                        "apiKey": ED25519_API_KEY,
-                        "timestamp": ts
-                    }
-                }, separators=(',',':'))
-                # 签名
-                sig = ed_priv.sign(payload.encode())
-                req = json.dumps({
-                    "id": ts,
-                    "method": "account.subscribe",
-                    "params": {
-                        "apiKey": ED25519_API_KEY,
-                        "timestamp": ts,
-                        "signature": sig.hex()
-                    }
-                }, separators=(',',':'))
-                await ws.send(req)
-                LOG.info("✅ User WS subscribed")
-                retry=0
+                params = {
+                    'apiKey':    ED25519_API_KEY,
+                    'timestamp': ts
+                }
+                # 签名：对按字母序排的 param 字串进行 base64(Ed25519) 签名
+                payload = '&'.join(f'{k}={params[k]}' for k in sorted(params))
+                sig = base64.b64encode(ed_priv.sign(payload.encode())).decode()
+                req = {
+                    'id':       ts,
+                    'method':   'session.logon',
+                    'params':   {**params, 'signature': sig}
+                }
+                await ws.send(json.dumps(req))
+                LOG.info("✅ session.logon sent")
+                retry = 0
                 async for msg in ws:
                     data = json.loads(msg)
+                    # 仅处理 ORDER_TRADE_UPDATE 类型
                     if data.get('method')=='account.update':
                         for evt in data['params']['events']:
                             if evt['e']=='ORDER_TRADE_UPDATE':
@@ -319,13 +314,13 @@ async def user_ws():
             LOG.warning(f"user_ws ▶️ {e}")
             await asyncio.sleep(5); retry+=1
 
-# —— 后台任务 ——
+# —— 维护 & 引擎 ——
 async def maintenance():
     while True:
         await asyncio.sleep(60)
         try:
             await exchange.load_markets()
-            LOG.debug("🛠 Markets refreshed")
+            LOG.debug("markets refreshed")
         except Exception as e:
             LOG.warning(f"maintenance ▶️ {e}")
 
@@ -335,15 +330,15 @@ async def engine():
         price = data_mgr.price
         for strat in strategies:
             try: await strat.check(price)
-            except Exception as e: LOG.error(f"strategy {type(strat).__name__} ▶️ {e}")
+            except Exception as e: LOG.error(f"{type(strat).__name__} ▶️ {e}")
 
 # —— 启动 ——
 async def main():
     loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(exchange.close()))
+    for s in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(s, lambda: asyncio.create_task(exchange.close()))
     await data_mgr.load_history()
     await asyncio.gather(market_ws(), user_ws(), maintenance(), engine())
 
-if __name__ == '__main__':
+if __name__=='__main__':
     asyncio.run(main())
