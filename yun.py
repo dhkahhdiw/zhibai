@@ -34,12 +34,11 @@ with open(ED25519_KEY_PATH, 'rb') as f:
 SYMBOL        = 'ETH/USDC'
 TF_CONFIG     = {'3m':'3m','15m':'15m','1h':'1h'}
 TIMEFRAMES    = list(TF_CONFIG.values())
-# 双向持仓时下单需指定 positionSide
 POSITION_SIDE = {'buy':'LONG', 'sell':'SHORT'}
 
 exchange = ccxt.binance({
-    'apiKey':    REST_API_KEY,
-    'secret':    REST_SECRET_KEY,
+    'apiKey': REST_API_KEY,
+    'secret': REST_SECRET_KEY,
     'enableRateLimit': True,
     'options': {
         'defaultType':    'future',
@@ -49,7 +48,7 @@ exchange = ccxt.binance({
     },
 })
 
-# —— numba 超趋势加速 ——
+# —— numba 超趋势 ——
 @jit(nopython=True)
 def numba_supertrend(h, l, c, per, mult):
     n = len(c)
@@ -102,7 +101,7 @@ class DataManager:
             df.loc[ts] = {'open':o,'high':h,'low':l,'close':c,'vol':v,
                           'ma7':ma7,'ma25':ma25,'ma99':ma99}
             if len(df)>1000: df.drop(df.index[0], inplace=True)
-            self.price = self.price
+            # price unchanged here
             self._evt.set()
         LOG.debug(f"{tf}@{ts} updated")
 
@@ -129,8 +128,7 @@ class PositionTracker:
             cid = self._cid; self._cid+=1
             self.positions[cid] = dict(side=side,qty=qty,sl=sl,tp=tp,active=True)
             LOG.info(f"[POS#{cid}] {side}@{entry:.4f} SL={sl:.4f} TP={tp:.4f}")
-            opp = 'sell' if side=='buy' else 'buy'
-            base = exchange.market_id(SYMBOL)
+            opp, base = ('sell' if side=='buy' else 'buy'), exchange.market_id(SYMBOL)
             for otype, price_trigger, client_id in [
                 ('STOP_MARKET', sl if side=='buy' else tp, f"sl_{cid}"),
                 ('TAKE_PROFIT_MARKET', tp if side=='buy' else sl, f"tp_{cid}")
@@ -155,7 +153,7 @@ class PositionTracker:
                 self.positions[cid][key] = resp.get('orderId')
 
     async def on_order_update(self, msg):
-        oid    = msg['o']['i']; status = msg['o']['X']
+        oid, status = msg['o']['i'], msg['o']['X']
         async with self.lock:
             for cid,p in self.positions.items():
                 if not p['active']: continue
@@ -163,14 +161,12 @@ class PositionTracker:
                     p['active'] = False
                     other = p['tp_oid'] if oid==p['sl_oid'] else p['sl_oid']
                     LOG.info(f"[POS#{cid}] OCO fill {oid}, cancel {other}")
-                    try:
-                        await exchange.cancel_order(other, SYMBOL)
-                    except Exception as e:
-                        LOG.warning(f"cancel OCO other failed: {e}")
+                    try: await exchange.cancel_order(other, SYMBOL)
+                    except Exception as e: LOG.warning(f"cancel OCO other failed: {e}")
 
 pos_tracker = PositionTracker()
 
-# —— 策略 ——
+# —— 策略基类 & 实例 ——
 class BaseStrategy:
     priority = 1
     async def check(self, price): ...
@@ -179,34 +175,36 @@ class MainStrategy(BaseStrategy):
     priority = 1
     def __init__(self): self._ts=0
     async def check(self, price):
-        if time.time()-self._ts<1: return
+        # 数据健壮性检查
+        if price is None or time.time()-self._ts<1: return
         df = data_mgr.klines['15m']
         if len(df)<100: return
         ma7,ma25,ma99 = df[['ma7','ma25','ma99']].iloc[-1]
-        if pd.isna(ma7): return
+        if pd.isna(ma7) or pd.isna(ma25) or pd.isna(ma99): return
         if not (price<ma7<ma25<ma99 or price>ma7>ma25>ma99): return
         adx = ADXIndicator(df['high'],df['low'],df['close'],14).adx().iat[-1]
         if adx<=25: return
-        bb = (df['close'].iat[-1]-df['close'].rolling(20).mean().iat[-1]+2*df['close'].rolling(20).std().iat[-1])\
+        bb = (df['close'].iat[-1] - df['close'].rolling(20).mean().iat[-1] + 2*df['close'].rolling(20).std().iat[-1]) \
              /(4*df['close'].rolling(20).std().iat[-1])
         if not (bb<=0 or bb>=1): return
-        side='buy' if bb<=0 else 'sell'
+        side = 'buy' if bb<=0 else 'sell'
         level=0.005 if side=='buy' else -0.005
-        qty, pr0 = 0.016, price*(1+level)
-        sl, tp    = price*0.98 if side=='buy' else price*1.02, price*1.02 if side=='buy' else price*0.98
+        qty,pr0=0.016,price*(1+level)
+        sl,tp = (price*0.98, price*1.02) if side=='buy' else (price*1.02, price*0.98)
         LOG.info(f"▶️ Main → {side}@{pr0:.4f}")
         o = await exchange.create_order(
-            SYMBOL, 'limit', side, qty, pr0,
+            SYMBOL,'limit',side,qty,pr0,
             {'timeInForce':'GTC','positionSide':POSITION_SIDE[side]}
         )
         if o.get('status')=='closed':
-            await pos_tracker.on_fill(side, qty, pr0, sl, tp)
+            await pos_tracker.on_fill(side,qty,pr0,sl,tp)
         self._ts=time.time()
 
 class MACDStrategy(BaseStrategy):
     priority = 2
     def __init__(self): self.in_pos=False
     async def check(self, price):
+        if price is None: return
         df = data_mgr.klines['15m']
         if len(df)<50: return
         ma7,ma25,ma99 = df[['ma7','ma25','ma99']].iloc[-1]
@@ -239,8 +237,8 @@ class TripleTrendStrategy(BaseStrategy):
     priority = 3
     def __init__(self): self._ts=0; self.active=False
     async def check(self, price):
-        if time.time()-self._ts<1: return
-        df=data_mgr.klines['15m']
+        if price is None or time.time()-self._ts<1: return
+        df = data_mgr.klines['15m']
         if len(df)<30: return
         ma7,ma25,ma99 = df[['ma7','ma25','ma99']].iloc[-1]
         if pd.isna(ma7): return
@@ -320,7 +318,7 @@ async def user_ws():
             LOG.warning(f"user_ws ▶️ {e}")
             await asyncio.sleep(5); retry+=1
 
-# —— 维护 & 引擎 ——
+# —— maintenance & engine ——
 async def maintenance():
     while True:
         await asyncio.sleep(60)
@@ -330,7 +328,7 @@ async def maintenance():
 async def engine():
     while True:
         await data_mgr.wait_update()
-        price = data_mgr.price
+        price=data_mgr.price
         for strat in strategies:
             try: await strat.check(price)
             except Exception as e: LOG.error(f"{type(strat).__name__} ▶️ {e}")
