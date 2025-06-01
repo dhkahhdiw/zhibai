@@ -490,13 +490,13 @@ class MACDStrategy:
         if prev>0>curr and not self._in:
             sp = price*1.005
             await mgr.safe_place("macd","SELL","LIMIT",
-                                 qty=0.06, price=sp,
+                                 qty=0.016, price=sp,
                                  extra_params={'sl':sp*1.03,'tp':sp*0.97})
             self._in = True
         elif prev<0<curr and self._in:
             bp = price*0.995
             await mgr.safe_place("macd","BUY","LIMIT",
-                                 qty=0.06, price=bp,
+                                 qty=0.016, price=bp,
                                  extra_params={'sl':bp*0.97,'tp':bp*1.03})
             self._in = False
 
